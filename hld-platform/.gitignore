@@ -1,0 +1,9 @@
+# hld-platform runtime + secrets (never commit)
+hld.env
+!hld.env.example
+runtime/
+*.db
+*.jsonl
+*.log
+__pycache__/
+*.py[cod]

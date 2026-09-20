@@ -1,0 +1,27 @@
+name: wazuh-infokom-mcp
+
+services:
+  infokom-mcp:
+    build:
+      context: .
+    image: wazuh-infokom-mcp:latest
+    container_name: wazuh-infokom-mcp
+    restart: unless-stopped
+    env_file:
+      - ./infokom.env
+    ports:
+      - "${INFOKOM_MCP_HOST_PORT:-8000}:8000"
+    volumes:
+      - ./runtime:/var/log/blue-team-mcp
+      - ./resource:/app/resource:ro
+    networks:
+      - wazuh-shared
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+networks:
+  wazuh-shared:
+    external: true
+    name: ${WAZUH_DOCKER_NETWORK:-single-node_default}

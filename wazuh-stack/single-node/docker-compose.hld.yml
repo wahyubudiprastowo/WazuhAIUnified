@@ -1,0 +1,7 @@
+services:
+  wazuh.manager:
+    volumes:
+      - /opt/wazuh-mcp-unified/hld-platform/wazuh/decoders/100-hld-platform.xml:/var/ossec/etc/decoders/100-hld-platform.xml:ro
+      - /opt/wazuh-mcp-unified/hld-platform/wazuh/rules/100-hld-platform.xml:/var/ossec/etc/rules/100-hld-platform.xml:ro
+      - /opt/wazuh-mcp-unified/hld-platform/pam-audit:/var/log/pam-platform:ro
+      - /opt/wazuh-mcp-unified/hld-platform/soar-audit:/var/log/soar:ro

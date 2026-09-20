@@ -1,0 +1,6 @@
+<group name="dg_network_device,">
+  <rule id="119901" level="3">
+    <decoded_as>dg-network-device</decoded_as>
+    <description>DG network device event.</description>
+  </rule>
+</group>

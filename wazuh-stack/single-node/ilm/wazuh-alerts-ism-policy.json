@@ -1,0 +1,49 @@
+{
+  "_comment": "Wazuh Indexer ISM retention policy TEMPLATE for wazuh-alerts-* only. NOT applied automatically. Review, confirm retention days (90/180), backup & legal holds before use. Apply future-only via ./manage-ism.sh apply-policy.",
+  "policy": {
+    "description": "Retention for Wazuh daily alert indices (future-only, attached via index template).",
+    "default_state": "hot",
+    "states": [
+      {
+        "name": "hot",
+        "actions": [
+          {
+            "rollover": {
+              "min_index_age": "1d",
+              "min_primary_shard_size": "30gb"
+            }
+          }
+        ],
+        "transitions": [
+          {
+            "state_name": "keep",
+            "conditions": {
+              "min_index_age": "1d"
+            }
+          }
+        ]
+      },
+      {
+        "name": "keep",
+        "actions": [],
+        "transitions": [
+          {
+            "state_name": "delete",
+            "conditions": {
+              "min_index_age": "90d"
+            }
+          }
+        ]
+      },
+      {
+        "name": "delete",
+        "actions": [
+          {
+            "delete": {}
+          }
+        ],
+        "transitions": []
+      }
+    ]
+  }
+}

@@ -1,0 +1,17 @@
+[
+  {
+    "agent_id": "001",
+    "host": "server.example.internal",
+    "name": "Example application server",
+    "ip": "10.0.0.10",
+    "aliases": ["server", "server.example.internal"],
+    "owner": "Application Operations",
+    "criticality": "high",
+    "environment": "production",
+    "network_zone": "application",
+    "vendor": "Example Vendor",
+    "version": "1.0.0",
+    "cpe": "cpe:2.3:a:example:product:1.0.0:*:*:*:*:*:*:*",
+    "purpose": "Replace this example with verified inventory data"
+  }
+]

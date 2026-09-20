@@ -1,0 +1,9 @@
+# Storage layout for this host; previous file is saved before installation.
+/dev/disk/by-uuid/c182f445-33cd-4c49-b4c4-7350b9650a50 none swap sw 0 0
+/dev/disk/by-uuid/87d339b9-94fe-40ef-b7b0-32b6e3670ab7 / ext4 defaults 0 1
+UUID=1c166263-3587-48e4-8098-9f9b9456003b /data/wazuh-storage ext4 defaults,nofail 0 2
+/data/wazuh-storage/app-data/syslog-ingest /opt/wazuh-mcp-unified/syslog-ingest none bind,nofail,x-systemd.requires-mounts-for=/data/wazuh-storage 0 0
+/data/wazuh-storage/app-data/infokom-analysis/runtime /opt/wazuh-mcp-unified/infokom-analysis/runtime none bind,nofail,x-systemd.requires-mounts-for=/data/wazuh-storage 0 0
+/data/wazuh-storage/app-data/hld-platform/runtime /opt/wazuh-mcp-unified/hld-platform/runtime none bind,nofail,x-systemd.requires-mounts-for=/data/wazuh-storage 0 0
+/data/wazuh-storage/app-data/hld-platform/soar-audit /opt/wazuh-mcp-unified/hld-platform/soar-audit none bind,nofail,x-systemd.requires-mounts-for=/data/wazuh-storage 0 0
+/data/wazuh-storage/app-data/hld-platform/pam-audit /opt/wazuh-mcp-unified/hld-platform/pam-audit none bind,nofail,x-systemd.requires-mounts-for=/data/wazuh-storage 0 0

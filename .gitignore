@@ -1,0 +1,142 @@
+# =============================================================================
+# Root ignore rules for the Wazuh MCP SOC Platform.
+# Goal: the repository only ever contains buildable source + docs. No runtime
+# data, no logs, no credentials, no captured telemetry, no backups ever leave
+# this host. Review with `git status --ignored` before pushing.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Secrets / environment files (never commit real credentials)
+# -----------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.env
+!*.env.example
+dashboard.env
+!dashboard.env.example
+infokom.env
+!infokom.env.example
+hld.env
+!hld.env.example
+config.env
+.env.local
+.env.production
+.env.save
+.env.bak
+*.env.bak
+secrets/
+!secrets/*.example
+
+# -----------------------------------------------------------------------------
+# Runtime state, persistent stores and generated data
+# -----------------------------------------------------------------------------
+runtime/
+**/runtime/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.jsonl
+**/state.db
+
+# Dashboard/browser artifacts and screenshots
+artifacts/
+**/artifacts/
+.ui-check/
+.skill-cache-*/
+*.png.tmp
+
+# CMDB / asset exports that may contain internal inventory
+cmdb/
+assets.json
+**/resource/assets.json
+
+# -----------------------------------------------------------------------------
+# Captured / ingested telemetry (very large, contains live customer logs)
+# -----------------------------------------------------------------------------
+syslog-ingest/
+integration/captures/
+*.pcap
+*.pcapng
+
+# -----------------------------------------------------------------------------
+# Backups and patch snapshots
+# -----------------------------------------------------------------------------
+backups/
+backup-*/
+**/backup-*/
+*.bak
+*.bak.*
+*.bak-*
+*~
+*.orig
+*.rej
+*.patch
+*.diff
+
+# -----------------------------------------------------------------------------
+# Certificates and keys
+# -----------------------------------------------------------------------------
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+*.jks
+wazuh-stack/*/config/wazuh_indexer_ssl_certs/*
+
+# -----------------------------------------------------------------------------
+# Python
+# -----------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+venv/
+ENV/
+.eggs/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+uv.lock
+
+# -----------------------------------------------------------------------------
+# Node / front-end tooling
+# -----------------------------------------------------------------------------
+node_modules/
+npm-debug.log*
+yarn-error.log*
+
+# -----------------------------------------------------------------------------
+# Logs
+# -----------------------------------------------------------------------------
+*.log
+logs/
+
+# -----------------------------------------------------------------------------
+# Editors / OS
+# -----------------------------------------------------------------------------
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# -----------------------------------------------------------------------------
+# Temporary / scratch
+# -----------------------------------------------------------------------------
+tmp/
+temp/
+*.tmp
+*.backup

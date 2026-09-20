@@ -1,0 +1,6 @@
+<group name="hld_platform,">
+  <rule id="119900" level="3">
+    <decoded_as>hld-platform</decoded_as>
+    <description>HLD platform event.</description>
+  </rule>
+</group>

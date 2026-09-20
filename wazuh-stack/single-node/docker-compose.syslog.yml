@@ -1,0 +1,6 @@
+services:
+  wazuh.manager:
+    volumes:
+      - "/opt/wazuh-mcp-unified/syslog-ingest/archives:/var/ossec/logs/archives"
+      - "/opt/wazuh-mcp-unified/syslog-ingest/decoders/99-dg-network-device.xml:/var/ossec/etc/decoders/99-dg-network-device.xml:ro"
+      - "/opt/wazuh-mcp-unified/syslog-ingest/rules/99-dg-network-device.xml:/var/ossec/etc/rules/99-dg-network-device.xml:ro"

@@ -1,0 +1,63 @@
+<!--
+  Small compatibility-safe subset inspired by SOCFortress Office 365 rules.
+  It extends Wazuh 4.14.7 rule 91531 and intentionally avoids common audit noise.
+-->
+<group name="office365,infokom_cloud_detection,">
+  <rule id="119500" level="10">
+    <if_sid>91531</if_sid>
+    <field name="office365.Operation" type="pcre2">^(Delete group\.|Delete user\.|Delete device\.|Disable account\.)$</field>
+    <description>Office 365: High-impact identity object change: $(office365.Operation)</description>
+    <group>identity_change,account_manipulation,</group>
+  </rule>
+
+  <rule id="119501" level="12">
+    <if_sid>91531</if_sid>
+    <field name="office365.Operation">^Remove users strong authentication phone app detail.$</field>
+    <description>Office 365: Strong authentication method removed.</description>
+    <mitre><id>T1098</id></mitre>
+    <group>identity_change,mfa_change,account_manipulation,</group>
+  </rule>
+
+  <rule id="119502" level="9">
+    <if_sid>91531</if_sid>
+    <field name="office365.Operation">^DlpRuleMatch$</field>
+    <description>Office 365: Data loss prevention policy matched.</description>
+    <group>dlp,policy_match,data_exposure,</group>
+  </rule>
+
+  <rule id="119503" level="10">
+    <if_sid>91531</if_sid>
+    <field name="office365.Operation" type="pcre2">^(AlertEntityGenerated|AlertTriggered)$</field>
+    <description>Office 365: Security alert generated: $(office365.Operation)</description>
+    <group>security_alert,threat_detection,</group>
+  </rule>
+
+  <rule id="119504" level="8">
+    <if_sid>91531</if_sid>
+    <field name="office365.Operation" type="pcre2">^(UserSubmission|UserSubmissionTriage)$</field>
+    <description>Office 365: User-submitted content requires security triage.</description>
+    <group>phishing,user_report,mail_security,</group>
+  </rule>
+
+  <rule id="119505" level="8">
+    <if_sid>91531</if_sid>
+    <field name="office365.LogonError" type="pcre2">^(PassThroughUserMfaError|SsoArtifactRevoked|DeviceIsDisabled|UserDisabled)$</field>
+    <description>Office 365: Significant authentication failure: $(office365.LogonError)</description>
+    <mitre><id>T1078</id></mitre>
+    <group>authentication_failed,identity_protection,</group>
+  </rule>
+
+  <rule id="119506" level="10">
+    <if_sid>91531</if_sid>
+    <field name="office365.LogonError">^UnauthorizedClientDoesNotMatchRequest$</field>
+    <description>Office 365: Unauthorized client does not match authentication request.</description>
+    <group>authentication_failed,unauthorized_client,identity_protection,</group>
+  </rule>
+
+  <rule id="119507" level="8">
+    <if_sid>91531</if_sid>
+    <field name="office365.Operation">^Device no longer compliant.$</field>
+    <description>Office 365: Managed device is no longer compliant.</description>
+    <group>device_compliance,configuration_risk,</group>
+  </rule>
+</group>

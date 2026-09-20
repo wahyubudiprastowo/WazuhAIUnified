@@ -1,0 +1,629 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Wazuh MCP SOC Command</title>
+    <link rel="stylesheet" href="/static/styles.css?v=20260915-2">
+    <link rel="stylesheet" href="/static/findings.css?v=20260920-2">
+    <link rel="stylesheet" href="/static/analysis.css?v=20260909-14">
+    <link rel="stylesheet" href="/static/enterprise.css?v=20260920-1">
+    <link rel="stylesheet" href="/static/automation.css?v=20260914-1">
+    <link rel="stylesheet" href="/static/history.css?v=20260915-3">
+    <link rel="stylesheet" href="/static/workflows.css?v=20260919-1">
+  </head>
+  <body>
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brandGlyph">W</div>
+        <div>
+          <strong>Wazuh MCP SOC</strong>
+          <small>AI Security Operations</small>
+        </div>
+      </div>
+      <nav class="nav">
+        <button data-view="findings" type="button"><span>FX</span>Findings</button>
+        <button class="active" data-view="command" type="button"><span>01</span>Command</button>
+        <button data-view="workbench" type="button"><span>WB</span>Workbench</button>
+        <button data-view="l1" type="button"><span>L1</span>Triage</button>
+        <button data-view="l2" type="button"><span>L2</span>Investigate</button>
+        <button data-view="incidents" type="button"><span>IR</span>Incidents</button>
+        <button data-view="history" type="button"><span>HT</span>Event History</button>
+        <button data-view="l3" type="button"><span>L3</span>Hunt</button>
+        <button data-view="vuln" type="button"><span>CV</span>Vulnerabilities</button>
+        <button data-view="assets" type="button"><span>AS</span>Assets</button>
+        <button data-view="tools" type="button"><span>TC</span>Tool Console</button>
+        <button data-view="settings" type="button"><span>ST</span>Settings</button>
+      </nav>
+      <div class="sideStatus">
+        <span id="connectionDot"></span>
+        <div>
+          <strong id="connectionText">Connecting</strong>
+          <small id="sideMeta">Waiting for telemetry</small>
+        </div>
+      </div>
+    </aside>
+
+    <main class="app">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">Enterprise SOC Analytics</p>
+          <h1 id="pageTitle">Command</h1>
+          <p id="status">Loading SOC data...</p>
+        </div>
+        <div class="actions">
+          <select id="rangeSelect" aria-label="Time range">
+            <option value="24h">24h</option>
+            <option value="7d">7d</option>
+            <option value="30d">30d</option>
+            <option value="custom">Custom</option>
+          </select>
+          <div class="dateRangeControls" id="dateRangeControls" hidden>
+            <input id="globalStart" type="datetime-local" aria-label="Start date">
+            <input id="globalEnd" type="datetime-local" aria-label="End date">
+          </div>
+          <button id="refreshBtn" type="button">Refresh</button>
+        </div>
+      </header>
+
+      <section class="view" id="historyView">
+        <div id="pipelineStatus" role="status" class="historyPipeline"></div>
+        <form id="historyFilters" class="historyFilters">
+          <label><span data-htext="Start">Start</span><input id="historyStart" type="datetime-local" required></label>
+          <label><span data-htext="End">End</span><input id="historyEnd" type="datetime-local" required></label>
+          <label><span data-htext="Timezone">Timezone</span><select id="historyZone"><option value="7">WIB (UTC+7)</option><option value="0">UTC</option></select></label>
+          <label><span data-htext="Records">Records</span><select id="historyMode"><option value="reports" data-htext="SOC snapshots">SOC snapshots</option><option value="intelligence" data-htext="Provider intelligence">Provider intelligence</option><option value="events" data-htext="Raw event drill-down">Raw event drill-down</option></select></label>
+          <label class="historyQuery"><span data-htext="Search">Search</span><input id="historyQuery" type="search" placeholder="IP, rule, device, operation"></label>
+          <label><span data-htext="Minimum level">Minimum level</span><select id="historyLevel"><option value="0">0+</option><option value="7">7+</option><option value="12">12+</option><option value="15">15</option></select></label>
+          <button type="submit" id="historySearch" data-htext="Search">Search</button>
+        </form>
+        <p id="historyStatus" role="status" aria-live="polite"></p>
+        <section id="historySummary" class="historySummary" aria-live="polite"></section>
+        <p id="historyChartSummary"></p>
+        <div id="historyTimeline" class="historyTimeline" aria-label="Event timeline"></div>
+        <div class="historyWorkspace">
+          <div class="historyTable"><table><thead id="historyHead"></thead><tbody id="historyRows"></tbody></table>
+            <div class="historyPager"><button id="historyPrevious" type="button" data-htext="Previous">Previous</button><span id="historyPage"></span><button id="historyNext" type="button" data-htext="Next">Next</button></div>
+          </div>
+          <section id="historyDetail" class="historyDetail" aria-live="polite"></section>
+        </div>
+      </section>
+
+      <section class="view" id="findingsView">
+        <div class="findingsSummary" id="findingsSummary" aria-live="polite"></div>
+        <div class="findingsCategories" id="findingsCategories" aria-label="Finding categories"></div>
+        <div class="findingsFilters">
+          <label>Search findings<input type="search" id="findingSearch" placeholder="IP, CVE, rule, user, hash..."></label>
+          <label>Evidence<select id="findingEvidence"><option value="all">All evidence</option><option value="observed">Wazuh observed</option><option value="inventory">Asset inventory</option><option value="intel">Intelligence feed / watchlist</option></select></label>
+          <label>Severity<select id="findingSeverity"><option value="all">All severities</option><option value="critical">Critical</option><option value="high">High</option><option value="medium">Medium</option><option value="low">Low</option><option value="unknown">Not assessed</option></select></label>
+        </div>
+        <div class="findingsWorkspace">
+          <section class="findingsList" aria-label="Finding results"><div class="findingsListHead"><strong id="findingsCount">Loading findings</strong><span>Most urgent first</span></div><div id="findingsRows"></div><div class="findingsPagination" id="findingsPagination"></div></section>
+          <section class="findingDetail" id="findingDetail" aria-label="Finding details"><div class="findingEmpty">Waiting for telemetry...</div></section>
+        </div>
+        <section class="findingAiOperations" aria-labelledby="findingAiOperationsTitle">
+          <div><h2 id="findingAiOperationsTitle">AI analyst operations</h2><button type="button" id="findingAiOperationsRefresh">Refresh</button></div>
+          <div id="findingAiOperations" aria-live="polite">Loading AI job status...</div>
+        </section>
+        <section class="findingSourceHealth"><h2>Integration health</h2><div id="findingHealth">Checking sources...</div></section>
+      </section>
+
+      <section class="view active" id="commandView">
+        <div id="pipelineCommand" class="historyPipeline" role="status"></div>
+        <div class="heroGrid">
+          <section class="heroPanel">
+            <div>
+              <p class="eyebrow">Operational Posture</p>
+              <span class="postureBadge" id="postureBadge">Loading</span>
+              <h2 id="postureTitle">Calculating posture</h2>
+              <p id="postureCopy" class="subtle">SOC signal fusion from Wazuh, GenSecAI, and INFOKOM.</p>
+              <div class="riskFactors" id="riskFactors"></div>
+            </div>
+            <div class="riskDial" id="riskDial">
+              <span id="riskScore">0</span>
+              <small id="riskMeta">Risk Score</small>
+            </div>
+          </section>
+          <section class="lanePanel">
+            <div class="lane" data-view-link="l1">
+              <span>L1</span>
+              <strong id="laneL1">-</strong>
+              <small id="laneL1Hint">alerts waiting for review</small>
+            </div>
+            <div class="lane" data-view-link="l2">
+              <span>L2</span>
+              <strong id="laneL2">-</strong>
+              <small id="laneL2Hint">correlation and enrichment signals</small>
+            </div>
+            <div class="lane" data-view-link="l3">
+              <span>L3</span>
+              <strong id="laneL3">-</strong>
+              <small id="laneL3Hint">hunt and intel tools ready</small>
+            </div>
+          </section>
+        </div>
+
+        <div class="insightStrip" id="insightStrip"></div>
+
+        <section class="glassPanel crossPlatformPanel">
+          <div class="panelHead">
+            <h2>Connected Platforms</h2>
+            <span id="platformStatusMeta">GenSecAI / INFOKOM / AI Analyst</span>
+          </div>
+          <div id="platformStatusGrid" class="platformStatusGrid">
+            <div class="platformConnecting">Loading platform status...</div>
+          </div>
+        </section>
+
+        <section class="glassPanel aiDeckPanel">
+          <div class="panelHead">
+            <h2>AI Intelligence Deck</h2>
+            <span id="aiDeckStatus">Latest analyst synthesis</span>
+          </div>
+          <div id="commandAiDeck" class="aiDeckGrid"></div>
+        </section>
+        <section class="glassPanel">
+          <div class="panelHead"><h2>Telemetry Health</h2><span>Indexer, shards, queues and dropped events</span></div>
+          <div id="telemetryEvidence" class="evidenceWorkspace"></div>
+        </section>
+
+        <div class="kpiGrid">
+          <article class="metric criticalLine" data-view-link="l1">
+            <span id="metricAlertsLabel">Alerts</span>
+            <strong id="metricAlerts">-</strong>
+            <small id="metricSample">-</small>
+          </article>
+          <article class="metric greenLine" data-view-link="assets">
+            <span>Active Agents</span>
+            <strong id="metricAgents">-</strong>
+            <small id="metricAgentTotal">-</small>
+          </article>
+          <article class="metric amberLine" data-view-link="vuln">
+            <span>Critical CVEs</span>
+            <strong id="metricCriticalCves">-</strong>
+            <small id="metricVulnTotal">-</small>
+          </article>
+          <article class="metric violetLine" data-view-link="l2">
+            <span>AI Recon Sources</span>
+            <strong id="metricAiSources">-</strong>
+            <small>LLM and crawler probes</small>
+          </article>
+          <article class="metric blueLine" data-view-link="tools">
+            <span>MCP Tools</span>
+            <strong id="metricTools">-</strong>
+            <small id="metricToolSplit">-</small>
+          </article>
+        </div>
+
+        <div class="gridThree">
+          <section class="glassPanel">
+            <div class="panelHead">
+              <h2>Severity Distribution</h2>
+              <span id="severityNote">Sample window</span>
+            </div>
+            <div class="severityBars" id="severityBars"></div>
+          </section>
+          <section class="glassPanel">
+            <div class="panelHead">
+              <h2>Hourly Activity</h2>
+              <span>Manager statistics</span>
+            </div>
+            <div class="sparkline" id="hourlySpark"></div>
+          </section>
+          <section class="glassPanel">
+            <div class="panelHead">
+              <h2>MCP Coverage</h2>
+              <span>Capability map</span>
+            </div>
+            <div class="coverageGrid" id="coverageGrid"></div>
+          </section>
+        </div>
+
+        <section class="glassPanel timelinePanel">
+          <div class="panelHead">
+            <h2>Attack Timeline</h2>
+            <span id="timelineMeta">Alert histogram</span>
+          </div>
+          <div class="attackTimeline" id="attackTimeline"></div>
+        </section>
+
+        <div class="gridTwo mapDetectionGrid">
+          <section class="glassPanel mapPanel">
+            <div class="panelHead">
+              <h2>Source Geo and IP Map</h2>
+              <span>Attacker origins and hot IPs</span>
+            </div>
+            <div class="mapLayout">
+              <div class="worldMap" id="attackMap"></div>
+              <div class="geoList" id="geoList"></div>
+            </div>
+          </section>
+          <section class="glassPanel">
+            <div class="panelHead">
+              <h2>Detection Layers</h2>
+              <span>FIM, auth, NIDS, web, vuln, SIEM</span>
+            </div>
+            <div class="layerGrid" id="detectionLayers"></div>
+          </section>
+        </div>
+
+        <section class="glassPanel">
+          <div class="panelHead">
+            <h2>Microsoft 365 Analytics</h2>
+            <span>Cloud audit, DLP and SaaS activity</span>
+          </div>
+          <div class="cloudM365" id="cloudM365Panel"></div>
+        </section>
+
+        <section class="glassPanel coveragePanel">
+          <div class="panelHead">
+            <h2>SOC Data Coverage</h2>
+            <span>Current telemetry, pivots and analytic gaps</span>
+          </div>
+          <div class="socCoverageGrid" id="socDataCoverage"></div>
+        </section>
+
+        <section class="glassPanel">
+          <div class="panelHead">
+            <h2>Attack Path Graph</h2>
+            <span>Source to affected asset</span>
+          </div>
+          <div class="attackPath" id="attackPath"></div>
+        </section>
+
+        <div class="gridTwo">
+          <section class="glassPanel">
+            <div class="panelHead">
+              <h2>Priority Threat Queue</h2>
+              <span>Click row for Wazuh events</span>
+            </div>
+            <div class="threatTable" id="overviewThreats"></div>
+          </section>
+          <section class="glassPanel">
+            <div class="panelHead">
+              <h2>Source IP Leaderboard</h2>
+              <span>Observed in top detections</span>
+            </div>
+            <div class="ipList" id="sourceIpList"></div>
+          </section>
+        </div>
+      </section>
+
+      <section class="view" id="workbenchView">
+        <section id="automationPanel" class="glassPanel">
+          <div class="panelHead"><h2>SOC Analysis Report</h2><span id="automationStatus" role="status" aria-live="polite"></span></div>
+          <div class="settingsActions">
+            <button type="button" id="runAutomation">Run analysis</button>
+            <button type="button" id="sendReportEmail">Send email report</button>
+            <button type="button" id="sendReportTeams">Send Teams report</button>
+          </div>
+          <div id="automationReport" class="automationReport"></div>
+        </section>
+        <section class="glassPanel">
+          <div class="panelHead">
+            <h2>SOC Action Deck</h2>
+            <span>Daily analyst launchpad</span>
+          </div>
+          <div class="actionDeck" id="socActionDeck"></div>
+        </section>
+        <section class="glassPanel">
+          <div class="panelHead">
+            <h2>Provider Intelligence Coverage</h2>
+            <span>Evidence depth and API health from latest automation</span>
+          </div>
+          <div id="workbenchProviderDeck" class="providerCoverageDeck"></div>
+        </section>
+        <div class="gridTwo">
+          <section class="glassPanel">
+            <div class="panelHead">
+              <h2>Threat Intel Workbench</h2>
+              <span>IOC enrichment and reputation</span>
+            </div>
+            <div class="toolRail" id="intelWorkbench"></div>
+          </section>
+          <section class="glassPanel">
+            <div class="panelHead">
+              <h2>Response Guardrails</h2>
+              <span>Controlled containment</span>
+            </div>
+            <div class="toolRail" id="responseWorkbench"></div>
+          </section>
+        </div>
+        <div class="gridTwo">
+          <section class="glassPanel">
+            <div class="panelHead">
+              <h2>Cloud and Container</h2>
+              <span>Docker and Microsoft 365 readiness</span>
+            </div>
+            <div class="sourceBoard" id="cloudContainerWorkbench"></div>
+          </section>
+          <section class="glassPanel">
+            <div class="panelHead">
+              <h2>Compliance Evidence</h2>
+              <span>Audit and control tools</span>
+            </div>
+            <div class="toolRail" id="complianceWorkbench"></div>
+          </section>
+        </div>
+      </section>
+
+      <section class="view" id="l1View">
+        <div class="gridTwo">
+          <section class="glassPanel tall">
+            <div class="panelHead">
+              <h2>L1 Alert Triage</h2>
+              <span>Queue and first response</span>
+            </div>
+            <div class="threatTable" id="l1Queue"></div>
+          </section>
+          <section class="glassPanel tall">
+            <div class="panelHead">
+              <h2>Agent Availability</h2>
+              <span id="assetSummary">-</span>
+            </div>
+            <div class="agentTable" id="l1Agents"></div>
+            <div class="decisionList" id="l1DecisionList"></div>
+          </section>
+        </div>
+      </section>
+
+      <section class="view" id="l2View">
+        <div class="gridTwo">
+          <section class="glassPanel">
+            <div class="panelHead">
+              <h2>3-Sum Correlation</h2>
+              <span id="correlationMeta">Recon, exploit, impact</span>
+            </div>
+            <div class="panelIntro" id="correlationIntro">Combines related recon, exploit, and impact signals into investigation candidates.</div>
+            <div class="correlationGrid" id="correlationGrid"></div>
+          </section>
+          <section class="glassPanel">
+            <div class="panelHead">
+              <h2>AI Bot Recon</h2>
+              <span id="aiReconMeta">INFOKOM detector</span>
+            </div>
+            <div class="panelIntro" id="aiReconIntro">Sources are ranked by exposed-path probes, not by confirmed compromise.</div>
+            <div id="aiReconList" class="intelList"></div>
+          </section>
+        </div>
+        <section class="glassPanel">
+          <div class="panelHead">
+            <h2>Investigation Flow</h2>
+            <span>Analyst handoff</span>
+          </div>
+          <div class="flowBoard" id="investigationFlow"></div>
+        </section>
+        <section class="glassPanel">
+          <div class="panelHead"><h2>Network and Identity Evidence</h2><span>Bounded samples from the selected window</span></div>
+          <div id="networkIdentityEvidence" class="evidenceWorkspace"></div>
+        </section>
+      </section>
+
+      <section class="view" id="incidentsView">
+        <div class="gridTwo">
+          <section class="glassPanel tall">
+            <div class="panelHead">
+              <h2>Incident Board</h2>
+              <span>Auto-built from current telemetry</span>
+            </div>
+            <div class="incidentBoard" id="incidentBoard"></div>
+          </section>
+          <section class="glassPanel tall">
+            <div class="panelHead">
+              <h2>Incident Detail</h2>
+              <span>Selected source context</span>
+            </div>
+            <div class="incidentDetail" id="incidentDetail"></div>
+          </section>
+        </div>
+      </section>
+
+      <section class="view" id="l3View">
+        <div class="gridTwo">
+          <section class="glassPanel">
+            <div class="panelHead">
+              <h2>Hunting Arsenal</h2>
+              <span>INFOKOM and GenSecAI tools</span>
+            </div>
+            <div class="capabilityList" id="huntCapabilities"></div>
+          </section>
+          <section class="glassPanel">
+            <div class="panelHead">
+              <h2>Response and Compliance</h2>
+              <span>Controlled action map</span>
+            </div>
+            <div class="capabilityList" id="responseCapabilities"></div>
+          </section>
+        </div>
+        <section class="glassPanel">
+          <div class="panelHead">
+            <h2>Hunt Matrix</h2>
+            <span>Coverage by mission</span>
+          </div>
+          <div class="huntMatrix" id="huntMatrix"></div>
+        </section>
+        <div class="gridTwo">
+          <section class="glassPanel"><div class="panelHead"><h2>MITRE ATT&amp;CK Coverage</h2><span>Observed techniques</span></div><div id="mitreEvidence" class="evidenceWorkspace"></div></section>
+          <section class="glassPanel"><div class="panelHead"><h2>Decoder Coverage</h2><span>Volume and unmatched events</span></div><div id="decoderEvidence" class="evidenceWorkspace"></div></section>
+        </div>
+        <section class="glassPanel">
+          <div class="panelHead">
+            <h2>Threat Intel API Diagnostics</h2>
+            <span id="intelTestStatus">CrowdSec, OTX, VirusTotal, CVE enrichment</span>
+          </div>
+          <div class="providerToolbar">
+            <button id="testIntelBtn" type="button">Test APIs</button>
+            <span>Connection tests: 8.8.8.8, example.com, CVE-2024-6387. No local alert association.</span>
+          </div>
+          <div class="providerGrid" id="providerIntelGrid"></div>
+        </section>
+        <section class="glassPanel">
+          <div class="panelHead">
+            <h2>Multi-provider Threat Intel From Wazuh Sources</h2>
+            <span id="crowdSecStatus">CrowdSec, OTX, GreyNoise, VirusTotal, ThreatFox, AbuseIPDB, URLHaus, CYFIRMA</span>
+          </div>
+          <div class="crowdSecPanel" id="crowdSecPanel"></div>
+        </section>
+        <section class="glassPanel"><div class="panelHead"><h2>Provider Freshness</h2><span>Persisted cache, quota and skip reason</span></div><div id="providerFreshness" class="evidenceWorkspace"></div></section>
+        <section class="glassPanel">
+          <div class="panelHead">
+            <h2>External Exposure Graph</h2>
+            <span>Public IP, cloud, assets and sensitive data</span>
+          </div>
+          <div class="attackPath" id="l3AttackPath"></div>
+        </section>
+      </section>
+
+      <section class="view" id="vulnView">
+        <section class="glassPanel aiDeckPanel">
+          <div class="panelHead">
+            <h2>AI CVE Priority Brief</h2>
+            <span>Asset inventory, EPSS, KEV and PoC context</span>
+          </div>
+          <div id="vulnAiBrief" class="vulnBriefGrid"></div>
+        </section>
+        <section class="glassPanel">
+          <div class="panelHead">
+            <h2>CVE Exposure Graph</h2>
+            <span id="cveExposureStatus" role="status" aria-live="polite">Loads from cached Wazuh inventory when this menu opens</span>
+          </div>
+          <div id="cveExposureGraph" class="cveExposureWorkspace">
+            <div class="emptyState">Open Vulnerabilities to load the current exposure graph.</div>
+          </div>
+        </section>
+        <section class="glassPanel"><div class="panelHead"><h2>CVE Exposure Coverage</h2><span>Evidence provenance and gaps</span></div><div id="cveEvidenceCoverage" class="evidenceWorkspace"></div></section>
+        <div class="gridTwo">
+          <section class="glassPanel tall">
+            <div class="panelHead">
+              <h2>Critical Vulnerabilities</h2>
+              <span>Wazuh inventory</span>
+            </div>
+            <div class="vulnList" id="criticalVulnList"></div>
+          </section>
+          <section class="glassPanel tall">
+            <div class="panelHead">
+              <h2>Quick CVE Triage</h2>
+              <span>NVD, EPSS, KEV, PoC</span>
+            </div>
+            <div class="formRow">
+              <input id="cveInput" value="CVE-2024-6387" aria-label="CVE ID">
+              <button id="cveBtn" type="button">Score</button>
+            </div>
+            <pre id="cveResult" class="resultPane"></pre>
+          </section>
+        </div>
+      </section>
+
+      <section class="view" id="assetsView">
+        <div class="gridTwo">
+          <section class="glassPanel">
+            <div class="panelHead">
+              <h2>Platform Mix</h2>
+              <span>Managed devices</span>
+            </div>
+            <div class="donutPanel">
+              <div class="donut" id="platformDonut"></div>
+              <div id="platformLegend" class="legendList"></div>
+            </div>
+          </section>
+          <section class="glassPanel">
+            <div class="panelHead">
+              <h2>Agents</h2>
+              <span id="agentCountLabel">-</span>
+            </div>
+            <div class="agentTable" id="agentTable"></div>
+          </section>
+        </div>
+        <section class="glassPanel"><div class="panelHead"><h2>Asset Security Context</h2><span>Ownership, criticality, zone and software identity</span></div><div id="assetContextEvidence" class="evidenceWorkspace"></div></section>
+      </section>
+
+      <section class="view" id="toolsView">
+        <section class="toolShell">
+          <div class="toolToolbar">
+            <input id="searchInput" type="search" placeholder="Search tools">
+            <select id="categorySelect" aria-label="Tool category">
+              <option value="all">All categories</option>
+            </select>
+            <div class="segments" role="tablist">
+              <button class="active" data-filter="all" type="button">All</button>
+              <button data-filter="gensecai" type="button">GenSecAI</button>
+              <button data-filter="infokom" type="button">INFOKOM</button>
+              <button data-filter="new" type="button">New</button>
+            </div>
+          </div>
+          <div class="toolReadiness" id="toolReadiness" role="status" aria-live="polite"></div>
+          <div class="toolLayout">
+            <aside class="toolList" id="toolList"></aside>
+            <section class="runner">
+              <div class="runnerHeader">
+                <div>
+                  <h2 id="toolName">Select a tool</h2>
+                  <span id="toolSource"></span>
+                </div>
+                <button id="runBtn" type="button" disabled>Run</button>
+              </div>
+              <div class="toolMeta" id="toolMeta"></div>
+              <textarea id="argsInput" spellcheck="false">{}</textarea>
+              <div class="resultBox" id="resultBox">
+                <div class="emptyState">Run a tool to see structured SOC output.</div>
+              </div>
+            </section>
+          </div>
+        </section>
+      </section>
+
+      <section class="view" id="settingsView">
+        <section class="glassPanel" id="automationConnectionPanel">
+          <div class="panelHead"><h2>AI &amp; Email Connection</h2><span id="automationConnectionStatus" role="status" aria-live="polite"></span></div>
+          <div class="settingsActions">
+            <button type="button" id="testAnalyst">Test AI Analyst</button>
+            <button type="button" id="testSmtp">Test SMTP / TLS</button>
+            <button type="button" data-open-automation>Open analysis report</button>
+          </div>
+          <div id="automationDiagnostics" class="automationReport" aria-live="polite"></div>
+        </section>
+        <form id="settingsForm" class="settingsShell">
+          <section class="glassPanel">
+            <div class="panelHead">
+              <h2>Runtime Settings</h2>
+              <span id="settingsStatus">Ready</span>
+            </div>
+            <div class="settingsActions">
+              <button id="saveSettingsBtn" type="submit">Save Settings</button>
+              <button id="resetSettingsBtn" type="button">Reload</button>
+              <button id="testM365Btn" type="button">Test M365</button>
+              <button id="startM365Btn" type="button">Start M365 Feed</button>
+            </div>
+            <div class="settingsGrid" id="settingsFields"></div>
+            <div class="settingsTest" id="m365TestResult"></div>
+          </section>
+          <div class="gridTwo">
+            <section class="glassPanel">
+              <div class="panelHead">
+                <h2>Connection Status</h2>
+                <span>Runtime config</span>
+              </div>
+              <dl class="settingsList" id="settingsList"></dl>
+            </section>
+            <section class="glassPanel">
+              <div class="panelHead">
+                <h2>Storage</h2>
+                <span>5TB Wazuh data path</span>
+              </div>
+              <dl class="settingsList" id="storageList"></dl>
+            </section>
+          </div>
+        </form>
+      </section>
+    </main>
+    <script src="/static/app.js?v=20260920-1"></script>
+    <script src="/static/findings.js?v=20260920-2"></script>
+    <script src="/static/vendor/chart.umd.js"></script>
+    <script src="/static/locale.js?v=20260911-1"></script>
+    <script src="/static/analysis-workspace.js?v=20260913-1"></script>
+    <script src="/static/enterprise.js?v=20260915-3"></script>
+    <script src="/static/automation.js?v=20260915-2"></script>
+    <script src="/static/history.js?v=20260915-6"></script>
+    <script src="/static/workflows.js?v=20260919-1"></script>
+  </body>
+</html>

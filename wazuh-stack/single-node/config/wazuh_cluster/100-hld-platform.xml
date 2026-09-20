@@ -1,0 +1,4 @@
+<!-- Valid placeholder for explicitly tagged HLD platform events. -->
+<decoder name="hld-platform">
+  <prematch>^HLD_PLATFORM:</prematch>
+</decoder>

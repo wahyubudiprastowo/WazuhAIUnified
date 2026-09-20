@@ -1,0 +1,45 @@
+<group name="local,hld_platform,pam,soar,">
+
+  <rule id="100200" level="3">
+    <decoded_as>json</decoded_as>
+    <field name="platform">pam</field>
+    <description>Containerized PAM audit event</description>
+    <group>pam,audit,privileged_access,</group>
+  </rule>
+
+  <rule id="100201" level="8">
+    <if_sid>100200</if_sid>
+    <match type="pcre2">(?i)"action"\s*:\s*"(login_failed|mfa_failed|policy_denied|session_denied)"</match>
+    <description>PAM privileged access denied or failed MFA</description>
+    <group>pam,audit,privileged_access,authentication_failed,</group>
+  </rule>
+
+  <rule id="100202" level="10">
+    <if_sid>100200</if_sid>
+    <match type="pcre2">(?i)"action"\s*:\s*"(credential_checkout|session_start|privilege_escalation)"</match>
+    <description>PAM privileged session activity</description>
+    <group>pam,audit,privileged_access,session_activity,</group>
+  </rule>
+
+  <rule id="100210" level="3">
+    <decoded_as>json</decoded_as>
+    <field name="platform">soar</field>
+    <description>SOAR automation event</description>
+    <group>soar,automation,response,</group>
+  </rule>
+
+  <rule id="100211" level="9">
+    <if_sid>100210</if_sid>
+    <match type="pcre2">(?i)"action"\s*:\s*"(approval_requested|approval_denied|approval_expired)"</match>
+    <description>SOAR response approval workflow event</description>
+    <group>soar,automation,approval,</group>
+  </rule>
+
+  <rule id="100212" level="12">
+    <if_sid>100210</if_sid>
+    <match type="pcre2">(?i)"action"\s*:\s*"(containment_executed|credential_rotated|account_disabled|host_isolated)"</match>
+    <description>Approved SOAR containment action executed</description>
+    <group>soar,automation,active_response,</group>
+  </rule>
+
+</group>

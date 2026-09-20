@@ -1,0 +1,3 @@
+FROM wazuh-main-server:4.3.0-threesum
+
+COPY --chown=wazuh:wazuh src/ /app/src/

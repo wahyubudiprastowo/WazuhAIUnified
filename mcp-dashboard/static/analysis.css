@@ -1,0 +1,108 @@
+/* Evidence surfaces share the SOC shell; status colors never replace labels. */
+.view { max-width: none; width: 100%; min-width: 0; }
+.view > *, .gridTwo > *, .analysisBody, .analysisControls > * { min-width: 0; }
+#findingsView { --finding-border: #3b4a51; --finding-muted: #bac8cf; --finding-text: #edf4f7; }
+#findingsView .findingsSummary, #findingsView .findingSourceHealth { background: #242e33; }
+#findingsView .findingsCategories, #findingsView .findingsList, #findingsView .findingDetailHead { background: #1d272c; }
+#findingsView .findingsFilters, #findingsView .findingsWorkspace, #findingsView .findingDetail, #findingsView .findingDetailTabs { background: #192126; }
+#findingsView .findingsSummary strong, #findingsView .findingCveMetrics dd { color: #67dfc8; }
+#findingsView button { border-color: #455961; }
+#findingsView button:hover, #findingsView .findingRow.selected { background: #243e41; }
+#findingsView .findingRow.selected { border-left-color: #54d3c2; }
+#findingsView input, #findingsView select { background: #111b20; color: #edf4f7; border-color: #51656d; color-scheme: dark; }
+#findingsView .findingsCategories button[aria-pressed="true"] { background: #27484a; color: #8af0dc; border-color: #5bada4; }
+#findingsView .findingsCategories button span, #findingsView .findingBadge { background: #31414a; color: #d1e3ea; }
+#findingsView .findingBadge.critical { background: #562834; color: #ffb7c6; }
+#findingsView .findingBadge.high { background: #503622; color: #ffcf8c; }
+#findingsView .findingBadge.medium { background: #494024; color: #ffe28c; }
+#findingsView .findingBadge.low { background: #214638; color: #94e5bd; }
+#findingsView .findingDetailTabs button[aria-selected="true"] { color: #80e7d6; border-bottom-color: #54d3c2; }
+#findingsView .findingSection h3 { color: #dceef4; }
+#findingsView .findingSection, #findingsView .findingCampaign, #findingsView .findingDataTable th, #findingsView .findingDataTable td { border-color: var(--finding-border); }
+#findingsView .findingTag, #findingsView .findingPaths code, #findingsView .findingDataTable th { background: #29383f; border-color: #425963; color: #d6e6ec; }
+#findingsView .findingNotice { background: #383322; border-color: #d6b357; color: #f1dcab; }
+#findingsView .findingRaw summary, #findingsView .findingReferences a, #findingsView .findingCve { color: #8bdace; }
+#findingsView .findingCve { border-color: #517f7d; }
+#findingsView .findingDetectionBar { background: #33444b; }
+.findingsWorkspace { align-items: start; }
+.findingDetailHead { background-image: none; }
+.findingProviderBody { font-size: 14px; }
+.findingFields { gap: 14px 24px; }
+.findingDetail { min-height: 650px; }
+.threatHeader, .threatRow { grid-template-columns: minmax(150px,1fr) 76px 70px 38px 60px; gap: 10px; }
+.threatRow > * { min-width: 0; overflow-wrap: anywhere; }
+.threatRow strong { font-size: 14px; line-height: 1.5; }
+.threatRow:hover { transform: none; background: #24343a; }
+.threatRow .rowActions { flex-wrap: wrap; }
+.threatRow .rowActions button { min-width: 0; padding: 6px 8px; }
+.ruleMeaning { margin: 7px 0; color: #ccdade; font-size: 13px; line-height: 1.6; }
+.threatRow small { display: block; font-size: 12px; line-height: 1.5; }
+.analysisOverview { margin-bottom: 18px; }
+.analysisOverview .panelHead { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; border-bottom: 1px solid var(--line); padding: 16px 18px; }
+.analysisOverview .panelHead h2 { font-size: 17px; line-height: 1.4; margin: 0; }
+.analysisOverview .panelHead span { font-size: 12px; color: var(--muted); }
+.analysisBody { padding: 18px; }
+.analysisMetrics { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); border-bottom: 1px solid var(--line); padding-bottom: 16px; gap: 16px; }
+.analysisMetrics > div { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.analysisMetrics span { color: var(--muted); font-size: 12px; }
+.analysisMetrics b { font-size: 24px; line-height: 1.4; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.analysisScope { color: var(--muted); font-size: 12px; line-height: 1.7; margin: 12px 0; overflow-wrap: anywhere; }
+.analysisControls { display: flex; align-items: end; gap: 12px; flex-wrap: wrap; margin-top: 18px; }
+.analysisControls label { flex: 1 1 300px; display: flex; flex-direction: column; gap: 7px; font-size: 13px; }
+.analysisControls select { width: 100%; min-width: 0; height: 42px; color-scheme: dark; }
+.analysisControls button { min-height: 42px; font-size: 13px; }
+.analysisTableWrap { overflow: auto; }
+.analysisTable { table-layout: fixed; width: 100%; border-collapse: collapse; font-size: 13px; line-height: 1.6; }
+.analysisTable th, .analysisTable td { text-align: left; padding: 12px; vertical-align: top; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+.analysisTable thead th { background: #29363c; font-size: 12px; color: #c7d9df; }
+.analysisTable th:first-child { width: 150px; }
+.analysisTable th:nth-child(2) { width: 240px; }
+.analysisStatus { color: #bddee5; }
+.analysisStatus.danger { color: #ff9cab; }
+.analysisStatus.warning { color: #ffda8d; }
+.analysisRuleGuide > summary { padding: 12px 0; cursor: pointer; font-size: 14px; font-weight: 600; }
+.analystExplanation { border-top: 1px solid var(--line); padding: 16px 0; line-height: 1.65; font-size: 13px; }
+.analystExplanation > strong { color: #8ee4d4; font-size: 15px; }
+.analystExplanation p { margin: 8px 0; }
+.analystExplanation dl { display: grid; grid-template-columns: 140px minmax(0,1fr); gap: 8px 16px; margin: 14px 0; }
+.analystExplanation dt { color: #adbfca; }
+.analystExplanation dd { margin: 0; }
+.analystExplanation small { display: block; color: var(--muted); margin: 10px 0; }
+.analystExplanation button { min-height: 38px; }
+.toolAnalystContext { padding: 18px; border-bottom: 1px solid var(--line); background: #1b3032; }
+.toolAnalystContext h3 { font-size: 16px; margin: 0; }
+.toolAnalystContext p { font-size: 13px; line-height: 1.7; }
+.toolProviderEvidence { --finding-border: #3b4a51; --finding-muted: #bac8cf; --finding-text: #edf4f7; }
+.toolProviderEvidence > p { font-size: 13px; line-height: 1.7; color: var(--muted); }
+.toolProviderEvidence .findingSection h3 { color: #dceef4; }
+.toolProviderEvidence .findingSection, .toolProviderEvidence .findingCampaign { border-color: #3b4a51; }
+.toolProviderEvidence .findingTag, .toolProviderEvidence .findingBadge, .toolProviderEvidence .findingDataTable th { background: #29383f; border-color: #425963; color: #d6e6ec; }
+.toolProviderEvidence .findingBadge.high { background: #503622; color: #ffcf8c; }
+.toolProviderEvidence .findingNotice { background: #383322; color: #f1dcab; }
+.toolProviderEvidence .findingRaw summary { color: #8bdace; }
+#aiReconList .intelItem { align-items: start; }
+#aiReconList button { margin-top: 10px; min-height: 36px; font-size: 12px; }
+#aiReconList { max-height: 600px; overflow: auto; }
+#l1Queue { max-height: 850px; overflow: auto; }
+#l1View .gridTwo { grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); }
+@media (max-width: 1250px) {
+  #l1View .gridTwo { grid-template-columns: minmax(0,1fr); }
+  .threatHeader, .threatRow { grid-template-columns: minmax(140px,1fr) 70px 60px 35px 55px; gap: 8px; }
+}
+@media (max-width: 760px) {
+  .analysisMetrics { grid-template-columns: repeat(2,minmax(0,1fr)); }
+  .analysisMetrics b { font-size: 21px; }
+  .analysisBody { padding: 14px; }
+  .analysisTable th:first-child { width: 98px; }
+  .analysisTable th:nth-child(2) { width: 110px; }
+  .analysisTable th, .analysisTable td { padding: 10px 6px; }
+  .analysisControls label { flex-basis: 100%; }
+  .analystExplanation dl { grid-template-columns: 1fr; gap: 4px; }
+  .analystExplanation dd { margin-bottom: 10px; }
+  .threatHeader { display: none; }
+  .threatRow { grid-template-columns: repeat(4,minmax(0,1fr)); }
+  .threatRow > div:first-child { grid-column: 1/-1; }
+  .threatRow > span:nth-child(3)::before { content: "Events: "; }
+  .threatRow > strong::before { content: "Score: "; font-weight: normal; }
+}
+@media (prefers-reduced-motion: reduce) { .threatRow { transition: none; } }

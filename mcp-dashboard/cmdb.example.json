@@ -1,0 +1,31 @@
+{
+  "schema_version": "1.0.0",
+  "generated_at": "2026-09-20T00:00:00Z",
+  "assets": [
+    {
+      "agent_id": "007",
+      "host": "edge-fw.example.internal",
+      "name": "Edge Firewall",
+      "owner": "Network SOC",
+      "criticality": "critical",
+      "environment": "production",
+      "network_zone": "dmz",
+      "application": "internet-edge",
+      "internet_exposed": true,
+      "patch_state": "pending",
+      "last_verified": "2026-09-20T00:00:00Z",
+      "components": [
+        {
+          "name": "FortiOS",
+          "vendor": "fortinet",
+          "product": "fortios",
+          "version": "7.4.3",
+          "cpe": "cpe:2.3:o:fortinet:fortios:7.4.3:*:*:*:*:*:*:*",
+          "patch_state": "pending",
+          "last_verified": "2026-09-20T00:00:00Z",
+          "source": "CMDB"
+        }
+      ]
+    }
+  ]
+}

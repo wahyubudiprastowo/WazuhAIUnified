@@ -1,0 +1,14 @@
+# Wazuh Indexer
+WAZUH_INDEXER_URL=https://wazuh.indexer:9200
+WAZUH_INDEXER_USER=admin
+WAZUH_INDEXER_PASSWORD=__WAZUH_INDEXER_PASSWORD__
+WAZUH_INDEXER_VERIFY_SSL=false
+
+# MCP Server
+MCP_URL=http://wazuh-main-server:3000
+
+# Minimum Wazuh level
+MIN_ALERT_LEVEL=10
+
+# Polling interval (seconds)
+POLL_INTERVAL=10

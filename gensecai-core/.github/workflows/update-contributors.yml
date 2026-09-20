@@ -1,0 +1,242 @@
+# Auto-update Contributors Section in README
+# Runs weekly and on-demand to keep the Thanks section up to date
+
+name: Update Contributors
+
+on:
+  schedule:
+    # Run every Sunday at 00:00 UTC
+    - cron: '0 0 * * 0'
+  workflow_dispatch: # Allow manual trigger
+
+concurrency:
+  group: update-contributors
+  cancel-in-progress: true
+
+# NOTE: main is a protected branch, so this opens a pull request instead of pushing
+# directly. Requires "Allow GitHub Actions to create and approve pull requests"
+# (Settings -> Actions -> General -> Workflow permissions) to be enabled.
+jobs:
+  update-contributors:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Generate Contributors List
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          python << 'EOF'
+          import os
+          import json
+          import requests
+          from collections import defaultdict
+
+          GITHUB_TOKEN = os.environ.get('GITHUB_TOKEN')
+          REPO = os.environ.get('GITHUB_REPOSITORY', 'gensecaihq/Wazuh-MCP-Server')
+
+          headers = {
+              'Authorization': f'token {GITHUB_TOKEN}',
+              'Accept': 'application/vnd.github.v3+json'
+          }
+
+          # Track contributions per user
+          contributors = defaultdict(set)
+
+          # Bots to exclude
+          BOTS = {'dependabot[bot]', 'github-actions[bot]', 'deepsource-io[bot]', 'google-labs-jules[bot]'}
+
+          import re as _re
+          # Additive: seed from the contributors already acknowledged in the README so a
+          # transient API gap, a deleted issue, or discussions pagination can never
+          # un-acknowledge an existing contributor. Fresh API data below only adds.
+          try:
+              with open('README.md', encoding='utf-8') as _f:
+                  _existing = _f.read()
+              _m = _re.search(r'<!-- CONTRIBUTORS-START -->(.*?)<!-- CONTRIBUTORS-END -->', _existing, _re.DOTALL)
+              if _m:
+                  for _line in _m.group(1).splitlines():
+                      _lm = _re.search(r'\[@([A-Za-z0-9_-]+)\]', _line)
+                      if not _lm:
+                          continue
+                      _login = _lm.group(1)
+                      if _login in BOTS:
+                          continue
+                      if 'Code' in _line:
+                          contributors[_login].add('code')
+                      if 'Issues' in _line:
+                          contributors[_login].add('issues')
+                      if 'PRs' in _line or 'Pull' in _line:
+                          contributors[_login].add('prs')
+                      if 'Discussions' in _line:
+                          contributors[_login].add('discussions')
+                      contributors[_login]  # ensure present even if no badge parsed
+          except Exception as _e:
+              print(f"Could not seed from existing README: {_e}")
+
+          def fetch_paginated(url):
+              """Fetch all pages from a paginated GitHub API endpoint."""
+              results = []
+              page = 1
+              sep = '&' if '?' in url else '?'  # preserve an existing query string (e.g. state=all)
+              while True:
+                  resp = requests.get(f"{url}{sep}page={page}&per_page=100", headers=headers)
+                  if resp.status_code != 200:
+                      break
+                  data = resp.json()
+                  if not data:
+                      break
+                  results.extend(data)
+                  page += 1
+                  if page > 30:  # Safety limit
+                      break
+              return results
+
+          # Get code contributors
+          print("Fetching code contributors...")
+          code_contributors = fetch_paginated(f'https://api.github.com/repos/{REPO}/contributors')
+          for c in code_contributors:
+              login = c.get('login', '')
+              if login and login not in BOTS:
+                  contributors[login].add('code')
+
+          # Get issue authors (state=all so closed-issue authors are kept, not just open ones)
+          print("Fetching issue authors...")
+          issues = fetch_paginated(f'https://api.github.com/repos/{REPO}/issues?state=all')
+          for issue in issues:
+              if 'pull_request' not in issue:  # Exclude PRs from issues
+                  author = issue.get('user', {}).get('login', '')
+                  if author and author not in BOTS:
+                      contributors[author].add('issues')
+
+          # Get PR authors
+          print("Fetching PR authors...")
+          prs = fetch_paginated(f'https://api.github.com/repos/{REPO}/pulls?state=all')
+          for pr in prs:
+              author = pr.get('user', {}).get('login', '')
+              if author and author not in BOTS:
+                  contributors[author].add('prs')
+
+          # Get discussion authors using GraphQL
+          print("Fetching discussion authors...")
+          graphql_query = """
+          query($owner: String!, $name: String!) {
+            repository(owner: $owner, name: $name) {
+              discussions(first: 100) {
+                nodes {
+                  author {
+                    login
+                  }
+                }
+              }
+            }
+          }
+          """
+          owner, name = REPO.split('/')
+          graphql_resp = requests.post(
+              'https://api.github.com/graphql',
+              headers=headers,
+              json={'query': graphql_query, 'variables': {'owner': owner, 'name': name}}
+          )
+          if graphql_resp.status_code == 200:
+              data = graphql_resp.json()
+              discussions = data.get('data', {}).get('repository', {}).get('discussions', {}).get('nodes', [])
+              for d in discussions:
+                  author = d.get('author', {})
+                  if author:
+                      login = author.get('login', '')
+                      if login and login not in BOTS:
+                          contributors[login].add('discussions')
+
+          # Sort contributors: code first, then by name
+          def sort_key(item):
+              login, types = item
+              priority = 0
+              if 'code' in types:
+                  priority -= 100
+              if 'prs' in types:
+                  priority -= 50
+              if 'issues' in types:
+                  priority -= 25
+              if 'discussions' in types:
+                  priority -= 10
+              return (priority, login.lower())
+
+          sorted_contributors = sorted(contributors.items(), key=sort_key)
+
+          # Generate markdown table
+          rows = []
+          for login, types in sorted_contributors:
+              badges = []
+              if 'code' in types:
+                  badges.append('💻 Code')
+              if 'issues' in types:
+                  badges.append('🐛 Issues')
+              if 'prs' in types:
+                  badges.append('🔀 PRs')
+              if 'discussions' in types:
+                  badges.append('💬 Discussions')
+
+              row = f'| <img src="https://github.com/{login}.png" width="40" height="40" style="border-radius: 50%"/> | [@{login}](https://github.com/{login}) | {", ".join(badges)} |'
+              rows.append(row)
+
+          # Create the contributors section
+          contributors_md = """### Contributors
+
+          | Avatar | Username | Contributions |
+          |--------|----------|---------------|
+          """ + '\n'.join(rows) + """
+
+          **Legend:** 💻 Code · 🐛 Issues · 🔀 Pull Requests · 💬 Discussions
+          """
+
+          # Clean up indentation
+          contributors_md = '\n'.join(line.strip() for line in contributors_md.strip().split('\n'))
+
+          # Read README
+          with open('README.md', 'r') as f:
+              readme = f.read()
+
+          # Replace section between markers
+          import re
+          pattern = r'<!-- CONTRIBUTORS-START -->.*?<!-- CONTRIBUTORS-END -->'
+          replacement = f'<!-- CONTRIBUTORS-START -->\n{contributors_md}\n<!-- CONTRIBUTORS-END -->'
+
+          new_readme = re.sub(pattern, replacement, readme, flags=re.DOTALL)
+
+          # Write updated README
+          with open('README.md', 'w') as f:
+              f.write(new_readme)
+
+          print(f"Updated README with {len(contributors)} contributors")
+          EOF
+
+      - name: Open pull request with changes
+        uses: peter-evans/create-pull-request@v8
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "docs: update contributors list"
+          title: "docs: update contributors list"
+          body: |
+            Automated update of the Contributors section in the README.
+            Generated by the `Update Contributors` workflow.
+          branch: automation/update-contributors
+          delete-branch: true
+          add-paths: README.md

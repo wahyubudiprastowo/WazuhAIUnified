@@ -1,0 +1,33 @@
+name: wazuh-ai-hld
+
+services:
+  ai-alert-worker:
+    build:
+      context: ./alert-worker
+    image: wazuh-hld-ai-alert-worker:latest
+    container_name: wazuh-hld-ai-alert-worker
+    restart: unless-stopped
+    user: "${HLD_WORKER_UID:-1000}:${HLD_WORKER_GID:-1000}"
+    env_file:
+      - ./hld.env
+    volumes:
+      - ./runtime:/data
+    networks:
+      - wazuh-shared
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:noexec,nosuid,size=32m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  wazuh-shared:
+    external: true
+    name: ${WAZUH_DOCKER_NETWORK:-single-node_default}

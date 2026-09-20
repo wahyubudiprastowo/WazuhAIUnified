@@ -1,0 +1,63 @@
+# Never bake credentials, telemetry or backups into an image layer.
+.git
+.gitignore
+.github
+
+# Secrets / env
+.env
+.env.*
+*.env
+!*.env.example
+dashboard.env
+infokom.env
+hld.env
+secrets/
+
+# Runtime state, stores, logs
+runtime/
+**/runtime/
+*.db
+*.db-journal
+*.db-wal
+*.jsonl
+*.log
+logs/
+artifacts/
+**/artifacts/
+.ui-check/
+.skill-cache-*/
+
+# Captured telemetry / large data
+syslog-ingest/
+integration/captures/
+*.pcap
+*.pcapng
+backups/
+*.tar.gz
+
+# Certs
+*.pem
+*.key
+*.crt
+*.p12
+
+# Python / node caches
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+node_modules/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+tmp/
+temp/
+*.tmp
+*.bak
+*.bak-*

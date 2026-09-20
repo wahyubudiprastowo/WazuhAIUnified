@@ -1,0 +1,4 @@
+<!-- Valid placeholder for explicitly tagged network-device events. -->
+<decoder name="dg-network-device">
+  <prematch>^DG_NETWORK:</prematch>
+</decoder>

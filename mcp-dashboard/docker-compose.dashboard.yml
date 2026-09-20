@@ -1,0 +1,39 @@
+name: wazuh-mcp-dashboard
+
+services:
+  mcp-dashboard:
+    build:
+      context: .
+    image: wazuh-mcp-dashboard:latest
+    container_name: wazuh-mcp-dashboard
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    env_file:
+      - ./dashboard.env
+    environment:
+      DASHBOARD_CONFIG_FILE: /app/dashboard.env
+      SOC_CMDB_FILE: "${SOC_CMDB_FILE:-/app/cmdb/assets.json}"
+    volumes:
+      - ./dashboard.env:/app/dashboard.env
+      - "${DASHBOARD_CMDB_FILE:-../infokom-analysis/resource/assets.json}:${SOC_CMDB_FILE:-/app/cmdb/assets.json}:ro"
+      - soc-automation:/app/runtime
+    ports:
+      - "${DASHBOARD_HOST_PORT:-8088}:8088"
+    networks:
+      - wazuh-shared
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+networks:
+  wazuh-shared:
+    external: true
+    name: ${WAZUH_DOCKER_NETWORK:-single-node_default}
+
+volumes:
+  soc-automation:
