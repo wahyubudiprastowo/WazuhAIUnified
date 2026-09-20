@@ -388,7 +388,7 @@
       if (result.started) await refresh();
       else showStatus(result.reason || result.error || label(result.status));
       if (endpoint.endsWith('smtp-test')) {
-        diagnostics.innerHTML = `<dl class="settingsList">${[['SMTP',`${result.host || '-'}:${result.port || '-'}`], ['TCP',result.tcp],['TLS',result.tls],['OAuth2',result.auth_method],['Authenticated',result.authenticated],['Token roles',(result.token_roles || []).join(', ')],['Error',result.error],['Next step',result.next_step]].filter(([_,v]) => v != null).map(([k,v]) => `<dt>${esc(k)}</dt><dd>${esc(String(v))}</dd>`).join('')}</dl>`;
+        diagnostics.innerHTML = `<dl class="settingsList">${[['SMTP',`${result.host || '-'}:${result.port || '-'}`], ['Email enabled',result.email_enabled],['Recipients',result.recipient_count],['Sender configured',result.sender_configured],['TCP',result.tcp],['TLS',result.tls],['Auth method',result.auth_method],['Authenticated',result.authenticated],['SMTP.SendAsApp',result.smtp_send_as_app],['Token roles',(result.token_roles || []).join(', ')],['Error',result.error],['Next step',result.next_step]].filter(([_,v]) => v != null).map(([k,v]) => `<dt>${esc(k)}</dt><dd>${esc(String(v))}</dd>`).join('')}</dl>`;
       } else if (endpoint.endsWith('ai-ping')) {
         diagnostics.innerHTML = `<dl class="settingsList"><dt>AI</dt><dd>${esc(label(result.status))}</dd><dt>Model</dt><dd>${esc(result.model || '-')}</dd><dt>Finish</dt><dd>${esc(result.finish_reason || '-')}</dd><dt>Answer</dt><dd>${esc(result.answer || result.error || '-')}</dd></dl>`;
       } else if (endpoint.endsWith('ai-test')) {

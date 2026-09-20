@@ -83,6 +83,7 @@ FIELDS = [
     ("SOC_TEAMS_ENABLED", "Teams reports", "boolean", "false", "Report Delivery"),
     ("SOC_TEAMS_WEBHOOK", "Teams Workflow webhook URL", "secret", "", "Report Delivery"),
     ("SOC_DELIVERY_INTERVAL_SECONDS", "Minimum report delivery interval (seconds)", "integer", "86400", "Report Delivery"),
+    ("SOC_DELIVERY_ERROR_BACKOFF_SECONDS", "Failed delivery retry backoff (seconds)", "integer", "900", "Report Delivery"),
 ]
 SCHEMA = [{"key": k, "label": label, "type": typ, "group": group, "required": False, "restart": False,
            **({"options": ["password", "oauth2"] if k == "SOC_SMTP_AUTH" else ["id", "en"]} if typ == "choice" else {})} for k, label, typ, _, group in FIELDS]
@@ -109,6 +110,7 @@ LIMITS = {"SOC_INTERVAL_SECONDS": (900, 86400), "SOC_IOC_BUDGET": (0, 50),
           "SOC_CVE_BUDGET": (0, 20), "SOC_CVE_SNAPSHOT_LIMIT": (10, 100),
           "SOC_SMTP_PORT": (1, 65535),
           "SOC_DELIVERY_INTERVAL_SECONDS": (300, 604800),
+          "SOC_DELIVERY_ERROR_BACKOFF_SECONDS": (300, 86400),
           "AI_TIMEOUT_SECONDS": (10, 600), "AI_MAX_TOKENS": (256, 8192),
           "AI_MEMORY_REPORTS": (0, 30), "AI_FINDING_CACHE_SECONDS": (900, 604800),
           "AI_FINDING_QUEUE_MAX": (10, 1000), "AI_FINDING_LEASE_SECONDS": (30, 3600),
@@ -258,7 +260,10 @@ def smtp_authenticate(smtp, config):
 def smtp_test(config):
     result = {"host": config.get("SOC_SMTP_HOST"), "port": config.get("SOC_SMTP_PORT"),
               "auth_method": config.get("SOC_SMTP_AUTH", "password"), "tcp": False, "tls": False,
-              "authenticated": False, "sent": False}
+              "authenticated": False, "sent": False,
+              "email_enabled": config.get("SOC_EMAIL_ENABLED") == "true",
+              "sender_configured": bool(config.get("SOC_SMTP_FROM")),
+              "recipient_count": len([value for value in config.get("SOC_REPORT_RECIPIENTS", "").split(",") if value.strip()])}
     if not result["host"]:
         return {**result, "status": "not_configured", "error": "SMTP host is empty"}
     try:
@@ -276,15 +281,22 @@ def smtp_test(config):
                     claims = json.loads(base64.urlsafe_b64decode(claim + '=' * (-len(claim) % 4)))
                     result["token_roles"] = claims.get("roles", [])
                     result["token_audience"] = claims.get("aud")
+                    result["smtp_send_as_app"] = "SMTP.SendAsApp" in result["token_roles"]
                 except (ValueError, IndexError):
                     pass
             smtp_authenticate(smtp, config)
             result["authenticated"] = True
         result["status"] = "connected"
     except smtplib.SMTPAuthenticationError as exc:
+        oauth_missing_role = (result["auth_method"] == "oauth2"
+                              and result.get("smtp_send_as_app") is False)
         result.update(status="error", smtp_code=exc.smtp_code,
             error=exc.smtp_error.decode(errors="replace")[:500],
-            next_step=("Verify SMTP.SendAsApp consent (or Exchange application RBAC), Exchange service-principal registration, sender mailbox permission and SMTP AUTH policy" if result['auth_method'] == 'oauth2' else 'Verify mailbox credentials and whether SMTP password authentication is allowed by tenant/mailbox policy; do not disable MFA or tenant security defaults globally'))
+            next_step=("Token is missing SMTP.SendAsApp. Grant/admin-consent that application permission, register the Exchange service principal, scope sender mailbox permission, then retest."
+                       if oauth_missing_role else
+                       "Verify SMTP.SendAsApp consent (or Exchange application RBAC), Exchange service-principal registration, sender mailbox permission and SMTP AUTH policy"
+                       if result['auth_method'] == 'oauth2' else
+                       'Verify mailbox credentials and whether SMTP password authentication is allowed by tenant/mailbox policy; do not disable MFA or tenant security defaults globally'))
     except Exception as exc:
         result.update(status="error", error=str(exc)[:500])
     return result
@@ -380,6 +392,34 @@ def _read_sse(response):
     return content, finish_reason, model, usage
 
 
+def _chat_content_error(content):
+    """Recognize gateways that return quota/upstream failures as assistant text."""
+    text = str(content or "").strip()
+    compact = re.sub(r"\s+", " ", text).lower()
+    if not compact:
+        return None
+    bracketed_error = compact.startswith("[error:") or compact.startswith("error:")
+    known_failure = any(marker in compact for marker in (
+        "you've hit your limit", "you have hit your limit", "quota exceeded",
+        "insufficient_quota", "rate limit exceeded", "upstream model error",
+        "provider unavailable", "service overloaded",
+    ))
+    if bracketed_error or (len(compact) <= 800 and known_failure):
+        return text[:500]
+    return None
+
+
+def _validated_chat_result(result):
+    if not isinstance(result, dict):
+        raise RuntimeError("AI provider returned an invalid response")
+    choice = (result.get("choices") or [{}])[0]
+    content = ((choice.get("message") or {}).get("content") or "").strip()
+    provider_error = _chat_content_error(content)
+    if provider_error:
+        raise RuntimeError(f"AI provider rejected the request: {provider_error}")
+    return result
+
+
 def post_chat(url, payload, headers=None, timeout=60):
     """POST a chat/completions payload using SSE streaming, with JSON fallback.
 
@@ -398,7 +438,7 @@ def post_chat(url, payload, headers=None, timeout=60):
             ctype = (response.headers.get("Content-Type") or "").lower()
             if "text/event-stream" in ctype or "ndjson" in ctype:
                 content, finish_reason, model, usage = _read_sse(response)
-                return {
+                return _validated_chat_result({
                     "model": model or payload.get("model"),
                     "choices": [{
                         "index": 0,
@@ -406,10 +446,10 @@ def post_chat(url, payload, headers=None, timeout=60):
                         "message": {"role": "assistant", "content": content},
                     }],
                     "usage": usage,
-                }
+                })
             # Non-stream JSON body fallback.
             raw = response.read(2_000_000).decode()
-            return json.loads(raw) if raw else {}
+            return _validated_chat_result(json.loads(raw) if raw else {})
     except urllib.error.HTTPError as exc:
         raise RuntimeError(f"Remote service HTTP {exc.code}") from None
     except (TimeoutError, socket.timeout):
@@ -436,14 +476,17 @@ def test_model_connection(config):
     if not base or not model:
         return {"status": "not_configured", "error": "AI provider URL and model are required"}
     headers = {"Authorization": "Bearer " + config["AI_API_KEY"]} if config.get("AI_API_KEY") else {}
-    result = post_chat(base + "/chat/completions", {
-        "model": model,
-        "max_tokens": 128,
-        "messages": [
-            {"role": "system", "content": "You are a SOC connectivity test. Reply with one short sentence."},
-            {"role": "user", "content": "Classify: SSH brute force, 200 failed logins from 45.13.2.9."},
-        ],
-    }, headers, timeout=int(config.get("AI_TIMEOUT_SECONDS", "180")))
+    try:
+        result = post_chat(base + "/chat/completions", {
+            "model": model,
+            "max_tokens": 128,
+            "messages": [
+                {"role": "system", "content": "You are a SOC connectivity test. Reply with one short sentence."},
+                {"role": "user", "content": "Classify: SSH brute force, 200 failed logins from 45.13.2.9."},
+            ],
+        }, headers, timeout=int(config.get("AI_TIMEOUT_SECONDS", "180")))
+    except Exception as exc:
+        return {"status": "error", "model": model, "error": str(exc)[:500]}
     choice = (result.get("choices") or [{}])[0]
     content = ((choice.get("message") or {}).get("content") or "").strip()
     if not content:
@@ -2415,7 +2458,9 @@ class Automation:
         with self.db() as db:
             previous = db.execute("SELECT sent,status FROM deliveries WHERE channel=? ORDER BY sent DESC LIMIT 1", (channel,)).fetchone()
         previous_result = json.loads(previous[1]) if previous else {}
-        retry_delay = int(cfg["SOC_DELIVERY_INTERVAL_SECONDS"]) if previous_result.get("status") in {"accepted", "partial"} else 60
+        retry_delay = (int_config(cfg, "SOC_DELIVERY_INTERVAL_SECONDS", 86400)
+                       if previous_result.get("status") in {"accepted", "partial"}
+                       else int_config(cfg, "SOC_DELIVERY_ERROR_BACKOFF_SECONDS", 900))
         if previous and time.time() - previous[0] < retry_delay:
             return {"status": "cooldown", "previous": json.loads(previous[1])}
         try:

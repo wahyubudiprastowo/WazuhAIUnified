@@ -1,3 +1,4 @@
+import base64
 import tempfile
 import time
 import unittest
@@ -137,6 +138,23 @@ class AutomationTests(unittest.TestCase):
             self.assertEqual(result['smtp_code'], 535)
             constructor.return_value.__enter__.return_value.send_message.assert_not_called()
 
+    def test_smtp_diagnostics_identify_missing_send_as_app_role(self):
+        config = {**self.config, 'SOC_SMTP_HOST': 'smtp.example.com', 'SOC_SMTP_AUTH': 'oauth2',
+                  'SOC_SMTP_USER': 'sender@example.com', 'SOC_EMAIL_ENABLED': 'false',
+                  'SOC_REPORT_RECIPIENTS': 'one@example.com,two@example.com'}
+        header = base64.urlsafe_b64encode(b'{"alg":"none"}').decode().rstrip('=')
+        claims = base64.urlsafe_b64encode(b'{"roles":["Mail.ReadWrite"]}').decode().rstrip('=')
+        token = f'{header}.{claims}.signature'
+        with patch.object(soc, 'smtp_token', return_value=token), \
+             patch.object(soc.smtplib, 'SMTP') as constructor:
+            smtp = constructor.return_value.__enter__.return_value
+            smtp.auth.side_effect = soc.smtplib.SMTPAuthenticationError(535, b'Authentication unsuccessful')
+            result = soc.smtp_test(config)
+        self.assertFalse(result['email_enabled'])
+        self.assertEqual(result['recipient_count'], 2)
+        self.assertFalse(result['smtp_send_as_app'])
+        self.assertIn('missing SMTP.SendAsApp', result['next_step'])
+
     def test_ai_test_persists_result_and_respects_active_analysis(self):
         self.worker.run()
         with patch.object(soc, 'analyze_with_model', return_value={'status': 'completed', 'result': {'summary': 'verified'}}) as model:
@@ -145,6 +163,33 @@ class AutomationTests(unittest.TestCase):
             self.worker.running = True
             self.assertEqual(self.worker.test_ai()['status'], 'busy')
             self.assertEqual(model.call_count, 1)
+
+    def test_ai_gateway_error_text_is_not_reported_as_connected(self):
+        response = Mock()
+        response.headers = {'Content-Type': 'text/event-stream'}
+        response.read.side_effect = [
+            b'data: {"model":"route","choices":[{"delta":{"content":"[Error: You have hit your limit. Please try again later.]"},"finish_reason":"stop"}]}\n\n',
+            b'',
+        ]
+        context = Mock()
+        context.__enter__ = Mock(return_value=response)
+        context.__exit__ = Mock(return_value=False)
+        with patch.object(soc.urllib.request, 'urlopen', return_value=context):
+            with self.assertRaisesRegex(RuntimeError, 'provider rejected'):
+                soc.post_chat('http://model/chat/completions', {'model': 'route'})
+
+    def test_ai_error_classifier_does_not_reject_normal_analysis(self):
+        self.assertIsNone(soc._chat_content_error('Rate limit activity was observed in the supplied firewall logs and should be investigated.'))
+        self.assertIn('quota', soc._chat_content_error('[Error: quota exceeded]'))
+
+    def test_model_connection_returns_structured_provider_error(self):
+        config = {**self.config, 'AI_ANALYST_ENABLED': 'true',
+                  'AI_PROVIDER_BASE_URL': 'http://model/v1', 'AI_MODEL': 'model'}
+        with patch.object(soc, 'post_chat', side_effect=RuntimeError('AI provider rejected the request: quota exceeded')):
+            result = soc.test_model_connection(config)
+        self.assertEqual(result['status'], 'error')
+        self.assertEqual(result['model'], 'model')
+        self.assertIn('quota exceeded', result['error'])
 
     def test_targeted_finding_ai_is_bounded_and_cached(self):
         self.config.update(AI_ANALYST_ENABLED='true', AI_PROVIDER_BASE_URL='http://model/v1', AI_MODEL='model')

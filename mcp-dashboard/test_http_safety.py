@@ -57,6 +57,8 @@ class HttpSafetyTests(unittest.TestCase):
             self.assertEqual(self.request('POST', '/api/tools', '{}')[0], 401)
             auth = base64.b64encode(b'soc:test-access-token').decode()
             self.assertEqual(self.request('GET', '/', headers={'Authorization': 'Basic ' + auth})[0], 200)
+            wrong_user = base64.b64encode(b'other:test-access-token').decode()
+            self.assertEqual(self.request('GET', '/', headers={'Authorization': 'Basic ' + wrong_user})[0], 401)
         with patch.object(server, '_tool_by_name', return_value={'name': 'wazuh_block_ip'}), patch.object(server, '_normalized_call') as call:
             status, _ = self.request('POST', '/api/call', '{"source":"gensecai","name":"wazuh_block_ip","arguments":{}}')
             self.assertEqual(status, 403)

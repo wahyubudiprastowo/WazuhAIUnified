@@ -39,6 +39,7 @@ CONFIG_FILE = Path(os.environ.get("DASHBOARD_CONFIG_FILE", ROOT / "dashboard.env
 HOST = os.environ.get("DASHBOARD_HOST", "0.0.0.0")
 PORT = int(os.environ.get("DASHBOARD_PORT", "8088"))
 DASHBOARD_ACCESS_TOKEN = os.environ.get("DASHBOARD_ACCESS_TOKEN", "")
+DASHBOARD_ACCESS_USERNAME = os.environ.get("DASHBOARD_ACCESS_USERNAME", "soc").strip() or "soc"
 _manual_tool_slots = threading.BoundedSemaphore(1)
 
 GENSECAI_MCP_URL = os.environ.get("GENSECAI_MCP_URL", "http://wazuh-main-server:3000").rstrip("/")
@@ -3472,7 +3473,9 @@ class Handler(SimpleHTTPRequestHandler):
         token = supplied.removeprefix('Bearer ') if supplied.startswith('Bearer ') else ''
         if supplied.startswith('Basic '):
             try:
-                token = base64.b64decode(supplied[6:], validate=True).decode().split(':', 1)[1]
+                username, token = base64.b64decode(supplied[6:], validate=True).decode().split(':', 1)
+                if not hmac.compare_digest(username.encode(), DASHBOARD_ACCESS_USERNAME.encode()):
+                    token = ''
             except (ValueError, UnicodeError, IndexError):
                 token = ''
         if hmac.compare_digest(token.encode(), DASHBOARD_ACCESS_TOKEN.encode()):
