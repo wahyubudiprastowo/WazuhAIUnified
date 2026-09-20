@@ -174,6 +174,27 @@ class AutomationTests(unittest.TestCase):
         self.assertIn("CVE-2026-99999", result)
         self.assertTrue(result["CVE-2026-99999"]["data"]["cve"]["data"]["components"]["in_kev"])
 
+    def test_cve_history_is_daily_idempotent_and_uses_no_provider_calls(self):
+        observed = datetime(2026, 9, 18, 10, tzinfo=timezone.utc).timestamp()
+        report = {"vulnerabilities": [{
+            "cve": "CVE-2026-99999", "agent": "server-01", "agent_id": "001",
+            "package": "openssl", "version": "3.0.0", "severity": "Critical",
+            "published_at": "2026-09-17T00:00:00Z", "detected_at": "2026-09-18T09:00:00Z",
+            "intelligence": {"cve": {"data": {"risk_score": 92, "components": {
+                "epss_probability": 0.91, "in_kev": True, "poc_confidence": "high"}}}},
+        }]}
+        self.worker._store_cve_observations(report, observed, 101)
+        self.worker._store_cve_observations(report, observed + 60, 101)
+        history = self.worker.cve_history(
+            datetime(2026, 9, 18, tzinfo=timezone.utc).isoformat(),
+            datetime(2026, 9, 19, tzinfo=timezone.utc).isoformat())
+        self.assertEqual(history["observations"], 1)
+        self.assertEqual(history["unique_cves"], 1)
+        self.assertEqual(history["affected_assets"], 1)
+        self.assertEqual(history["provider_calls"], 0)
+        self.assertTrue(history["items"][0]["kev"])
+        self.assertEqual(history["items"][0]["agent"]["name"], "server-01")
+
     def test_materialized_history_summary_preserves_soc_dimensions(self):
         created = time.time()
         report = {

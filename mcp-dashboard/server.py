@@ -839,9 +839,20 @@ def _indexer_request(path, payload, method='POST'):
             },
             method=method,
         )
-        with urllib.request.urlopen(req, timeout=30, context=ssl._create_unverified_context()) as resp:
-            raw = resp.read().decode("utf-8")
-            return json.loads(raw) if raw else None
+        try:
+            with urllib.request.urlopen(req, timeout=30, context=ssl._create_unverified_context()) as resp:
+                raw = resp.read().decode("utf-8")
+                return json.loads(raw) if raw else None
+        except urllib.error.HTTPError as exc:
+            raw = exc.read(8192).decode("utf-8", errors="replace")
+            try:
+                detail = json.loads(raw).get("error", raw)
+                if isinstance(detail, dict):
+                    detail = detail.get("reason") or detail.get("root_cause") or detail.get("type")
+            except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+                detail = raw
+            message = re.sub(r"\s+", " ", str(detail or exc.reason)).strip()[:600]
+            raise RuntimeError(f"OpenSearch HTTP {exc.code}: {message}") from None
     finally:
         _indexer_slots.release()
 
@@ -3536,13 +3547,13 @@ class Handler(SimpleHTTPRequestHandler):
                 _json_response(self, 200, _api_cache_write("history_events", history_payload, soc_pipeline.history(_indexer_search, history_payload), 180))
                 return
             if self.path == '/api/history/reports':
-                start, end = soc_pipeline.bounds(payload)
+                start, end = soc_pipeline.bounds(_history_payload(payload))
                 _json_response(self, 200, {'reports': automation.reports(start,end,int(payload.get('offset',0))),
                                            'timeline': automation.report_timeline(start, end) if int(payload.get('offset', 0)) == 0 else [],
                                            'summary': automation.history_summary(start, end) if int(payload.get('offset', 0)) == 0 else None})
                 return
             if self.path == '/api/history/intelligence':
-                start, end = soc_pipeline.bounds(payload)
+                start, end = soc_pipeline.bounds(_history_payload(payload))
                 _json_response(self, 200, _provider_history_payload(
                     start, end, int(payload.get('offset', 0)), payload.get('query', '')))
                 return
@@ -3647,16 +3658,26 @@ class Handler(SimpleHTTPRequestHandler):
                 _json_response(self, 200, vulnerability_inventory(_indexer_search, payload))
                 return
             if self.path == "/api/vulnerabilities/exposure":
+                historical = payload.get("range") in {"7d", "30d", "custom"} or bool(payload.get("start") or payload.get("end"))
                 request = {
                     "severity": payload.get("severity", "all"), "search": payload.get("search", ""),
                     "sort": payload.get("sort", "cve"), "limit": min(int(payload.get("limit", 100)), 100),
                     "include_summary": False,
                 }
+                if historical:
+                    start, end = soc_pipeline.bounds(_history_payload(payload))
+                    request.update({"historical": True, "start": start, "end": end})
                 cached = _api_cache_read("cve_exposure", request, 900)
                 if cached:
                     _json_response(self, 200, cached)
                     return
-                inventory = vulnerability_inventory(_indexer_search, request)
+                if historical:
+                    history = automation.cve_history(request["start"], request["end"], request["limit"])
+                    inventory = {"ok": True, "items": history["items"],
+                                 "total": history["observations"], "inventory_total": history["observations"]}
+                else:
+                    history = None
+                    inventory = vulnerability_inventory(_indexer_search, request)
                 cmdb_assets, cmdb_status = _load_cmdb_assets()
                 items = inventory.get("items") or []
                 cves = {
@@ -3674,6 +3695,7 @@ class Handler(SimpleHTTPRequestHandler):
                     "inventory_total": inventory.get("inventory_total", inventory.get("total", 0)),
                     "inventory_ok": inventory.get("ok", False), "cmdb": cmdb_status,
                     "cached_cve_enrichment": len(cached_intelligence),
+                    "history": history,
                 })
                 _json_response(self, 200, _api_cache_write("cve_exposure", request, graph, 900))
                 return

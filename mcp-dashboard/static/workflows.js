@@ -73,7 +73,7 @@
       }
       q("#workflowResult").textContent = result.json != null ? JSON.stringify(result.json, null, 2) : result.text;
     } catch (error) { update(error.message); }
-    finally { button.disabled = false; loadMenu(tool.workflow.menu); }
+    finally { button.disabled = false; loadMenu(tool.workflow.menu, true); }
   });
 
   function mount() {
@@ -85,18 +85,21 @@
         panel = document.createElement("section");
         panel.id = `workflow-${menu}`;
         panel.className = "workflowBand";
-        panel.innerHTML = `<h2>Investigation tools &amp; saved evidence</h2>
-          <div class="workflowControls"><label>Tool<select aria-label="${esc(viewTitles[menu])} tools"></select></label>
+        panel.innerHTML = `<details><summary><span>Analyst workflows</span><small data-workflow-summary>Saved evidence and on-demand actions</small></summary>
+          <div class="workflowBody"><div class="workflowControls"><label>Tool<select aria-label="${esc(viewTitles[menu])} tools"></select></label>
           <button type="button" data-prepare>Prepare</button><button type="button" data-history>Refresh history</button></div>
           <p class="workflowStatus" role="status" aria-live="polite"></p>
-          <div class="workflowHistory"></div><div class="workflowEvidence"></div>`;
+          <div class="workflowHistory"></div><div class="workflowEvidence"></div></div></details>`;
         view.append(panel);
         panel.querySelector("[data-prepare]").addEventListener("click", () => {
           const key = panel.querySelector("select").value;
           const tool = state.tools.find(t => `${t.source}:${t.name}` === key);
           if (tool) openTool(tool);
         });
-        panel.querySelector("[data-history]").addEventListener("click", () => loadMenu(menu));
+        panel.querySelector("[data-history]").addEventListener("click", () => loadMenu(menu, true));
+        panel.querySelector("details").addEventListener("toggle", event => {
+          if (event.currentTarget.open) loadMenu(menu, true);
+        });
         panel.addEventListener("click", async event => {
           const target = event.target.closest("[data-workflow-job]");
           if (!target) return;
@@ -117,12 +120,14 @@
       select.innerHTML = tools.map(t => `<option value="${esc(t.source)}:${esc(t.name)}">${esc(t.name)} [${esc(t.workflow.mode)}]</option>`).join("");
       if (tools.some(t => `${t.source}:${t.name}` === previous)) select.value = previous;
       panel.querySelector("[data-prepare]").disabled = tools.length === 0;
+      panel.querySelector("[data-workflow-summary]").textContent = `${tools.length} mapped actions · collapsed to keep operational evidence in focus`;
     }
   }
 
-  async function loadMenu(menu) {
+  async function loadMenu(menu, force = false) {
     const panel = q(`#workflow-${menu}`);
     if (!panel) return;
+    if (!force && !panel.querySelector("details")?.open) return;
     const version = String(Number(panel.dataset.request || 0) + 1);
     panel.dataset.request = version;
     const status = panel.querySelector(".workflowStatus");
@@ -151,9 +156,7 @@
       }
     } catch (error) { if (panel.dataset.request === version) status.textContent = `Saved evidence unavailable: ${error.message}`; }
   }
-  document.addEventListener("soc:tools", () => { mount(); loadMenu(state.view); });
+  document.addEventListener("soc:tools", mount);
   document.addEventListener("soc:view", event => { mount(); loadMenu(event.detail.view); });
-  document.addEventListener("soc:overview", () => loadMenu(state.view));
   mount();
-  if (state.tools.length) loadMenu(state.view);
 })();

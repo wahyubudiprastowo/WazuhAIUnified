@@ -1521,15 +1521,18 @@ function renderCveExposureGraph(data) {
 }
 
 async function loadCveExposureGraph(force = false) {
-  if (state.cveExposureLoading || (state.cveExposure && !force)) {
+  const windowPayload = currentWindowPayload();
+  const windowKey = JSON.stringify(windowPayload);
+  if (state.cveExposureLoading || (state.cveExposure && state.cveExposureWindow === windowKey && !force)) {
     if (state.cveExposure) renderCveExposureGraph(state.cveExposure);
     return;
   }
   state.cveExposureLoading = true;
   setText("#cveExposureStatus", "Loading bounded current-state inventory...");
   try {
-    const data = await postJsonWithTimeout("/api/vulnerabilities/exposure", {limit: 100}, 35000);
+    const data = await postJsonWithTimeout("/api/vulnerabilities/exposure", {...windowPayload, limit: 100}, 35000);
     state.cveExposure = data;
+    state.cveExposureWindow = windowKey;
     renderCveExposureGraph(data);
     const exposureCoverage = data.coverage || {};
     renderCveEvidenceCoverage({vulnerabilities: {evidence_coverage: {
@@ -1543,7 +1546,8 @@ async function loadCveExposureGraph(force = false) {
       note: `Coverage is based on ${number(exposureCoverage.denominator)} bounded current-state exposure paths. Missing enrichment is shown as unknown and is never fetched during page load.`,
     }}});
     const cache = data.cache?.status ? ` · cache ${data.cache.status} (${evidenceAge(data.cache.age_seconds)})` : "";
-    setText("#cveExposureStatus", `${fmt.format(number(data.inventory_total))} inventory records · ${fmt.format(number(data.summary?.paths))} paths loaded${cache}`);
+    const source = data.history ? `stored history · ${fmt.format(number(data.history.unique_cves))} unique CVEs · no provider calls` : "current Wazuh inventory";
+    setText("#cveExposureStatus", `${fmt.format(number(data.inventory_total))} inventory records · ${fmt.format(number(data.summary?.paths))} paths loaded · ${source}${cache}`);
   } catch (error) {
     setHtml("#cveExposureGraph", `<div class="errorPanel"><strong>Exposure graph unavailable</strong><p>${esc(error.message)}</p></div>`);
     setText("#cveExposureStatus", "Current-state inventory could not be loaded");
@@ -2566,7 +2570,7 @@ function renderCrowdSecIntel(payload = state.crowdSecIntel) {
   `;
 }
 
-async function loadCrowdSecIntel(silent = true) {
+async function loadCrowdSecIntel(silent = true, live = false) {
   if (!els.crowdSecPanel || !state.overview || state.crowdSecLoading) return;
   const observed = Object.fromEntries((state.overview.source_ips || []).map((row) => [row.ip, row]));
   const candidatesByIp = new Map();
@@ -2593,6 +2597,53 @@ async function loadCrowdSecIntel(silent = true) {
     return;
   }
   state.crowdSecLoading = true;
+  const automationByIndicator = new Map((window.SocAutomation?.report?.findings || []).map((row) => [row.indicator, row]));
+  let historicalByIndicator = new Map();
+  try {
+    const stored = await postJson("/api/history/intelligence", {...currentWindowPayload(), offset: 0});
+    historicalByIndicator = new Map((stored.intelligence || []).map((row) => [row.indicator, row]));
+  } catch (_) {
+    historicalByIndicator = new Map();
+  }
+  const storedRows = candidates.map((candidate) => {
+    const automation = automationByIndicator.get(candidate.ip) || {};
+    const historical = historicalByIndicator.get(candidate.ip) || {};
+    const result = historical.result || {};
+    const data = result.data || {};
+    const providers = mergeProviderRows([
+      ...arrayify(automation.providers),
+      ...arrayify(data.results),
+    ].filter((provider) => provider && typeof provider === "object"));
+    const cyMatches = [...arrayify(automation.cyfirma_matches), ...arrayify(data.cyfirma_matches)];
+    const cves = uniqueLabels([
+      ...providerCves(providers, cyMatches), ...arrayify(historical.cve_refs), ...arrayify(data.historical_cves),
+    ], 20);
+    const hasStored = providers.length > 0 || cyMatches.length > 0 || Boolean(historical.observed_at);
+    return {
+      ip: candidate.ip, providers, cyfirma_matches: cyMatches, cves,
+      aggregate_risk: data.aggregated_risk_level || historical.risk || automation.status || "unknown",
+      reputation: data.aggregated_risk_level || historical.risk || "unknown",
+      malicious: Boolean(data.consensus_malicious || historical.malicious || automation.status === "suspected"),
+      why: hasStored
+        ? "Loaded from retained provider intelligence; opening the dashboard did not call external APIs."
+        : "No retained provider result in the selected window; scheduled enrichment will process this indicator by priority.",
+      observed_hits: observed[candidate.ip]?.hits || automation.event_total || 0,
+      observed_score: observed[candidate.ip]?.max_score || automation.level || 0,
+      watchlist: (state.overview.crowdsec_watchlist_ips || []).includes(candidate.ip),
+      enriched_at: historical.observed_at || automation.enriched_at,
+    };
+  });
+  state.crowdSecIntel = {
+    generated_at: new Date().toISOString().replace(/\.\d{3}Z$/, "Z"),
+    ok: true, loading: false, errors: [], ips,
+    rows: mergeIntelRows(storedRows),
+    stored_only: !live,
+  };
+  renderCrowdSecIntel(state.crowdSecIntel);
+  if (!live) {
+    state.crowdSecLoading = false;
+    return;
+  }
   const requestId = ++state.crowdSecRequestId;
   const watchlistIps = (state.overview.crowdsec_watchlist_ips || []).filter(isPublicIp);
   state.crowdSecIntel = {
@@ -2618,7 +2669,6 @@ async function loadCrowdSecIntel(silent = true) {
   renderCrowdSecIntel(state.crowdSecIntel);
   try {
     const batchErrors = [];
-    const automationByIndicator = new Map((window.SocAutomation?.report?.findings || []).map((row) => [row.indicator, row]));
     for (let offset = 0; offset < ips.length; offset += 4) {
       if (requestId !== state.crowdSecRequestId) return;
       const chunk = ips.slice(offset, offset + 4);
@@ -3581,6 +3631,7 @@ async function loadDashboard(force = false) {
     els.connectionText.textContent = errors.length ? "Degraded" : "Operational";
     els.sideMeta.textContent = `${fmt.format(number(overview.tools?.gensecai))} GenSecAI + ${fmt.format(number(overview.tools?.infokom))} INFOKOM tools`;
     renderOverview(overview);
+    if (state.view === "vuln") void loadCveExposureGraph();
     void loadPlatformStatus();
     void loadPersistentCases();
     if (["stale-refreshing", "building"].includes(overview.cache?.status) && !state.overviewRefreshTimer) {
@@ -3594,12 +3645,12 @@ async function loadDashboard(force = false) {
     if (!state.selected && state.tools.length) {
       selectTool(state.tools.find((tool) => tool.name === "advanced_three_sum_correlation") || state.tools[0]);
     }
-    if (!state.providerTests && !state.providerTestsLoading) {
-      testThreatIntel(true).catch(() => {});
-    } else {
+    if (state.providerTests) {
       renderProviderIntel();
+    } else if (els.providerIntelGrid) {
+      els.providerIntelGrid.innerHTML = '<div class="emptyState">Provider connection tests are on demand. Stored intelligence and scheduled enrichment remain available without spending API quota.</div>';
     }
-    loadCrowdSecIntel(true).catch(() => {});
+    if (state.view === "l3") loadCrowdSecIntel(true).catch(() => {});
     await Promise.allSettled([settingsPromise, toolsPromise]);
   } finally {
     els.refresh.disabled = false;

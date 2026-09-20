@@ -51,7 +51,7 @@
     const baseline = summary.baseline || {};
     const change = baseline.change_vs_previous || {};
     const providers = (summary.provider_consensus || []).slice(0,6);
-    const cveSources = summary.cve_refs?.length ? `${fmt.format(summary.cve_refs.length)} ${t('stored CVE references','referensi CVE tersimpan')}` : t('Inventory CVEs only; provider refs unavailable in this window','CVE dari inventaris saja; referensi provider tidak tersedia pada window ini');
+    const cveHistory = summary.cve_history || {};
     target.innerHTML = `<div class="historySummaryHero">
       <div><span>${t('AI daily brief memory','Memori AI daily brief')}</span><strong>${t('Selected historical window','Window historis terpilih')}</strong><p>${t('Read from stored reports, not raw log replay or live provider calls.','Dibaca dari report tersimpan, bukan replay raw log atau panggilan provider live.')}</p></div>
       <b>${fmt.format(totals.case_score || 0)}</b>
@@ -64,7 +64,7 @@
       ${metric(t('Deferred IOCs','IOC ditunda'), fmt.format(totals.deferred_candidates || 0), t('protected by quota/backoff','dilindungi quota/backoff'))}
       ${metric(t('New API lookups','Lookup API baru'), fmt.format(totals.new_external_lookups || 0), t('live provider calls in reports','call provider live di report'))}
       ${metric('CYFIRMA', fmt.format(totals.cyfirma_matches || 0), t('exact historical matches','match historis persis'))}
-      ${metric('CVE', fmt.format(totals.critical_cves || 0), cveSources)}
+      ${metric('CVE', fmt.format(cveHistory.unique_cves || totals.critical_cves || 0), `${fmt.format(cveHistory.affected_assets || 0)} ${t('assets · stored locally','aset · tersimpan lokal')}`)}
     </div>
     <div class="historySummaryGrid">
       <article><h3>${t('Top source IP / IOC','Top source IP / IOC')}</h3><ul>${compactList(summary.top_source_ips, t('No IOC in stored reports','Tidak ada IOC di report tersimpan'))}</ul></article>
@@ -75,7 +75,7 @@
       <article><h3>${t('Affected assets','Aset terdampak')}</h3><ul>${compactList(summary.affected_assets, t('No affected asset assertion','Tidak ada aset terdampak'))}</ul></article>
       <article><h3>${t('Provider consensus','Konsensus provider')}</h3><ul>${providers.map(p=>`<li><b>${esc(p.provider)}</b><span>${fmt.format(p.match || 0)} match · ${fmt.format(p.error || 0)} error</span></li>`).join('') || `<li>${t('No provider memory','Tidak ada memori provider')}</li>`}</ul></article>
       <article><h3>${t('Anomaly baseline','Baseline anomali')}</h3><p>${t('Previous window','Window sebelumnya')}: ${fmt.format(baseline.previous_window?.findings || 0)} ${t('findings','temuan')} · ${t('7 days','7 hari')}: ${fmt.format(baseline.last_7_days?.findings || 0)} · ${t('30 days','30 hari')}: ${fmt.format(baseline.last_30_days?.findings || 0)}</p></article>
-      <article><h3>${t('CVE freshness','Kesegaran CVE')}</h3><div class="historyChipRow">${(summary.cve_refs || []).slice(0,8).map(v=>chip(v,'cve')).join('') || chip(t('Wazuh inventory + NVD/EPSS/KEV/PoC when refreshed','Inventaris Wazuh + NVD/EPSS/KEV/PoC saat sudah refresh'),'cve')}</div></article>
+      <article><h3>${t('CVE history','Histori CVE')}</h3><p>${fmt.format(cveHistory.observations || 0)} ${t('daily asset/package observations','observasi harian aset/paket')} · ${fmt.format(cveHistory.critical || 0)} critical · ${fmt.format(cveHistory.high || 0)} high</p><div class="historyChipRow">${(summary.cve_refs || []).slice(0,8).map(v=>chip(v,'cve')).join('') || chip(t('No stored CVE in this window','Tidak ada CVE tersimpan pada window ini'),'cve')}</div><small>${esc(cveHistory.materialization?.complete ? t('Local ledger complete; zero provider calls','Ledger lokal lengkap; tanpa call provider') : `${fmt.format(cveHistory.materialization?.pending || 0)} ${t('legacy reports pending migration','report lama menunggu migrasi')}`)}</small></article>
     </div>`;
   }
   $('historyStart').value=local(Date.now()-86400000); $('historyEnd').value=local(Date.now());

@@ -54,10 +54,13 @@ FIELDS = [
     ("SOC_QUEUE_BATCH_SIZE", "IOC queue batch per cycle", "integer", "75", "SOC Automation"),
     ("SOC_IOC_BUDGET", "New external IOC lookups per cycle", "integer", "2", "SOC Automation"),
     ("SOC_CVE_BUDGET", "CVE refreshes per cycle", "integer", "2", "SOC Automation"),
+    ("SOC_CVE_SNAPSHOT_LIMIT", "Critical/high CVEs captured per severity", "integer", "50", "SOC Automation"),
     ("SOC_ENRICHMENT_MAX_SECONDS", "Max enrichment time per cycle", "integer", "420", "SOC Automation"),
     ("SOC_PROVIDER_OK_CACHE_SECONDS", "Provider success cache (seconds)", "integer", "21600", "SOC Automation"),
     ("SOC_PROVIDER_ERROR_BACKOFF_SECONDS", "Provider error backoff (seconds)", "integer", "14400", "SOC Automation"),
     ("SOC_CYFIRMA_FEED_CACHE_SECONDS", "CYFIRMA feed cache (seconds)", "integer", "1800", "SOC Automation"),
+    ("SOC_CYFIRMA_MAX_PAGES", "CYFIRMA pages per scope and cycle", "integer", "10", "SOC Automation"),
+    ("SOC_CYFIRMA_MAX_SECONDS", "CYFIRMA feed time budget (seconds)", "integer", "90", "SOC Automation"),
     ("SOC_PROVIDER_HISTORY_RETENTION_DAYS", "Provider intelligence history retention (days)", "integer", "180", "SOC Automation"),
     ("HERMES_AGENT_ENABLED", "Hermes agent integration", "boolean", "false", "SOC Automation"),
     ("HERMES_AGENT_URL", "Hermes agent URL", "url_optional", "", "SOC Automation"),
@@ -92,10 +95,13 @@ LIMITS = {"SOC_INTERVAL_SECONDS": (900, 86400), "SOC_IOC_BUDGET": (0, 50),
           "SOC_PROVIDER_OK_CACHE_SECONDS": (900, 86400),
           "SOC_PROVIDER_ERROR_BACKOFF_SECONDS": (900, 86400),
           "SOC_CYFIRMA_FEED_CACHE_SECONDS": (300, 21600),
+          "SOC_CYFIRMA_MAX_PAGES": (1, 50),
+          "SOC_CYFIRMA_MAX_SECONDS": (10, 300),
           "SOC_PROVIDER_HISTORY_RETENTION_DAYS": (7, 3650),
           "SOC_ENRICHMENT_MAX_SECONDS": (60, 1800),
           "SOC_REPORT_RETENTION_DAYS": (7, 3650),
-          "SOC_CVE_BUDGET": (0, 20), "SOC_SMTP_PORT": (1, 65535),
+          "SOC_CVE_BUDGET": (0, 20), "SOC_CVE_SNAPSHOT_LIMIT": (10, 100),
+          "SOC_SMTP_PORT": (1, 65535),
           "SOC_DELIVERY_INTERVAL_SECONDS": (300, 604800),
           "AI_TIMEOUT_SECONDS": (10, 600), "AI_MAX_TOKENS": (256, 8192),
           "AI_MEMORY_REPORTS": (0, 30), "AI_FINDING_CACHE_SECONDS": (900, 604800),
@@ -1533,6 +1539,15 @@ class Automation:
                             conn.execute("CREATE TABLE IF NOT EXISTS report_summaries (report_id INTEGER PRIMARY KEY, created REAL, bucket_day TEXT, data TEXT)")
                             conn.execute("CREATE INDEX IF NOT EXISTS report_summaries_time ON report_summaries(created)")
                             conn.execute("CREATE INDEX IF NOT EXISTS report_summaries_day ON report_summaries(bucket_day,created)")
+                            conn.execute('''CREATE TABLE IF NOT EXISTS cve_observations (
+                                observation_key TEXT PRIMARY KEY, observed_at REAL NOT NULL,
+                                bucket_day TEXT NOT NULL, cve TEXT NOT NULL, agent_id TEXT,
+                                agent TEXT, package TEXT, version TEXT, severity TEXT,
+                                published_at TEXT, detected_at TEXT, data TEXT NOT NULL)''')
+                            conn.execute("CREATE INDEX IF NOT EXISTS cve_observations_time ON cve_observations(observed_at)")
+                            conn.execute("CREATE INDEX IF NOT EXISTS cve_observations_day ON cve_observations(bucket_day,cve)")
+                            conn.execute("CREATE INDEX IF NOT EXISTS cve_observations_asset ON cve_observations(agent_id,cve)")
+                            conn.execute("CREATE TABLE IF NOT EXISTS cve_observation_reports (report_id INTEGER PRIMARY KEY, materialized_at REAL NOT NULL)")
                             conn.execute("CREATE TABLE IF NOT EXISTS cache (key TEXT PRIMARY KEY, expires REAL, data TEXT)")
                             conn.execute("CREATE TABLE IF NOT EXISTS deliveries (channel TEXT, report_id INTEGER, sent REAL, status TEXT, PRIMARY KEY(channel,report_id))")
                             conn.execute('CREATE TABLE IF NOT EXISTS ai_runs (id INTEGER PRIMARY KEY, report_id INTEGER, created REAL, data TEXT)')
@@ -1581,6 +1596,133 @@ class Automation:
         with self.db() as db:
             db.execute("INSERT OR REPLACE INTO cache VALUES (?,?,?)", (key, time.time() + ttl, json.dumps(value)))
             db.execute("DELETE FROM cache WHERE expires<?", (time.time() - 604800,))
+
+    @staticmethod
+    def _cve_observation(row, observed_at):
+        cve = str(row.get("cve") or "").upper()
+        if not re.fullmatch(r"CVE-\d{4}-\d{4,}", cve):
+            return None
+        bucket_day = datetime.fromtimestamp(observed_at, timezone.utc).strftime("%Y-%m-%d")
+        agent_id = str(row.get("agent_id") or "")[:128]
+        agent = str(row.get("agent") or "")[:256]
+        package = str(row.get("package") or "")[:256]
+        version = str(row.get("version") or "")[:256]
+        identity = "\x1f".join((bucket_day, cve, agent_id or agent, package, version))
+        score = _cve_score_summary(row)
+        poc_value = score.get("poc")
+        poc = poc_value if isinstance(poc_value, bool) else (
+            True if str(poc_value or "").lower() in {"high", "confirmed", "available", "true"}
+            else False if str(poc_value or "").lower() in {"none", "not_found", "false"} else None)
+        data = {
+            "vulnerability": {
+                "id": cve, "severity": row.get("severity"),
+                "published_at": row.get("published_at"), "detected_at": row.get("detected_at"),
+                "reference": row.get("reference"),
+            },
+            "agent": {"id": agent_id or None, "name": agent or None},
+            "package": {"name": package or None, "version": version or None},
+            "epss": score.get("epss_probability"), "kev": score.get("kev"), "poc": poc,
+            "risk_score": score.get("risk_score"), "urgency": score.get("urgency"),
+            "evidence_basis": row.get("evidence_basis"),
+        }
+        return {
+            "observation_key": hashlib.sha256(identity.encode()).hexdigest(),
+            "observed_at": observed_at, "bucket_day": bucket_day, "cve": cve,
+            "agent_id": agent_id, "agent": agent, "package": package, "version": version,
+            "severity": str(row.get("severity") or "unknown")[:32],
+            "published_at": row.get("published_at"), "detected_at": row.get("detected_at"),
+            "data": data,
+        }
+
+    def _store_cve_observations(self, report, observed_at=None, report_id=None):
+        observed_at = float(observed_at or time.time())
+        rows = [item for item in
+                (self._cve_observation(row, observed_at) for row in (report.get("vulnerabilities") or []))
+                if item]
+        retention = int_config(self.config(), "SOC_REPORT_RETENTION_DAYS", 180) * 86400
+        with self.db() as db:
+            self._upsert_cve_rows(db, rows)
+            if report_id is not None:
+                db.execute("INSERT OR REPLACE INTO cve_observation_reports VALUES (?,?)",
+                           (int(report_id), time.time()))
+            db.execute("DELETE FROM cve_observations WHERE observed_at<?", (time.time() - retention,))
+            db.execute("DELETE FROM cve_observation_reports WHERE report_id NOT IN (SELECT id FROM reports)")
+        return len(rows)
+
+    @staticmethod
+    def _upsert_cve_rows(db, rows):
+        if not rows:
+            return
+        db.executemany('''INSERT INTO cve_observations
+            (observation_key,observed_at,bucket_day,cve,agent_id,agent,package,version,severity,published_at,detected_at,data)
+            VALUES (:observation_key,:observed_at,:bucket_day,:cve,:agent_id,:agent,:package,:version,:severity,:published_at,:detected_at,:data)
+            ON CONFLICT(observation_key) DO UPDATE SET
+            observed_at=excluded.observed_at,severity=excluded.severity,published_at=excluded.published_at,
+            detected_at=excluded.detected_at,data=excluded.data''',
+            [{**row, "data": json.dumps(row["data"])} for row in rows])
+
+    def _materialize_cve_history(self, start_ts, end_ts, limit=250):
+        with self.db() as db:
+            rows = db.execute('''SELECT r.id,r.created,r.data FROM reports r
+                LEFT JOIN cve_observation_reports m ON m.report_id=r.id
+                WHERE r.created>=? AND r.created<? AND m.report_id IS NULL
+                ORDER BY r.id LIMIT ?''', (start_ts, end_ts, int(limit))).fetchall()
+        observations, completed = [], []
+        for report_id, created, raw in rows:
+            try:
+                report = json.loads(raw)
+                observations.extend(item for item in
+                    (self._cve_observation(row, created) for row in (report.get("vulnerabilities") or []))
+                    if item)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
+            completed.append((int(report_id), time.time()))
+        with self.db() as db:
+            self._upsert_cve_rows(db, observations)
+            if completed:
+                db.executemany("INSERT OR REPLACE INTO cve_observation_reports VALUES (?,?)", completed)
+        with self.db() as db:
+            pending = int(db.execute('''SELECT COUNT(*) FROM reports r
+                LEFT JOIN cve_observation_reports m ON m.report_id=r.id
+                WHERE r.created>=? AND r.created<? AND m.report_id IS NULL''',
+                (start_ts, end_ts)).fetchone()[0] or 0)
+        return {"migrated": len(rows), "pending": pending, "complete": pending == 0}
+
+    def cve_history(self, start, end, limit=100):
+        start_ts, end_ts = datetime.fromisoformat(start).timestamp(), datetime.fromisoformat(end).timestamp()
+        limit = max(1, min(int(limit), 100))
+        materialization = self._materialize_cve_history(start_ts, end_ts)
+        with self.db() as db:
+            aggregate = db.execute('''SELECT COUNT(*),COUNT(DISTINCT cve),
+                COUNT(DISTINCT COALESCE(NULLIF(agent_id,''),agent)),
+                SUM(CASE WHEN lower(severity)='critical' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN lower(severity)='high' THEN 1 ELSE 0 END)
+                FROM cve_observations WHERE observed_at>=? AND observed_at<?''', (start_ts, end_ts)).fetchone()
+            rows = db.execute('''SELECT observed_at,data FROM cve_observations
+                WHERE observed_at>=? AND observed_at<?
+                ORDER BY CASE lower(severity) WHEN 'critical' THEN 0 WHEN 'high' THEN 1 ELSE 2 END,
+                         observed_at DESC,cve LIMIT ?''', (start_ts, end_ts, limit)).fetchall()
+            trend = db.execute('''SELECT bucket_day,COUNT(*),COUNT(DISTINCT cve),
+                SUM(CASE WHEN lower(severity)='critical' THEN 1 ELSE 0 END)
+                FROM cve_observations WHERE observed_at>=? AND observed_at<?
+                GROUP BY bucket_day ORDER BY bucket_day''', (start_ts, end_ts)).fetchall()
+        items = []
+        for observed_at, raw in rows:
+            try:
+                item = json.loads(raw)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            item["observed_at"] = datetime.fromtimestamp(observed_at, timezone.utc).isoformat()
+            items.append(item)
+        return {
+            "observations": int(aggregate[0] or 0), "unique_cves": int(aggregate[1] or 0),
+            "affected_assets": int(aggregate[2] or 0), "critical": int(aggregate[3] or 0),
+            "high": int(aggregate[4] or 0), "items": items,
+            "timeline": [{"day": day, "observations": int(count), "unique_cves": int(unique),
+                          "critical": int(critical or 0)} for day, count, unique, critical in trend],
+            "source": "local CVE observation ledger", "provider_calls": 0,
+            "materialization": materialization,
+        }
 
     def _prepare_finding(self, finding):
         context = _bounded_finding_context(finding)
@@ -2057,6 +2199,14 @@ class Automation:
             }
 
         current = aggregate(load(start_ts, end_ts))
+        cve_history = self.cve_history(start, end, 30)
+        current["cve_history"] = cve_history
+        current["cve_refs"] = sorted(set(current.get("cve_refs") or []) | {
+            str((item.get("vulnerability") or {}).get("id")) for item in cve_history["items"]
+            if (item.get("vulnerability") or {}).get("id")})[:100]
+        current["totals"]["cve_observations"] = cve_history["observations"]
+        current["totals"]["unique_cves"] = cve_history["unique_cves"]
+        current["totals"]["affected_cve_assets"] = cve_history["affected_assets"]
         duration = end_ts - start_ts
         previous = aggregate(load(start_ts - duration, start_ts))
         baseline7 = aggregate(load(start_ts - 7 * 86400, start_ts))
@@ -2226,6 +2376,7 @@ class Automation:
                 db.execute('DELETE FROM ai_runs WHERE report_id NOT IN (SELECT id FROM reports)')
                 db.execute('DELETE FROM report_summaries WHERE report_id NOT IN (SELECT id FROM reports)')
             self._store_report_summary(report, report["id"], created)
+            self._store_cve_observations(report, created, report["id"])
             self.error = None
             if self.pipeline:
                 for candidate in report.get('queue_attempts', []):
@@ -2279,6 +2430,9 @@ class Automation:
         if self.pipeline and cfg.get('SOC_STREAM_ENABLED') == 'true':
             candidates = self.pipeline.candidates(int_config(cfg, "SOC_QUEUE_BATCH_SIZE", 75))
         feed_rows, feed_status = [], {}
+        feed_started = time.time()
+        feed_budget = int_config(cfg, "SOC_CYFIRMA_MAX_SECONDS", 90)
+        feed_pages = int_config(cfg, "SOC_CYFIRMA_MAX_PAGES", 10)
         self.phase = "cyfirma"
         for scope in ("tailored", "global"):
             snapshot = self.cached("feed:" + scope)
@@ -2288,7 +2442,12 @@ class Automation:
                 continue
             start = len(feed_rows)
             loaded, reported, complete = 0, 0, False
-            for offset in range(0, 1000, 20):
+            for page in range(feed_pages):
+                if time.time() - feed_started >= feed_budget:
+                    feed_status[scope] = {"status": "deferred", "loaded": loaded,
+                                          "reported": reported, "reason": "feed time budget reached"}
+                    break
+                offset = page * 20
                 response = self.call("infokom", "cyfirma_ioc_feed", {"scope": scope, "limit": 20, "offset": offset, "response_format": "json"})
                 data = response.get("data") or {}
                 if not response.get("ok") or data.get("errors"):
@@ -2302,8 +2461,10 @@ class Automation:
                     complete = loaded >= reported
                     break
             feed_status.setdefault(scope, {"status": "loaded" if complete else "partial", "loaded": loaded, "reported": reported})
-            if complete:
-                self.put("feed:" + scope, {"rows": feed_rows[start:], "status": {**feed_status[scope], "fetched_at": now()}}, int_config(cfg, "SOC_CYFIRMA_FEED_CACHE_SECONDS", 1800))
+            snapshot_ttl = (int_config(cfg, "SOC_CYFIRMA_FEED_CACHE_SECONDS", 1800) if complete
+                            else int_config(cfg, "SOC_PROVIDER_ERROR_BACKOFF_SECONDS", 14400))
+            self.put("feed:" + scope, {"rows": feed_rows[start:],
+                "status": {**feed_status[scope], "fetched_at": now(), "cached_partial": not complete}}, snapshot_ttl)
         feed_index = {}
         for row in feed_rows:
             valid_until = row.get("valid_until")
@@ -2368,9 +2529,19 @@ class Automation:
             if self.pipeline and result is not None:
                 queue_attempts.append({'kind':candidate['kind'],'indicator':indicator,'retry':not result.get('ok') or any(p.get('error') for p in providers)})
         self.phase = "vulnerabilities"
-        inventory = self.inventory({"severity": "Critical", "sort": "published"})
+        snapshot_limit = int_config(cfg, "SOC_CVE_SNAPSHOT_LIMIT", 50)
+        inventories = [self.inventory({"severity": severity, "sort": "published", "limit": snapshot_limit,
+                                       "include_summary": False}) for severity in ("Critical", "High")]
+        inventory_items, seen_inventory = [], set()
+        for inventory_result in inventories:
+            for item in inventory_result.get("items", []):
+                vuln, agent, package = item.get("vulnerability") or {}, item.get("agent") or {}, item.get("package") or {}
+                key = (vuln.get("id"), agent.get("id") or agent.get("name"), package.get("name"), package.get("version"))
+                if key not in seen_inventory:
+                    seen_inventory.add(key)
+                    inventory_items.append(item)
         vulnerabilities, cve_used = [], 0
-        for item in inventory.get("items", []):
+        for item in inventory_items:
             vuln, agent, package = item.get("vulnerability") or {}, item.get("agent") or {}, item.get("package") or {}
             cve = vuln.get("id", "")
             intel = self.cached("cve:" + cve)
@@ -2395,14 +2566,15 @@ class Automation:
                 "provider_error_backoff_seconds": int_config(cfg, "SOC_PROVIDER_ERROR_BACKOFF_SECONDS", 14400)},
                 "enrichment_max_seconds": int_config(cfg, "SOC_ENRICHMENT_MAX_SECONDS", 420),
             "cyfirma_candidates_checked": len(candidates) if feed_rows else 0, "cyfirma_feeds": feed_status,
-            "syslog_sources": coverage.get("sources"), "inventory_ok": inventory.get("ok"),
-            "critical_inventory_records": inventory.get("total"), "cve_records_loaded": len(vulnerabilities)},
+            "syslog_sources": coverage.get("sources"), "inventory_ok": all(row.get("ok") for row in inventories),
+            "critical_inventory_records": inventories[0].get("total"),
+            "high_inventory_records": inventories[1].get("total"), "cve_records_loaded": len(vulnerabilities)},
             "findings": findings, "vulnerabilities": vulnerabilities, "rules": coverage.get("rules", [])[:20],
             "limitations": ["24-hour indexed alerts including decoded syslog; raw archives outside the alert index are not included.",
                 "IOC candidates are deduplicated and processed by priority queue; external provider calls are budgeted and cached with backoff to protect API quota.",
-                "CYFIRMA matches use exact observables from loaded feeds (up to 1,000 records per scope), not all possible global intelligence.",
+                f"CYFIRMA matches use exact observables from bounded feeds (up to {feed_pages * 20} records per scope and {feed_budget} seconds per cycle).",
                 "Source reputation does not prove a device is infected. A reporting agent may be a log collector.",
-                "Critical CVE inventory shows the 25 most recently published records; external CVE data refreshes from cache every six hours."]}
+                f"Critical and high CVE inventory captures up to {snapshot_limit} records per severity into a daily local ledger; external CVE data refreshes from cache every six hours."]}
         if self.pipeline:
             report['coverage']['pipeline'] = self.pipeline.status()
             report['coverage']['candidate_source'] = 'persistent queue batch' if cfg.get('SOC_STREAM_ENABLED') == 'true' else 'top values'
