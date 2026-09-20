@@ -216,14 +216,28 @@ class Pipeline:
             db.execute('''CREATE TABLE IF NOT EXISTS rollup_backfill_state (
                 id INTEGER PRIMARY KEY, cursor TEXT, target TEXT, completed INTEGER DEFAULT 0,
                 chunks INTEGER DEFAULT 0, events INTEGER DEFAULT 0, last_run REAL,
-                last_duration_ms INTEGER DEFAULT 0, last_query_took_ms INTEGER DEFAULT 0, error TEXT)''')
+                last_duration_ms INTEGER DEFAULT 0, last_query_took_ms INTEGER DEFAULT 0, error TEXT,
+                current_chunk_minutes INTEGER DEFAULT 0, success_streak INTEGER DEFAULT 0,
+                failures INTEGER DEFAULT 0, next_run REAL DEFAULT 0, mode TEXT DEFAULT 'linear')''')
+            backfill_columns = {row[1] for row in db.execute('PRAGMA table_info(rollup_backfill_state)')}
+            for name, definition in {
+                'current_chunk_minutes': 'INTEGER DEFAULT 0',
+                'success_streak': 'INTEGER DEFAULT 0',
+                'failures': 'INTEGER DEFAULT 0',
+                'next_run': 'REAL DEFAULT 0',
+                'mode': "TEXT DEFAULT 'linear'",
+            }.items():
+                if name not in backfill_columns:
+                    db.execute(f'ALTER TABLE rollup_backfill_state ADD COLUMN {name} {definition}')
 
     def status(self):
         with self.automation.db() as db:
             row = db.execute('SELECT start,checkpoint,scanned,live_checkpoint,checkpoint_scanned,replay_scanned FROM stream_state WHERE id=1').fetchone()
             total, pending = db.execute('SELECT COUNT(*),COALESCE(SUM(next_attempt<=?),0) FROM ioc_queue', (time.time(),)).fetchone()
             rollup = db.execute("SELECT MIN(bucket),MAX(bucket),COUNT(*),COALESCE(SUM(count),0) FROM detection_rollups WHERE dimension='total'").fetchone()
-            backfill = db.execute('SELECT cursor,target,completed,chunks,events,last_run,last_duration_ms,last_query_took_ms,error FROM rollup_backfill_state WHERE id=1').fetchone()
+            backfill = db.execute('''SELECT cursor,target,completed,chunks,events,last_run,
+                last_duration_ms,last_query_took_ms,error,current_chunk_minutes,success_streak,
+                failures,next_run,mode FROM rollup_backfill_state WHERE id=1''').fetchone()
             committed_batches = int(db.execute('SELECT COUNT(*) FROM scan_batches').fetchone()[0] or 0)
         checkpoint = row[1] if row else None
         lag_seconds = None
@@ -233,6 +247,11 @@ class Pipeline:
             except (TypeError, ValueError):
                 pass
         caught_up = lag_seconds is not None and lag_seconds <= 15 * 60
+        gaps = self.rollup_gaps()
+        effective_chunk = int(backfill[9] or 0) if backfill else 0
+        interval = int(self.automation.config().get('SOC_ROLLUP_BACKFILL_MIN_INTERVAL_SECONDS', 30))
+        estimated_cycles = ((int(gaps.get('missing') or 0) + max(1, effective_chunk // 5) - 1)
+                            // max(1, effective_chunk // 5)) if effective_chunk else None
         backfill_status = {
             'enabled': self.automation.config().get('SOC_ROLLUP_BACKFILL_ENABLED', 'true') == 'true',
             'cursor': backfill[0] if backfill else None, 'target': backfill[1] if backfill else None,
@@ -243,6 +262,13 @@ class Pipeline:
             'last_duration_ms': int(backfill[6] or 0) if backfill else 0,
             'last_query_took_ms': int(backfill[7] or 0) if backfill else 0,
             'error': backfill[8] if backfill else None,
+            'current_chunk_minutes': effective_chunk,
+            'success_streak': int(backfill[10] or 0) if backfill else 0,
+            'failures': int(backfill[11] or 0) if backfill else 0,
+            'next_run': backfill[12] if backfill else None,
+            'mode': backfill[13] if backfill else 'linear',
+            'estimated_cycles': estimated_cycles,
+            'estimated_completion_seconds': estimated_cycles * interval if estimated_cycles is not None else None,
         }
         return {'enabled': self.automation.config().get('SOC_STREAM_ENABLED') == 'true',
                 'active': self.active, 'error': self.error, 'started_at': row[0] if row else None,
@@ -263,7 +289,7 @@ class Pipeline:
                            'bucket_minutes': 5,
                            'retention_days': int(self.automation.config().get('SOC_ROLLUP_RETENTION_DAYS', 180)),
                            'committed_batches': committed_batches,
-                           'gaps': self.rollup_gaps(), 'backfill': backfill_status},
+                           'gaps': gaps, 'backfill': backfill_status},
                 'queued_indicators': total, 'due_indicators': pending,
                 'scope': 'wazuh-alerts-* only; initial 24h, 5-minute checkpoints, 2-minute ingest delay; periodic late-event replay; older logs require backfill'}
 
@@ -315,28 +341,50 @@ class Pipeline:
             return False
         now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
         lookback_days = max(7, min(180, int(config.get('SOC_ROLLUP_BACKFILL_DAYS', 30))))
-        chunk_minutes = max(5, min(120, int(config.get('SOC_ROLLUP_BACKFILL_CHUNK_MINUTES', 30))))
+        base_chunk = max(5, min(120, int(config.get('SOC_ROLLUP_BACKFILL_CHUNK_MINUTES', 30))))
+        max_chunk = max(base_chunk, min(360, int(config.get('SOC_ROLLUP_BACKFILL_MAX_CHUNK_MINUTES', 120))))
+        normal_interval = max(30, int(config.get('SOC_ROLLUP_BACKFILL_INTERVAL_SECONDS', 120)))
+        min_interval = max(15, min(normal_interval, int(config.get('SOC_ROLLUP_BACKFILL_MIN_INTERVAL_SECONDS', 30))))
+        fast_query_ms = max(100, int(config.get('SOC_ROLLUP_BACKFILL_FAST_QUERY_MS', 1500)))
         desired_target = now - timedelta(days=lookback_days)
         desired_target = desired_target.replace(minute=0)
         with self.automation.db() as db:
-            state = db.execute('SELECT cursor,target,completed FROM rollup_backfill_state WHERE id=1').fetchone()
+            state = db.execute('''SELECT cursor,target,completed,current_chunk_minutes,
+                success_streak,failures,next_run FROM rollup_backfill_state WHERE id=1''').fetchone()
             if not state:
                 earliest = db.execute("SELECT MIN(bucket) FROM detection_rollups WHERE dimension='total'").fetchone()[0]
                 cursor = datetime.fromisoformat(earliest) if earliest else now - timedelta(hours=24)
                 target = desired_target
                 db.execute('INSERT INTO rollup_backfill_state(id,cursor,target,completed) VALUES (1,?,?,0)',
                            (stamp(cursor), stamp(target)))
+                chunk_minutes, success_streak, failures, next_run = base_chunk, 0, 0, 0
             else:
                 cursor = datetime.fromisoformat(state[0]) if state[0] else now - timedelta(hours=24)
-                stored_target = datetime.fromisoformat(state[1]) if state[1] else desired_target
-                target = min(stored_target, desired_target)
-                if target < stored_target:
-                    db.execute('UPDATE rollup_backfill_state SET target=?,completed=0 WHERE id=1', (stamp(target),))
-            if cursor <= target:
-                db.execute('UPDATE rollup_backfill_state SET completed=1,error=NULL WHERE id=1')
+                target = desired_target
+                chunk_minutes = max(base_chunk, min(max_chunk, int(state[3] or base_chunk)))
+                success_streak, failures, next_run = int(state[4] or 0), int(state[5] or 0), float(state[6] or 0)
+                # The target is a rolling lookback boundary. Keeping the oldest
+                # target forever makes a configured 30-day scope grow without bound.
+                db.execute('UPDATE rollup_backfill_state SET target=?,completed=0 WHERE id=1', (stamp(target),))
+            checkpoint_row = db.execute('SELECT checkpoint FROM stream_state WHERE id=1').fetchone()
+            checkpoint = checkpoint_row[0] if checkpoint_row and checkpoint_row[0] else stamp(now - timedelta(minutes=10))
+        if next_run > time.time():
+            return False
+        if cursor > target:
+            mode = 'linear'
+            end = cursor
+            start = max(target, end - timedelta(minutes=chunk_minutes))
+        else:
+            gaps = self.rollup_gaps(stamp(target), checkpoint, sample_limit=1)
+            if not gaps.get('ranges'):
+                with self.automation.db() as db:
+                    db.execute("UPDATE rollup_backfill_state SET completed=1,error=NULL,mode='complete' WHERE id=1")
                 return False
-        end = cursor
-        start = max(target, end - timedelta(minutes=chunk_minutes))
+            mode = 'repair'
+            gap = gaps['ranges'][0]
+            start = datetime.fromisoformat(gap['start'])
+            gap_end = datetime.fromisoformat(gap['end'])
+            end = min(gap_end, start + timedelta(minutes=chunk_minutes))
         aggs = {
             dimension: {'terms': {'field': field, 'size': size}}
             for dimension, (field, size) in BACKFILL_FIELDS.items()
@@ -404,16 +452,31 @@ class Pipeline:
                     VALUES (?,?,?,?,?,?) ON CONFLICT(bucket_epoch) DO UPDATE SET
                     source=excluded.source,event_count=MAX(rollup_windows.event_count,excluded.event_count),
                     completed_at=excluded.completed_at,batch_key=excluded.batch_key''', window_rows)
-                completed = int(start <= target)
-                db.execute('''UPDATE rollup_backfill_state SET cursor=?,completed=?,chunks=chunks+1,
-                    events=events+?,last_run=?,last_duration_ms=?,last_query_took_ms=?,error=NULL WHERE id=1''',
-                    (stamp(start), completed, events, time.time(), duration_ms, int(data.get('took') or 0)))
+                query_took = int(data.get('took') or duration_ms)
+                fast = query_took <= fast_query_ms and duration_ms <= fast_query_ms * 2
+                next_streak = success_streak + 1 if fast else 0
+                next_chunk = chunk_minutes
+                if fast and next_streak >= 2:
+                    next_chunk, next_streak = min(max_chunk, chunk_minutes + base_chunk), 0
+                elif not fast:
+                    next_chunk = max(base_chunk, chunk_minutes // 2)
+                cooldown = min_interval if fast else normal_interval
+                next_cursor = stamp(start) if mode == 'linear' else stamp(cursor)
+                db.execute('''UPDATE rollup_backfill_state SET cursor=?,completed=0,chunks=chunks+1,
+                    events=events+?,last_run=?,last_duration_ms=?,last_query_took_ms=?,error=NULL,
+                    current_chunk_minutes=?,success_streak=?,failures=0,next_run=?,mode=? WHERE id=1''',
+                    (next_cursor, events, time.time(), duration_ms, query_took, next_chunk,
+                     next_streak, time.time() + cooldown, mode))
             return True
         except Exception as exc:
             duration_ms = int((time.monotonic() - started) * 1000)
+            next_failures = failures + 1
+            retry_delay = min(3600, normal_interval * (2 ** min(next_failures, 4)))
             with self.automation.db() as db:
-                db.execute('UPDATE rollup_backfill_state SET last_run=?,last_duration_ms=?,error=? WHERE id=1',
-                           (time.time(), duration_ms, str(exc)[:500]))
+                db.execute('''UPDATE rollup_backfill_state SET last_run=?,last_duration_ms=?,error=?,
+                    current_chunk_minutes=?,success_streak=0,failures=?,next_run=?,mode='cooldown' WHERE id=1''',
+                    (time.time(), duration_ms, str(exc)[:500], max(base_chunk, chunk_minutes // 2),
+                     next_failures, time.time() + retry_delay))
             raise
 
     def rollup_summary(self, start, end, limit=20):
@@ -633,7 +696,10 @@ class Pipeline:
                     self.last_live=time.time()
                 advanced = self.scan_window()
                 backfill_interval = int(config.get('SOC_ROLLUP_BACKFILL_INTERVAL_SECONDS', 120))
-                if not advanced and self.status().get('caught_up') and time.time() - self.last_backfill >= backfill_interval:
+                backfill_poll_interval = max(15, min(backfill_interval, int(
+                    config.get('SOC_ROLLUP_BACKFILL_MIN_INTERVAL_SECONDS', 30))))
+                if (not advanced and self.status().get('caught_up')
+                        and time.time() - self.last_backfill >= backfill_poll_interval):
                     try:
                         self.backfill_once()
                     except Exception:

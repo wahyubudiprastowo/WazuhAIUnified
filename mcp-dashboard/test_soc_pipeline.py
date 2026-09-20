@@ -1,4 +1,5 @@
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import Mock
@@ -146,6 +147,56 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(status['chunks'], 0)
         self.assertFalse(status['complete'])
         self.assertIn('cursor not advanced', status['error'])
+
+    def test_fast_backfill_adapts_chunk_and_uses_rolling_target(self):
+        self.config.update({
+            'SOC_ROLLUP_BACKFILL_DAYS': '7',
+            'SOC_ROLLUP_BACKFILL_CHUNK_MINUTES': '30',
+            'SOC_ROLLUP_BACKFILL_MAX_CHUNK_MINUTES': '120',
+            'SOC_ROLLUP_BACKFILL_MIN_INTERVAL_SECONDS': '15',
+            'SOC_ROLLUP_BACKFILL_FAST_QUERY_MS': '1500',
+        })
+        self.request.return_value = {
+            'took': 10, '_shards': {'failed': 0},
+            'aggregations': {'rollup': {'buckets': []}},
+        }
+        old_target = datetime.now(timezone.utc) - timedelta(days=30)
+        cursor = datetime.now(timezone.utc) - timedelta(days=1)
+        with self.worker.db() as db:
+            db.execute('''INSERT INTO rollup_backfill_state
+                (id,cursor,target,completed,current_chunk_minutes,next_run)
+                VALUES (1,?,?,0,30,0)''', (cursor.isoformat(), old_target.isoformat()))
+        self.assertTrue(self.pipeline.backfill_once())
+        with self.worker.db() as db:
+            db.execute('UPDATE rollup_backfill_state SET next_run=0 WHERE id=1')
+        self.assertTrue(self.pipeline.backfill_once())
+        status = self.pipeline.status()['rollup']['backfill']
+        target = datetime.fromisoformat(status['target'])
+        self.assertLess(abs((target - (datetime.now(timezone.utc) - timedelta(days=7))).total_seconds()), 3700)
+        self.assertEqual(status['current_chunk_minutes'], 60)
+        self.assertEqual(status['failures'], 0)
+        self.assertGreater(status['next_run'], time.time())
+
+    def test_completed_linear_backfill_repairs_internal_gap(self):
+        self.config['SOC_ROLLUP_BACKFILL_DAYS'] = '7'
+        now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        target = (now - timedelta(days=7)).replace(minute=0)
+        checkpoint = target + timedelta(minutes=15)
+        with self.worker.db() as db:
+            db.execute('INSERT INTO stream_state(id,start,checkpoint,scanned) VALUES (1,?,?,0)',
+                       (target.isoformat(), checkpoint.isoformat()))
+            db.execute('''INSERT INTO rollup_backfill_state
+                (id,cursor,target,completed,current_chunk_minutes,next_run)
+                VALUES (1,?,?,1,30,0)''', (target.isoformat(), target.isoformat()))
+        self.request.return_value = {
+            'took': 5, '_shards': {'failed': 0},
+            'aggregations': {'rollup': {'buckets': []}},
+        }
+        self.assertTrue(self.pipeline.backfill_once())
+        request = self.request.call_args.args[1]
+        self.assertEqual(request['query']['range']['@timestamp']['gte'], target.isoformat())
+        self.assertEqual(self.pipeline.status()['rollup']['backfill']['mode'], 'repair')
+        self.assertEqual(self.pipeline.rollup_gaps(target.isoformat(), checkpoint.isoformat())['missing'], 0)
 
     def test_private_paths_and_invalid_hashes_not_sent(self):
         self.assertEqual(observables({'data':{'srcip':'10.1.1.1','url':'/.env'},'syscheck':{'md5_after':'bad'}}),[])

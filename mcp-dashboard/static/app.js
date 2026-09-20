@@ -2877,6 +2877,10 @@ function renderSettings() {
   const automationStore = s.storage?.automation || {};
   const pipeline = s.pipeline || {};
   const backfill = pipeline.rollup?.backfill || {};
+  const rollupGaps = pipeline.rollup?.gaps || {};
+  const backfillEta = number(backfill.estimated_completion_seconds) > 0
+    ? `${Math.max(1, Math.ceil(number(backfill.estimated_completion_seconds) / 3600))}h ETA`
+    : (backfill.complete ? "complete" : "calculating ETA");
   renderSettingsForm(s);
   setHtml("#settingsList", `
     <dt>GenSecAI URL</dt><dd>${esc(s.urls?.gensecai)}</dd>
@@ -2903,7 +2907,7 @@ function renderSettings() {
     <dt>Prewarm</dt><dd>${s.storage?.prewarm_enabled ? "enabled" : "disabled"} | ${(s.storage?.prewarm_ranges || []).join(", ")} | TTL ${fmt.format(number(s.storage?.overview_cache_ttl_seconds))}s</dd>
     <dt>IOC stream</dt><dd>${pipeline.enabled ? "enabled" : "disabled"} | ${esc(pipeline.scan_status || "unknown")} | ${fmt.format(number(pipeline.checkpoint_events_scanned))} checkpoint events | ${fmt.format(number(pipeline.queued_indicators))} unique indicators | lag ${fmt.format(number(pipeline.lag_seconds))}s</dd>
     <dt>Detection rollup</dt><dd>${pipeline.rollup?.enabled ? "enabled" : "disabled"} | ${fmt.format(number(pipeline.rollup?.events))} events in ${fmt.format(number(pipeline.rollup?.buckets))} five-minute buckets | ${fmt.format(number(pipeline.rollup?.retention_days))} day retention</dd>
-    <dt>Historical backfill</dt><dd>${backfill.enabled ? (backfill.complete ? "complete" : "throttled") : "disabled"} | ${fmt.format(number(backfill.chunks))} bounded chunks, ${fmt.format(number(backfill.events))} events | cursor ${esc(backfill.cursor || "not started")} ${backfill.error ? `| last error: ${esc(backfill.error)}` : `| last query ${fmt.format(number(backfill.last_query_took_ms))} ms`}</dd>
+    <dt>Historical backfill</dt><dd>${backfill.enabled ? (backfill.complete ? "complete" : esc(backfill.mode || "throttled")) : "disabled"} | ${fmt.format(number(rollupGaps.coverage_percent))}% coverage, ${fmt.format(number(rollupGaps.missing))} gaps | ${fmt.format(number(backfill.current_chunk_minutes))} min adaptive chunk, ${esc(backfillEta)} | ${fmt.format(number(backfill.chunks))} committed chunks ${backfill.error ? `| cooldown: ${esc(backfill.error)}` : `| last query ${fmt.format(number(backfill.last_query_took_ms))} ms`}</dd>
     <dt>Historical scan</dt><dd>${pipeline.historical_scope_complete ? "complete" : "live stream protected; historical coverage progresses only while caught up"}</dd>
   `);
 }
