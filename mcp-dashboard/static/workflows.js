@@ -1,6 +1,6 @@
 (() => {
   "use strict";
-  const menus = ["l1", "l2", "l3", "vuln", "assets", "incidents", "workbench", "history", "settings"];
+  const menus = ["tools"];
   const stamp = value => value ? new Date(value * 1000).toLocaleString() : "-";
   const dialog = document.createElement("dialog");
   dialog.className = "workflowDialog";
@@ -63,7 +63,7 @@
       }
       q("#workflowResult").textContent = result.json != null ? JSON.stringify(result.json, null, 2) : result.text;
     } catch (error) { update(error.message); }
-    finally { button.disabled = false; loadMenu(tool.workflow.menu, true); }
+    finally { button.disabled = false; loadMenu("tools", true); }
   });
 
   function mount() {
@@ -104,13 +104,13 @@
           } catch (error) { panel.querySelector(".workflowStatus").textContent = error.message; }
         });
       }
-      const tools = state.tools.filter(t => t.workflow?.menu === menu);
+      const tools = state.tools.filter(t => t.workflow);
       const select = panel.querySelector("select");
       const previous = select.value;
-      select.innerHTML = tools.map(t => `<option value="${esc(t.source)}:${esc(t.name)}">${esc(t.name)} [${esc(t.workflow.mode)}]</option>`).join("");
+      select.innerHTML = tools.map(t => `<option value="${esc(t.source)}:${esc(t.name)}">${esc(t.workflow.menu || "general")} · ${esc(t.name)} [${esc(t.workflow.mode)}]</option>`).join("");
       if (tools.some(t => `${t.source}:${t.name}` === previous)) select.value = previous;
       panel.querySelector("[data-prepare]").disabled = tools.length === 0;
-      panel.querySelector("[data-workflow-summary]").textContent = `${tools.length} mapped actions · collapsed to keep operational evidence in focus`;
+      panel.querySelector("[data-workflow-summary]").textContent = `${tools.length} mapped actions · centralized to keep operational menus focused`;
     }
   }
 
@@ -128,7 +128,7 @@
     const hours = { "24h": 24, "7d": 168, "30d": 720 }[windowPayload.range] || 24;
     const start = windowPayload.start || new Date(now - hours * 3600000).toISOString();
     try {
-      const history = await postJson("/api/workflows/history", { menu, start, end });
+      const history = await postJson("/api/workflows/history", { menu: null, start, end });
       if (panel.dataset.request !== version) return;
       status.textContent = `${history.jobs.length} saved runs in selected window | ${history.counts.queued || 0} queued | ${history.counts.running || 0} running | budgets ${history.local_runs_per_hour} local / ${history.external_runs_per_hour} provider per hour | retention ${history.retention_days}d`;
       panel.querySelector(".workflowHistory").innerHTML = history.jobs.length ?

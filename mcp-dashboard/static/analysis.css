@@ -2,7 +2,7 @@
 .view { max-width: none; width: 100%; min-width: 0; }
 .view > *, .gridTwo > *, .analysisBody, .analysisControls > * { min-width: 0; }
 #findingsView { --finding-border: #3b4a51; --finding-muted: #bac8cf; --finding-text: #edf4f7; }
-#findingsView .findingsSummary, #findingsView .findingSourceHealth { background: #242e33; }
+#findingsView .findingsSummary { background: #242e33; }
 #findingsView .findingsCategories, #findingsView .findingsList, #findingsView .findingDetailHead { background: #1d272c; }
 #findingsView .findingsFilters, #findingsView .findingsWorkspace, #findingsView .findingDetail, #findingsView .findingDetailTabs { background: #192126; }
 #findingsView .findingsSummary strong, #findingsView .findingCveMetrics dd { color: #67dfc8; }

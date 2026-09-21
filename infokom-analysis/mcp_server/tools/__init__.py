@@ -98,7 +98,7 @@ def register_all_tools() -> None:
         ("wazuh_rules_files",     "wazuh_rules_files",     False),  # 2 tools (rule XML)
         ("owned_domains",          "owned_domains",          False),  # 2 tools (view/set victim domains)
         ("jarm",                   "jarm",                   False),  # 1 tool (TLS fingerprinting)
-        ("case",                   "case",                   False),  # 5 tools (incident case management)
+        ("case",                   "case",                   False),  # durable incident and evidence lifecycle
         ("domain_permute",          "domain_permute",          False),  # 1 tool (typosquatting lookalikes)
         ("stealer_log",              "stealer_log",              False),  # 1 tool (HudsonRock stealer-log check)
         ("document_convert",        "document_convert",        False),  # 1 tool Marker PDF -> markdown/json/html/chunks

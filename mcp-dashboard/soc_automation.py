@@ -27,6 +27,12 @@ from soc_contract import (
     CONTRACT_VERSION, apply_contract, definition as contract_definition,
     metadata as contract_metadata, prompt_clause,
 )
+import cyfirma_research
+import cyfirma_taxii
+import cyfirma_org_vulnerability
+import defender_xdr
+import entity_resolver
+from detection_taxonomy import classify as classify_detection
 
 
 # These settings are included in the existing web settings schema.
@@ -43,8 +49,13 @@ FIELDS = [
     ("SOC_STREAM_ENABLED", "Incremental alert discovery", "boolean", "true", "SOC Automation"),
     ("SOC_STREAM_REPLAY_INTERVAL_SECONDS", "Late-event replay interval (seconds)", "integer", "1800", "SOC Automation"),
     ("SOC_STREAM_SCAN_PAUSE_SECONDS", "Indexer pause between discovery windows (seconds)", "integer", "10", "SOC Automation"),
+    ("SOC_STREAM_WINDOW_SECONDS", "Maximum checkpoint scan window (seconds)", "integer", "300", "SOC Automation"),
+    ("SOC_STREAM_PAGE_SIZE", "Maximum Indexer page size for materializer", "integer", "500", "SOC Automation"),
     ("SOC_ROLLUP_ENABLED", "Materialized detection rollups", "boolean", "true", "SOC Automation"),
     ("SOC_ROLLUP_RETENTION_DAYS", "Detection rollup retention (days)", "integer", "180", "SOC Automation"),
+    ("SOC_ENTITY_RETENTION_DAYS", "Canonical evidence graph retention (days)", "integer", "30", "SOC Automation"),
+    ("SOC_ENTITY_MAX_EVIDENCE_PER_WINDOW", "Maximum canonical evidence groups per scan window", "integer", "500", "SOC Automation"),
+    ("SOC_ENTITY_DRAIN_BATCH_SIZE", "Canonical evidence graph queue rows drained per worker loop", "integer", "100", "SOC Automation"),
     ("SOC_ROLLUP_BACKFILL_ENABLED", "Throttled historical rollup backfill", "boolean", "true", "SOC Automation"),
     ("SOC_ROLLUP_BACKFILL_DAYS", "Historical rollup backfill window (days)", "integer", "30", "SOC Automation"),
     ("SOC_ROLLUP_BACKFILL_CHUNK_MINUTES", "Historical backfill chunk (minutes)", "integer", "30", "SOC Automation"),
@@ -52,6 +63,9 @@ FIELDS = [
     ("SOC_ROLLUP_BACKFILL_INTERVAL_SECONDS", "Pause between historical chunks (seconds)", "integer", "120", "SOC Automation"),
     ("SOC_ROLLUP_BACKFILL_MIN_INTERVAL_SECONDS", "Minimum pause after a fast backfill query", "integer", "30", "SOC Automation"),
     ("SOC_ROLLUP_BACKFILL_FAST_QUERY_MS", "Indexer latency threshold for increasing backfill", "integer", "1500", "SOC Automation"),
+    ("SOC_FORTI_SECURITY_BACKFILL_ENABLED", "Forti security historical materialization", "boolean", "true", "SOC Automation"),
+    ("SOC_FORTI_SECURITY_BACKFILL_CHUNK_MINUTES", "Forti security historical chunk (minutes)", "integer", "120", "SOC Automation"),
+    ("SOC_FORTI_SECURITY_BACKFILL_INTERVAL_SECONDS", "Pause between Forti security chunks (seconds)", "integer", "60", "SOC Automation"),
     ("SOC_REPORT_RETENTION_DAYS", "Analysis history retention (days)", "integer", "180", "SOC Automation"),
     ("SOC_INTERVAL_SECONDS", "Analysis interval (seconds)", "integer", "900", "SOC Automation"),
     ("SOC_QUEUE_BATCH_SIZE", "IOC queue batch per cycle", "integer", "75", "SOC Automation"),
@@ -62,9 +76,36 @@ FIELDS = [
     ("SOC_PROVIDER_OK_CACHE_SECONDS", "Provider success cache (seconds)", "integer", "21600", "SOC Automation"),
     ("SOC_PROVIDER_ERROR_BACKOFF_SECONDS", "Provider error backoff (seconds)", "integer", "14400", "SOC Automation"),
     ("SOC_CYFIRMA_FEED_CACHE_SECONDS", "CYFIRMA feed cache (seconds)", "integer", "1800", "SOC Automation"),
+    ("SOC_CYFIRMA_PAGE_SIZE", "CYFIRMA indicators per page", "integer", "20", "SOC Automation"),
     ("SOC_CYFIRMA_MAX_PAGES", "CYFIRMA pages per scope and cycle", "integer", "10", "SOC Automation"),
     ("SOC_CYFIRMA_MAX_SECONDS", "CYFIRMA feed time budget (seconds)", "integer", "90", "SOC Automation"),
+    ("SOC_CYFIRMA_RESEARCH_ENABLED", "CYFIRMA public research collection", "boolean", "false", "Threat Intelligence"),
+    ("SOC_CYFIRMA_RESEARCH_URL", "CYFIRMA public research URL", "url", "https://www.cyfirma.com/research/", "Threat Intelligence"),
+    ("SOC_CYFIRMA_RESEARCH_INTERVAL_SECONDS", "CYFIRMA research refresh interval (seconds)", "integer", "21600", "Threat Intelligence"),
+    ("SOC_CYFIRMA_RESEARCH_MAX_ITEMS", "CYFIRMA research items per refresh", "integer", "25", "Threat Intelligence"),
+    ("SOC_CYFIRMA_TAXII_ENABLED", "CYFIRMA TAXII 2.1 collection", "boolean", "false", "Threat Intelligence"),
+    ("SOC_CYFIRMA_TAXII_COLLECTION_URL", "CYFIRMA TAXII collection URL", "url_optional", "", "Threat Intelligence"),
+    ("SOC_CYFIRMA_TAXII_BEARER_TOKEN", "CYFIRMA TAXII bearer token", "secret", "", "Threat Intelligence"),
+    ("SOC_CYFIRMA_TAXII_INTERVAL_SECONDS", "CYFIRMA TAXII refresh interval (seconds)", "integer", "21600", "Threat Intelligence"),
+    ("SOC_CYFIRMA_TAXII_MAX_ITEMS", "CYFIRMA TAXII objects per refresh", "integer", "50", "Threat Intelligence"),
+    ("SOC_CYFIRMA_TAXII_MAX_PAGES", "CYFIRMA TAXII pages per cycle", "integer", "2", "Threat Intelligence"),
+    ("SOC_CYFIRMA_ORG_VULN_ENABLED", "CYFIRMA Organization vulnerability STIX", "boolean", "false", "Threat Intelligence"),
+    ("SOC_CYFIRMA_ORG_VULN_API_KEY", "CYFIRMA Organization API key", "secret", "", "Threat Intelligence"),
+    ("SOC_CYFIRMA_ORG_VULN_URL", "CYFIRMA Organization vulnerability URL", "url", "https://decyfir.cyfirma.com/core/api-ua/stix-v2.1/v2/vulnerabilities", "Threat Intelligence"),
+    ("SOC_CYFIRMA_ORG_VULN_INTERVAL_SECONDS", "CYFIRMA Organization vulnerability refresh interval (seconds)", "integer", "21600", "Threat Intelligence"),
+    ("SOC_CYFIRMA_ORG_VULN_LOOKBACK_DAYS", "CYFIRMA Organization vulnerability lookback (days)", "integer", "30", "Threat Intelligence"),
+    ("SOC_CYFIRMA_ORG_VULN_PAGE_SIZE", "CYFIRMA Organization vulnerability page size", "integer", "50", "Threat Intelligence"),
+    ("SOC_CYFIRMA_ORG_VULN_MAX_PAGES", "CYFIRMA Organization vulnerability pages per cycle", "integer", "2", "Threat Intelligence"),
     ("SOC_PROVIDER_HISTORY_RETENTION_DAYS", "Provider intelligence history retention (days)", "integer", "180", "SOC Automation"),
+    ("DEFENDER_XDR_ENABLED", "Microsoft Defender XDR collector", "boolean", "false", "Microsoft Defender XDR"),
+    ("DEFENDER_XDR_TENANT_ID", "Defender XDR tenant ID", "text", "", "Microsoft Defender XDR"),
+    ("DEFENDER_XDR_CLIENT_ID", "Defender XDR application ID", "text", "", "Microsoft Defender XDR"),
+    ("DEFENDER_XDR_CLIENT_SECRET", "Defender XDR application secret", "secret", "", "Microsoft Defender XDR"),
+    ("DEFENDER_XDR_API_PROVIDER", "Defender incident API provider", "choice", "defender", "Microsoft Defender XDR"),
+    ("DEFENDER_XDR_COLLECTION_MODE", "Defender XDR collection mode", "choice", "incidents", "Microsoft Defender XDR"),
+    ("DEFENDER_XDR_API_BASE_URL", "Defender XDR API base URL", "url", "https://api.security.microsoft.com", "Microsoft Defender XDR"),
+    ("DEFENDER_XDR_POLL_INTERVAL_SECONDS", "Defender XDR refresh interval (seconds)", "integer", "900", "Microsoft Defender XDR"),
+    ("DEFENDER_XDR_BATCH_SIZE", "Defender XDR alerts per cycle", "integer", "50", "Microsoft Defender XDR"),
     ("HERMES_AGENT_ENABLED", "Hermes agent integration", "boolean", "false", "SOC Automation"),
     ("HERMES_AGENT_URL", "Hermes agent URL", "url_optional", "", "SOC Automation"),
     ("SOC_REPORT_LANGUAGE", "Report language", "choice", "id", "SOC Automation"),
@@ -86,25 +127,44 @@ FIELDS = [
     ("SOC_DELIVERY_ERROR_BACKOFF_SECONDS", "Failed delivery retry backoff (seconds)", "integer", "900", "Report Delivery"),
 ]
 SCHEMA = [{"key": k, "label": label, "type": typ, "group": group, "required": False, "restart": False,
-           **({"options": ["password", "oauth2"] if k == "SOC_SMTP_AUTH" else ["id", "en"]} if typ == "choice" else {})} for k, label, typ, _, group in FIELDS]
+           **({"options": (["password", "oauth2"] if k == "SOC_SMTP_AUTH" else ["defender", "graph"] if k == "DEFENDER_XDR_API_PROVIDER" else ["incidents", "alerts"] if k == "DEFENDER_XDR_COLLECTION_MODE" else ["id", "en"])} if typ == "choice" else {})} for k, label, typ, _, group in FIELDS]
 DEFAULTS = {k: default for k, _, _, default, _ in FIELDS}
 LIMITS = {"SOC_INTERVAL_SECONDS": (900, 86400), "SOC_IOC_BUDGET": (0, 50),
           "SOC_QUEUE_BATCH_SIZE": (10, 500),
           "SOC_STREAM_REPLAY_INTERVAL_SECONDS": (300, 86400),
           "SOC_STREAM_SCAN_PAUSE_SECONDS": (2, 300),
+          "SOC_STREAM_WINDOW_SECONDS": (60, 900),
+          "SOC_STREAM_PAGE_SIZE": (100, 1000),
           "SOC_ROLLUP_RETENTION_DAYS": (7, 3650),
+          "SOC_ENTITY_RETENTION_DAYS": (7, 365),
+          "SOC_ENTITY_MAX_EVIDENCE_PER_WINDOW": (50, 10000),
+          "SOC_ENTITY_DRAIN_BATCH_SIZE": (10, 1000),
           "SOC_ROLLUP_BACKFILL_DAYS": (7, 180),
           "SOC_ROLLUP_BACKFILL_CHUNK_MINUTES": (5, 120),
           "SOC_ROLLUP_BACKFILL_MAX_CHUNK_MINUTES": (5, 360),
           "SOC_ROLLUP_BACKFILL_INTERVAL_SECONDS": (30, 3600),
           "SOC_ROLLUP_BACKFILL_MIN_INTERVAL_SECONDS": (15, 600),
           "SOC_ROLLUP_BACKFILL_FAST_QUERY_MS": (100, 10000),
+          "SOC_FORTI_SECURITY_BACKFILL_CHUNK_MINUTES": (5, 120),
+          "SOC_FORTI_SECURITY_BACKFILL_INTERVAL_SECONDS": (60, 3600),
           "SOC_PROVIDER_OK_CACHE_SECONDS": (900, 86400),
           "SOC_PROVIDER_ERROR_BACKOFF_SECONDS": (900, 86400),
           "SOC_CYFIRMA_FEED_CACHE_SECONDS": (300, 21600),
+          "SOC_CYFIRMA_PAGE_SIZE": (1, 100),
           "SOC_CYFIRMA_MAX_PAGES": (1, 50),
           "SOC_CYFIRMA_MAX_SECONDS": (10, 300),
+          "SOC_CYFIRMA_RESEARCH_INTERVAL_SECONDS": (3600, 604800),
+          "SOC_CYFIRMA_RESEARCH_MAX_ITEMS": (1, 100),
+          "SOC_CYFIRMA_TAXII_INTERVAL_SECONDS": (900, 604800),
+          "SOC_CYFIRMA_TAXII_MAX_ITEMS": (1, 100),
+          "SOC_CYFIRMA_TAXII_MAX_PAGES": (1, 10),
+          "SOC_CYFIRMA_ORG_VULN_INTERVAL_SECONDS": (900, 604800),
+          "SOC_CYFIRMA_ORG_VULN_LOOKBACK_DAYS": (1, 365),
+          "SOC_CYFIRMA_ORG_VULN_PAGE_SIZE": (1, 100),
+          "SOC_CYFIRMA_ORG_VULN_MAX_PAGES": (1, 10),
           "SOC_PROVIDER_HISTORY_RETENTION_DAYS": (7, 3650),
+          "DEFENDER_XDR_POLL_INTERVAL_SECONDS": (300, 86400),
+          "DEFENDER_XDR_BATCH_SIZE": (1, 100),
           "SOC_ENRICHMENT_MAX_SECONDS": (60, 1800),
           "SOC_REPORT_RETENTION_DAYS": (7, 3650),
           "SOC_CVE_BUDGET": (0, 20), "SOC_CVE_SNAPSHOT_LIMIT": (10, 100),
@@ -134,6 +194,10 @@ def validate(values):
         pass
     if values.get("SOC_SMTP_AUTH", "password") not in {"password", "oauth2"}:
         errors.append("SOC_SMTP_AUTH: choose password or oauth2")
+    if values.get("DEFENDER_XDR_COLLECTION_MODE", "incidents") not in {"incidents", "alerts"}:
+        errors.append("DEFENDER_XDR_COLLECTION_MODE: choose incidents or alerts")
+    if values.get("DEFENDER_XDR_API_PROVIDER", "defender") not in {"defender", "graph"}:
+        errors.append("DEFENDER_XDR_API_PROVIDER: choose defender or graph")
     for key in ("SOC_REPORT_RECIPIENTS", "SOC_SMTP_FROM"):
         for value in filter(None, (v.strip() for v in values.get(key, "").split(","))):
             if not re.fullmatch(r"[^\s,@<>]+@[^\s,@<>]+\.[^\s,@<>]+", value):
@@ -329,6 +393,61 @@ def evidence_summary(events):
     return rows
 
 
+def provider_policy(candidate, providers, cyfirma_matches, evidence, enriched_at=None):
+    """Interpret stored provider evidence without claiming compromise.
+
+    Providers describe observables, not the direction or outcome of a local
+    connection. This policy preserves their raw rows while adding a small,
+    explainable decision layer for triage. It makes no provider or Indexer call.
+    """
+    providers = [row for row in (providers or []) if isinstance(row, dict)]
+    evidence = [row for row in (evidence or []) if isinstance(row, dict)]
+    indicator = normalized((candidate or {}).get("indicator") or "")
+    source_hits = sum(normalized(row.get("source_ip") or "") == indicator for row in evidence)
+    destination_hits = sum(normalized(row.get("destination_ip") or "") == indicator for row in evidence)
+    actions = {str(row.get("action") or "").strip().lower() for row in evidence if row.get("action")}
+    blocked_terms = ("block", "blocked", "deny", "denied", "drop", "dropped", "reject", "rejected")
+    allowed_terms = ("allow", "allowed", "accept", "accepted", "permit", "permitted", "success")
+    blocked = bool(actions) and all(any(term in action for term in blocked_terms) for action in actions)
+    allowed = any(any(term in action for term in allowed_terms) for action in actions)
+    adverse = [row for row in providers if row.get("is_malicious") and not row.get("error")]
+    scanner_rows = []
+    for row in providers:
+        if str(row.get("provider") or "").lower() != "greynoise":
+            continue
+        text = json.dumps(row.get("detail") or {}, ensure_ascii=True).lower()
+        if any(term in text for term in ("noise", "scanner", "benign", "unknown")):
+            scanner_rows.append(row)
+    provider_names = {str(row.get("provider") or "unknown").lower() for row in adverse}
+    exact_cyfirma = bool(cyfirma_matches)
+    local_evidence = bool(evidence)
+    score = min(35, max(0, int((candidate or {}).get("level") or 0) * 3))
+    score += min(35, len(provider_names) * 18)
+    score += 20 if exact_cyfirma else 0
+    score += 15 if local_evidence else 0
+    score -= 15 if scanner_rows and not adverse and not exact_cyfirma else 0
+    score -= 8 if blocked else 0
+    score = max(0, min(100, score))
+    if scanner_rows and not adverse and not exact_cyfirma:
+        status, confidence = "scanner_context", "scanner_or_background_noise"
+    elif adverse or exact_cyfirma:
+        status = "suspected"
+        confidence = ("corroborated_local_evidence" if local_evidence and (len(provider_names) >= 2 or exact_cyfirma)
+                      else "local_evidence_pending" if not local_evidence else "single_source_context")
+    else:
+        status, confidence = "needs_review", "no_adverse_provider_consensus"
+    return {
+        "status": status, "score": score, "confidence": confidence,
+        "provider_matches": len(provider_names), "cyfirma_exact_matches": len(cyfirma_matches or []),
+        "scanner_context": bool(scanner_rows), "flow": {
+            "source_matches": source_hits, "destination_matches": destination_hits,
+            "actions": sorted(actions)[:8], "blocked": blocked, "allowed": allowed,
+        },
+        "freshness": {"enriched_at": enriched_at, "source": "stored provider result"},
+        "note": "Provider context does not prove a successful attack or actor attribution.",
+    }
+
+
 def post(url, payload, headers=None, timeout=60):
     request = urllib.request.Request(url, data=json.dumps(payload).encode(),
         headers={"Content-Type": "application/json", **(headers or {})}, method="POST")
@@ -516,7 +635,7 @@ Output only JSON with this schema:
   "daily_brief": "what happened in this window by attack, source, target, CVE, provider confidence and action",
   "verdict": {"status": "benign|needs_review|suspicious|malicious", "severity": "low|medium|high|critical", "confidence": "low|medium|high", "reason": "why"},
   "assessment": "evidence-based analyst assessment",
-  "attack_categories": [{"category": "authentication|network_attack|web_attack|malware|file_integrity|cloud|vulnerability|reconnaissance|other", "count": 0, "severity": "low|medium|high|critical", "evidence": ["rule/event ids"]}],
+  "attack_categories": [{"category": "bruteforce|scan|web_attack.sqli|web_attack.xss|dos|malware|mitm_suspected|exploit_attempt|phishing|authentication|network_attack|web_attack|file_integrity|cloud|vulnerability|reconnaissance|other", "count": 0, "severity": "low|medium|high|critical", "evidence": ["rule/event ids"]}],
   "network_paths": [{"source": "source IP or identity", "destination": "destination IP/device/service", "action": "allow|deny|block|unknown", "events": 0, "evidence": ["event/rule ids"]}],
   "identities": [{"user": "account", "activity": "observed operation", "asset": "device/workload", "evidence": ["event/rule ids"]}],
   "data_impact": [{"data": "file/mailbox/object/path or unknown", "operation": "read/write/delete/download/unknown", "status": "observed|suspected|not_established", "evidence": ["event/rule ids"]}],
@@ -671,6 +790,15 @@ def _compact_event(event):
 
 
 def _attack_category(finding, events):
+    for event in events or []:
+        classification = classify_detection({
+            "rule": {"id": event.get("rule_id"), "description": event.get("rule_description")},
+            "category": finding.get("kind"), "title": finding.get("status"),
+            "data": {"srcip": event.get("source_ip"), "dstip": event.get("destination_ip"),
+                     "action": event.get("action")},
+        })
+        if classification["family"] != "other":
+            return classification["family"]
     text = " ".join(str(value) for value in [finding.get("kind"), finding.get("indicator"),
         finding.get("status"), finding.get("types"), finding.get("cyfirma_labels"),
         *[event.get("rule_description") for event in events], *[event.get("action") for event in events]] if value).lower()
@@ -1567,11 +1695,16 @@ class Automation:
         self.db_init_lock = threading.Lock()
         self.db_initialized = False
         self.cyfirma_cache_materialized = False
+        self.external_collector_lock = threading.Lock()
+        self.external_collectors: dict[str, Any] = {}
         self.pipeline = None
         self.running = False
         self.phase = "idle"
         self.error = None
         self.next_run = time.time() + 30
+        # External collectors have their own cache/backoff and must not wait
+        # for an Indexer-backed Wazuh report to succeed.
+        self.next_external_refresh = time.time() + 30
         self.stop = threading.Event()
         self.requested_window = {"range": "24h"}
 
@@ -1615,6 +1748,17 @@ class Automation:
                                 reported INTEGER NOT NULL DEFAULT 0, cached INTEGER NOT NULL DEFAULT 0,
                                 detail TEXT NOT NULL)''')
                             conn.execute("CREATE INDEX IF NOT EXISTS cyfirma_feed_runs_time ON cyfirma_feed_runs(collected_at DESC)")
+                            # A feed can be much larger than the per-cycle API budget.
+                            # Keep a durable, per-scope cursor so each run advances rather
+                            # than repeatedly downloading page zero.
+                            conn.execute('''CREATE TABLE IF NOT EXISTS cyfirma_feed_cursor (
+                                scope TEXT PRIMARY KEY, next_offset INTEGER NOT NULL DEFAULT 0,
+                                updated_at REAL NOT NULL, status TEXT NOT NULL, detail TEXT NOT NULL)''')
+                            conn.execute('''CREATE TABLE IF NOT EXISTS cyfirma_connector_cursor (
+                                scope TEXT PRIMARY KEY, next_value TEXT NOT NULL,
+                                updated_at REAL NOT NULL, status TEXT NOT NULL, detail TEXT NOT NULL)''')
+                            cyfirma_research.ensure_schema(conn)
+                            defender_xdr.ensure_schema(conn)
                             conn.execute("CREATE TABLE IF NOT EXISTS cache (key TEXT PRIMARY KEY, expires REAL, data TEXT)")
                             conn.execute("CREATE TABLE IF NOT EXISTS deliveries (channel TEXT, report_id INTEGER, sent REAL, status TEXT, PRIMARY KEY(channel,report_id))")
                             conn.execute('CREATE TABLE IF NOT EXISTS ai_runs (id INTEGER PRIMARY KEY, report_id INTEGER, created REAL, data TEXT)')
@@ -1659,6 +1803,52 @@ class Automation:
                 continue
         return result
 
+    def cyfirma_org_cve_context(self, cve_ids):
+        """Return Organization CVE records from the retained ledger only.
+
+        The dashboard can therefore enrich the Wazuh exposure graph without
+        re-contacting CYFIRMA for each asset, date selection, or analyst click.
+        """
+        ids = sorted({str(cve).upper() for cve in cve_ids
+                      if re.fullmatch(r"CVE-\d{4}-\d{4,}", str(cve), re.I)})[:100]
+        if not ids:
+            return {}
+        result = {cve: [] for cve in ids}
+        with self.db() as db:
+            rows = db.execute('''SELECT observed_at,name,description,confidence,source_modified,valid_until,cves,data
+                FROM cyfirma_observations WHERE scope='org_vulnerability'
+                ORDER BY observed_at DESC LIMIT 500''').fetchall()
+        for observed_at, name, description, confidence, modified, valid_until, raw_cves, raw_data in rows:
+            try:
+                row_cves = {str(value).upper() for value in json.loads(raw_cves or "[]")}
+            except (TypeError, ValueError, json.JSONDecodeError):
+                row_cves = set()
+            matched = row_cves & set(ids)
+            if not matched:
+                continue
+            try:
+                source = json.loads(raw_data or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                source = {}
+            entry = {
+                "name": str(name or "CYFIRMA Organization vulnerability")[:500],
+                "description": str(description or "")[:1200], "confidence": int(confidence or 0),
+                "modified": modified, "valid_until": valid_until,
+                "references": [str(value)[:500] for value in (source.get("references") or []) if value][:5],
+                "labels": [str(value)[:120] for value in (source.get("labels") or []) if value][:10],
+                "observed_at": datetime.fromtimestamp(float(observed_at), timezone.utc).isoformat(),
+                "source": "CYFIRMA Organization Vulnerability V2 STIX local ledger",
+            }
+            for cve in matched:
+                if len(result[cve]) < 5:
+                    result[cve].append(entry)
+        return {cve: rows for cve, rows in result.items() if rows}
+
+    def defender_xdr_correlations(self, context):
+        """Persist idempotent correlations from local records and bounded evidence."""
+        with self.db() as db:
+            return defender_xdr.correlate(db, context)
+
     def put(self, key, value, ttl=21600):
         with self.db() as db:
             db.execute("INSERT OR REPLACE INTO cache VALUES (?,?,?)", (key, time.time() + ttl, json.dumps(value)))
@@ -1682,18 +1872,26 @@ class Automation:
             if value and str(value) not in phases:
                 phases.append(str(value)[:120])
         references = [str(value)[:500] for value in (row.get("references") or []) if value][:10]
+        ioc_types = [str(value)[:64] for value in (row.get("ioc_types") or []) if value][:12]
         try:
             confidence = int(float(row.get("confidence") or 0))
         except (TypeError, ValueError):
             confidence = 0
         safe = {
             "id": str(row.get("id") or "")[:300], "scope": scope,
+            "indicator_type": str(row.get("type") or "indicator")[:64],
             "name": str(row.get("name") or "STIX indicator")[:500],
             "description": str(row.get("description") or "")[:3000],
             "confidence": max(0, min(confidence, 100)),
             "created": row.get("created"), "modified": row.get("modified"),
             "valid_from": row.get("valid_from"), "valid_until": row.get("valid_until"),
             "labels": labels, "kill_chain_phases": phases, "references": references,
+            "reference_count": len(references), "ioc_types": ioc_types,
+            # These are public observables supplied by the CYFIRMA feed. Keeping
+            # them in the protected local ledger enables future exact matching
+            # without re-downloading a previously processed page.
+            "iocs": [normalized(value) for value in (row.get("iocs") or [])
+                     if isinstance(value, str) and normalized(value)][:50],
             "cves": cves, "ioc_count": len(row.get("iocs") or []),
         }
         identity = "\x1f".join((bucket_day, scope, item_key))
@@ -1742,6 +1940,76 @@ class Automation:
             db.execute("DELETE FROM cyfirma_observations WHERE observed_at<?", (time.time() - retention,))
             db.execute("DELETE FROM cyfirma_feed_runs WHERE collected_at<?", (time.time() - retention,))
         return len(observations)
+
+    def _cyfirma_feed_offset(self, scope):
+        """Read the next bounded page offset without provider I/O."""
+        with self.db() as db:
+            row = db.execute("SELECT next_offset FROM cyfirma_feed_cursor WHERE scope=?", (scope,)).fetchone()
+        return max(0, int(row[0] or 0)) if row else 0
+
+    def _set_cyfirma_feed_offset(self, scope, next_offset, status):
+        detail = {key: status.get(key) for key in ("loaded", "reported", "reason", "error")
+                  if status.get(key) is not None}
+        with self.db() as db:
+            db.execute('''INSERT INTO cyfirma_feed_cursor(scope,next_offset,updated_at,status,detail)
+                VALUES (?,?,?,?,?) ON CONFLICT(scope) DO UPDATE SET
+                next_offset=excluded.next_offset,updated_at=excluded.updated_at,
+                status=excluded.status,detail=excluded.detail''',
+                (scope, max(0, int(next_offset or 0)), time.time(),
+                 str(status.get("status") or "unknown")[:32], json.dumps(detail)))
+
+    def _connector_cursor(self, scope, default=""):
+        """Read an opaque connector cursor without making a provider request."""
+        with self.db() as db:
+            row = db.execute("SELECT next_value FROM cyfirma_connector_cursor WHERE scope=?", (scope,)).fetchone()
+        return str(row[0]) if row and row[0] is not None else str(default)
+
+    def _set_connector_cursor(self, scope, next_value, status):
+        detail = {key: status.get(key) for key in ("loaded", "reported", "pages", "more", "reason", "error")
+                  if status.get(key) is not None}
+        with self.db() as db:
+            db.execute('''INSERT INTO cyfirma_connector_cursor(scope,next_value,updated_at,status,detail)
+                VALUES (?,?,?,?,?) ON CONFLICT(scope) DO UPDATE SET
+                next_value=excluded.next_value,updated_at=excluded.updated_at,
+                status=excluded.status,detail=excluded.detail''',
+                (str(scope)[:64], str(next_value or "")[:2048], time.time(),
+                 str(status.get("status") or "unknown")[:32], json.dumps(detail)))
+
+    def _cyfirma_ledger_matches(self, indicators):
+        """Match stored public CYFIRMA observables locally.
+
+        Older ledger rows intentionally did not retain IOC values, so they are
+        harmlessly skipped. New rows make a rotating feed useful immediately
+        after their page has been collected, with no new CYFIRMA request.
+        """
+        wanted = {normalized(value) for value in indicators if normalized(value)}
+        if not wanted:
+            return {}
+        matches = {value: [] for value in wanted}
+        now_utc = datetime.now(timezone.utc)
+        with self.db() as db:
+            rows = db.execute('''SELECT data FROM (
+                SELECT data,item_key,scope,valid_until,observed_at,
+                       ROW_NUMBER() OVER (PARTITION BY item_key,scope ORDER BY observed_at DESC) AS position
+                FROM cyfirma_observations
+            ) WHERE position=1 ORDER BY item_key LIMIT 10000''').fetchall()
+        for (raw,) in rows:
+            try:
+                item = json.loads(raw or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            valid_until = item.get("valid_until")
+            if valid_until:
+                try:
+                    if datetime.fromisoformat(str(valid_until).replace("Z", "+00:00")) < now_utc:
+                        continue
+                except (TypeError, ValueError):
+                    continue
+            for value in item.get("iocs") or []:
+                key = normalized(value)
+                if key in matches and len(matches[key]) < 5:
+                    matches[key].append(item)
+        return {key: rows for key, rows in matches.items() if rows}
 
     def _materialize_cached_cyfirma_feeds(self):
         """Import existing feed snapshots into the durable ledger without provider I/O."""
@@ -1803,6 +2071,9 @@ class Automation:
             runs = db.execute('''SELECT scope,status,loaded,reported,cached,collected_at,detail
                 FROM cyfirma_feed_runs WHERE collected_at>=? AND collected_at<?
                 ORDER BY collected_at DESC LIMIT 12''', (start_ts, end_ts)).fetchall()
+            timeline_rows = db.execute('''SELECT bucket_day,COUNT(DISTINCT item_key),COALESCE(SUM(ioc_count),0)
+                FROM cyfirma_observations WHERE observed_at>=? AND observed_at<?
+                GROUP BY bucket_day ORDER BY bucket_day''', (start_ts, end_ts)).fetchall()
         def decode_rows(records):
             decoded = []
             for raw, observed_at in records:
@@ -1810,12 +2081,22 @@ class Automation:
                     item = json.loads(raw)
                 except (TypeError, ValueError, json.JSONDecodeError):
                     continue
+                # IOC values remain available to the local exact-match engine
+                # but are not bulk-exported by the historical feed view.
+                item.pop("iocs", None)
                 item["observed_at"] = datetime.fromtimestamp(observed_at, timezone.utc).isoformat()
                 decoded.append(item)
             return decoded
 
         items = decode_rows(rows)
         cve_items = decode_rows(cve_rows)
+        labels = {}
+        phases = {}
+        for item in items:
+            for value in item.get("labels") or []:
+                labels[str(value)] = labels.get(str(value), 0) + 1
+            for value in item.get("kill_chain_phases") or []:
+                phases[str(value)] = phases.get(str(value), 0) + 1
         statuses = []
         seen_scopes = set()
         for scope, status, loaded, reported, cached, collected_at, detail in runs:
@@ -1831,8 +2112,14 @@ class Automation:
             "summary": {"indicators": int(totals[0] or 0), "tailored": int(totals[1] or 0),
                 "global": int(totals[2] or 0), "ioc_values": int(totals[3] or 0),
                 "cve_linked": int(totals[5] or 0),
-                "last_observed_at": datetime.fromtimestamp(totals[4], timezone.utc).isoformat() if totals[4] else None},
+                "last_observed_at": datetime.fromtimestamp(totals[4], timezone.utc).isoformat() if totals[4] else None,
+                "top_labels": dict(sorted(labels.items(), key=lambda item: item[1], reverse=True)[:8]),
+                "top_kill_chain_phases": dict(sorted(phases.items(), key=lambda item: item[1], reverse=True)[:8]),
+                "feed_status": statuses},
             "items": items, "cve_items": cve_items, "feed_status": statuses,
+            "timeline": [{"key": datetime.fromisoformat(day).replace(tzinfo=timezone.utc).timestamp() * 1000,
+                          "doc_count": int(indicators), "ioc_values": int(ioc_values)}
+                         for day, indicators, ioc_values in timeline_rows],
             "provider_calls": 0, "storage": "soc-automation SQLite daily ledger",
             "scope_note": "CYFIRMA endpoints currently provide STIX indicators. CVE linkage appears only when a feed record explicitly references a CVE; absence is not evidence that no relevant CVE exists.",
         }
@@ -2623,6 +2910,10 @@ class Automation:
                 db.execute('DELETE FROM report_summaries WHERE report_id NOT IN (SELECT id FROM reports)')
             self._store_report_summary(report, report["id"], created)
             self._store_cve_observations(report, created, report["id"])
+            # A successful report may opportunistically refresh external
+            # sources. The scheduler also runs this independently of Wazuh.
+            self._refresh_external_collectors()
+            self.next_external_refresh = time.time() + 60
             self.error = None
             if self.pipeline:
                 for candidate in report.get('queue_attempts', []):
@@ -2634,6 +2925,250 @@ class Automation:
             with self.lock:
                 self.running = False
                 self.phase = "idle"
+
+    def _refresh_external_collectors(self) -> None:
+        """Collect optional external sources without changing the Wazuh read path."""
+        if not self.external_collector_lock.acquire(blocking=False):
+            return
+        try:
+            cfg = self.config()
+            research = {"enabled": cfg.get("SOC_CYFIRMA_RESEARCH_ENABLED") == "true", "status": "disabled"}
+            if research["enabled"]:
+                interval = int_config(cfg, "SOC_CYFIRMA_RESEARCH_INTERVAL_SECONDS", 21600)
+                cached = self.cached("cyfirma_research:refresh")
+                if cached is not None:
+                    research = {**cached, "status": "cooldown"}
+                else:
+                    try:
+                        items = cyfirma_research.fetch_listing(
+                            cfg.get("SOC_CYFIRMA_RESEARCH_URL") or cyfirma_research.DEFAULT_URL,
+                            int_config(cfg, "SOC_CYFIRMA_RESEARCH_MAX_ITEMS", 25),
+                        )
+                        with self.db() as db:
+                            stored = cyfirma_research.store(db, items)
+                        research = {"enabled": True, "status": "ok", "received": stored}
+                        self.put("cyfirma_research:refresh", research, interval)
+                    except Exception as exc:
+                        research = {"enabled": True, "status": "error", "reason": self.clean_error(exc)}
+                        self.put("cyfirma_research:refresh", research,
+                                 int_config(cfg, "SOC_PROVIDER_ERROR_BACKOFF_SECONDS", 14400))
+            taxii = {"enabled": cfg.get("SOC_CYFIRMA_TAXII_ENABLED") == "true", "status": "disabled"}
+            if taxii["enabled"]:
+                interval = int_config(cfg, "SOC_CYFIRMA_TAXII_INTERVAL_SECONDS", 21600)
+                cached = self.cached("cyfirma_taxii:refresh")
+                if cached is not None:
+                    taxii = {**cached, "status": "cooldown"}
+                else:
+                    try:
+                        rows, pages, complete = [], 0, False
+                        cursor = self._connector_cursor("taxii", "")
+                        next_cursor = cursor
+                        last_page = {}
+                        for _ in range(int_config(cfg, "SOC_CYFIRMA_TAXII_MAX_PAGES", 2)):
+                            page_rows, page_status = cyfirma_taxii.fetch(
+                                cfg.get("SOC_CYFIRMA_TAXII_COLLECTION_URL") or "",
+                                cfg.get("SOC_CYFIRMA_TAXII_BEARER_TOKEN") or "",
+                                int_config(cfg, "SOC_CYFIRMA_TAXII_MAX_ITEMS", 50), cursor=next_cursor,
+                            )
+                            rows.extend(page_rows)
+                            pages += 1
+                            last_page = page_status
+                            if not page_status.get("more"):
+                                complete, next_cursor = True, ""
+                                break
+                            next_cursor = str(page_status.get("next_cursor") or "")
+                            if not next_cursor:
+                                raise RuntimeError("CYFIRMA TAXII reported more pages without a continuation token")
+                        taxii = {"enabled": True, "status": "loaded" if complete else "partial",
+                                 "loaded": len(rows), "reported": int(last_page.get("reported") or 0),
+                                 "pages": pages, "more": not complete, "cursor": bool(next_cursor),
+                                 "pagination_complete": complete}
+                        self._store_cyfirma_observations(rows, {"taxii": taxii})
+                        self._set_connector_cursor("taxii", next_cursor, taxii)
+                        # A partial sweep advances in the background sooner; a
+                        # completed sweep follows the configured freshness SLA.
+                        self.put("cyfirma_taxii:refresh", taxii, interval if complete else min(interval, 900))
+                    except Exception as exc:
+                        taxii = {"enabled": True, "status": "error", "reason": self.clean_error(exc)}
+                        self.put("cyfirma_taxii:refresh", taxii,
+                                 int_config(cfg, "SOC_PROVIDER_ERROR_BACKOFF_SECONDS", 14400))
+            org_vulnerability = {"enabled": cfg.get("SOC_CYFIRMA_ORG_VULN_ENABLED") == "true", "status": "disabled"}
+            if org_vulnerability["enabled"]:
+                interval = int_config(cfg, "SOC_CYFIRMA_ORG_VULN_INTERVAL_SECONDS", 21600)
+                cached = self.cached("cyfirma_org_vulnerability:refresh")
+                if cached is not None:
+                    org_vulnerability = {**cached, "status": "cooldown"}
+                else:
+                    try:
+                        rows, pages, complete = [], 0, False
+                        try:
+                            page = max(1, int(self._connector_cursor("org_vulnerability", "1")))
+                        except ValueError:
+                            page = 1
+                        next_page = page
+                        last_page = {}
+                        for _ in range(int_config(cfg, "SOC_CYFIRMA_ORG_VULN_MAX_PAGES", 2)):
+                            page_rows, page_status = cyfirma_org_vulnerability.fetch(
+                                cfg.get("SOC_CYFIRMA_ORG_VULN_API_KEY") or "",
+                                cfg.get("SOC_CYFIRMA_ORG_VULN_URL") or cyfirma_org_vulnerability.DEFAULT_URL,
+                                int_config(cfg, "SOC_CYFIRMA_ORG_VULN_LOOKBACK_DAYS", 30),
+                                int_config(cfg, "SOC_CYFIRMA_ORG_VULN_PAGE_SIZE", 50), page=next_page,
+                            )
+                            rows.extend(page_rows)
+                            pages += 1
+                            last_page = page_status
+                            if not page_status.get("more"):
+                                complete, next_page = True, 1
+                                break
+                            next_page = max(1, int(page_status.get("next_page") or next_page + 1))
+                        org_vulnerability = {"enabled": True, "status": "loaded" if complete else "partial",
+                                             "loaded": len(rows), "reported": int(last_page.get("reported") or 0),
+                                             "pages": pages, "more": not complete, "next_page": next_page,
+                                             "pagination_complete": complete}
+                        self._store_cyfirma_observations(rows, {"org_vulnerability": org_vulnerability})
+                        self._set_connector_cursor("org_vulnerability", str(next_page), org_vulnerability)
+                        self.put("cyfirma_org_vulnerability:refresh", org_vulnerability,
+                                 interval if complete else min(interval, 900))
+                    except Exception as exc:
+                        org_vulnerability = {"enabled": True, "status": "error", "reason": self.clean_error(exc)}
+                        self.put("cyfirma_org_vulnerability:refresh", org_vulnerability,
+                                 int_config(cfg, "SOC_PROVIDER_ERROR_BACKOFF_SECONDS", 14400))
+            with self.db() as db:
+                defender = defender_xdr.collect(db, cfg)
+            self.external_collectors = {"cyfirma_research": research, "cyfirma_taxii": taxii,
+                                        "cyfirma_org_vulnerability": org_vulnerability, "defender_xdr": defender}
+        finally:
+            self.external_collector_lock.release()
+
+    def external_intelligence_status(self) -> dict[str, Any]:
+        """Expose only local ledger/checkpoint status; this never calls a provider."""
+        cfg = self.config()
+        now_utc = datetime.now(timezone.utc)
+        with self.db() as db:
+            research = cyfirma_research.history(db, limit=5)
+            defender = defender_xdr.status(db)
+            try:
+                observation_rows = db.execute('''SELECT scope,COUNT(*),MAX(observed_at),MIN(valid_until),MAX(valid_until)
+                    FROM cyfirma_observations GROUP BY scope''').fetchall()
+            except sqlite3.OperationalError:
+                observation_rows = []
+            try:
+                cursor_rows = db.execute('''SELECT scope,next_offset,updated_at,status,detail
+                    FROM cyfirma_feed_cursor ORDER BY scope''').fetchall()
+            except sqlite3.OperationalError:
+                cursor_rows = []
+            try:
+                connector_rows = db.execute('''SELECT scope,next_value,updated_at,status,detail
+                    FROM cyfirma_connector_cursor ORDER BY scope''').fetchall()
+            except sqlite3.OperationalError:
+                connector_rows = []
+        feed_cursors = []
+        for scope, next_offset, updated_at, status, detail in cursor_rows:
+            try:
+                parsed_detail = json.loads(detail or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                parsed_detail = {}
+            feed_cursors.append({
+                "scope": scope, "next_offset": int(next_offset or 0), "status": status,
+                "updated_at": datetime.fromtimestamp(float(updated_at), timezone.utc).isoformat(),
+                "detail": parsed_detail,
+            })
+        connector_cursors = {}
+        for scope, next_value, updated_at, status, detail in connector_rows:
+            try:
+                parsed_detail = json.loads(detail or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                parsed_detail = {}
+            connector_cursors[str(scope)] = {
+                "next": str(next_value or ""), "status": status,
+                "updated_at": datetime.fromtimestamp(float(updated_at), timezone.utc).isoformat(),
+                "detail": parsed_detail,
+            }
+        observation_counts = {}
+        for scope, count, observed_at, earliest_expiry, latest_expiry in observation_rows:
+            observation_counts[str(scope)] = {
+                "observations": int(count or 0),
+                "last_observed_at": datetime.fromtimestamp(float(observed_at), timezone.utc).isoformat()
+                if observed_at else None,
+                # Dates originate in STIX. They are evidence freshness metadata,
+                # not a claim that all indicators remain actionable.
+                "earliest_valid_until": earliest_expiry or None,
+                "latest_valid_until": latest_expiry or None,
+            }
+
+        def collection_label(value: str) -> str | None:
+            try:
+                parsed = urllib.parse.urlsplit(value)
+                if not parsed.hostname:
+                    return None
+                return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path.rstrip("/"), "", ""))
+            except (TypeError, ValueError):
+                return None
+
+        def freshness(row: dict[str, Any]) -> dict[str, Any]:
+            observed = row.get("last_observed_at")
+            age_seconds = None
+            try:
+                age_seconds = max(0, int((now_utc - datetime.fromisoformat(str(observed).replace("Z", "+00:00"))).total_seconds()))
+            except (TypeError, ValueError):
+                pass
+            return {"last_observed_at": observed, "age_seconds": age_seconds,
+                    "earliest_valid_until": row.get("earliest_valid_until"),
+                    "latest_valid_until": row.get("latest_valid_until")}
+        # Collector state is normally in memory, but the deployment verifier
+        # reads the same SQLite ledger from a short-lived Python process. Fall
+        # back to durable cache/checkpoint state so restart verification never
+        # calls completed data "not_started".
+        research_runtime = self.external_collectors.get("cyfirma_research") or self.cached("cyfirma_research:refresh") or {}
+        taxii_runtime = self.external_collectors.get("cyfirma_taxii") or self.cached("cyfirma_taxii:refresh") or {}
+        org_vulnerability_runtime = (self.external_collectors.get("cyfirma_org_vulnerability")
+                                     or self.cached("cyfirma_org_vulnerability:refresh") or {})
+
+        def status(runtime, cursor=None, observations=0):
+            value = runtime.get("status") if isinstance(runtime, dict) else None
+            if value and value != "not_started":
+                return value
+            if isinstance(cursor, dict) and cursor.get("status"):
+                return cursor["status"]
+            return "stored" if observations else "not_started"
+
+        taxii_cursor = connector_cursors.get("taxii")
+        org_cursor = connector_cursors.get("org_vulnerability")
+        taxii_observations = observation_counts.get("taxii", {})
+        org_observations = observation_counts.get("org_vulnerability", {})
+        return {
+            "cyfirma_feed": {"enabled": True, "cursors": feed_cursors,
+                              "source": "durable rotating STIX feed cursor"},
+            "cyfirma_research": {"enabled": cfg.get("SOC_CYFIRMA_RESEARCH_ENABLED") == "true",
+                                  "items": research.get("total", 0), "recent": research.get("items", []),
+                                  "status": status(research_runtime, observations=research.get("total", 0))},
+            "cyfirma_taxii": {"enabled": cfg.get("SOC_CYFIRMA_TAXII_ENABLED") == "true",
+                               "status": status(taxii_runtime, taxii_cursor, taxii_observations.get("observations", 0)),
+                               "configured": bool(cfg.get("SOC_CYFIRMA_TAXII_COLLECTION_URL") and cfg.get("SOC_CYFIRMA_TAXII_BEARER_TOKEN")),
+                               "cursor": taxii_cursor, "collection": collection_label(cfg.get("SOC_CYFIRMA_TAXII_COLLECTION_URL") or ""),
+                               "freshness": freshness(taxii_observations), **taxii_observations,
+                               "detail": {key: taxii_runtime.get(key) for key in ("loaded", "reported", "pages", "more", "pagination_complete", "reason") if key in taxii_runtime}},
+            "cyfirma_org_vulnerability": {"enabled": cfg.get("SOC_CYFIRMA_ORG_VULN_ENABLED") == "true",
+                                          "status": status(org_vulnerability_runtime, org_cursor, org_observations.get("observations", 0)),
+                                          "configured": bool(cfg.get("SOC_CYFIRMA_ORG_VULN_API_KEY")),
+                                          "cursor": org_cursor, "freshness": freshness(org_observations), **org_observations,
+                                          "detail": {key: org_vulnerability_runtime.get(key) for key in ("loaded", "reported", "pages", "more", "pagination_complete", "reason") if key in org_vulnerability_runtime}},
+            "defender_xdr": {"enabled": cfg.get("DEFENDER_XDR_ENABLED") == "true", **defender,
+                             "configured": bool(cfg.get("DEFENDER_XDR_TENANT_ID") and cfg.get("DEFENDER_XDR_CLIENT_ID") and cfg.get("DEFENDER_XDR_CLIENT_SECRET"))},
+        }
+
+    def cyfirma_research_updates(self, start: str, end: str, limit: int = 30) -> dict[str, Any]:
+        with self.db() as db:
+            result = cyfirma_research.history(db, start, end, limit)
+        result["enabled"] = self.config().get("SOC_CYFIRMA_RESEARCH_ENABLED") == "true"
+        return result
+
+    def defender_xdr_updates(self, start: str, end: str, limit: int = 30, offset: int = 0) -> dict[str, Any]:
+        """Serve retained Defender observations without a new Microsoft API call."""
+        with self.db() as db:
+            result = defender_xdr.history(db, start, end, limit, offset)
+        result["enabled"] = self.config().get("DEFENDER_XDR_ENABLED") == "true"
+        return result
 
     def clean_error(self, exc):
         message = str(exc)
@@ -2714,22 +3249,29 @@ class Automation:
         feed_started = time.time()
         feed_budget = int_config(cfg, "SOC_CYFIRMA_MAX_SECONDS", 90)
         feed_pages = int_config(cfg, "SOC_CYFIRMA_MAX_PAGES", 10)
+        feed_page_size = max(1, min(int_config(cfg, "SOC_CYFIRMA_PAGE_SIZE", 20), 100))
         self.phase = "cyfirma"
         for scope in ("tailored", "global"):
             snapshot = self.cached("feed:" + scope)
-            if snapshot:
+            # Only a complete feed snapshot is reused. A partial page set must
+            # advance its persisted cursor on the next automation cycle.
+            if snapshot and not (snapshot.get("status") or {}).get("cached_partial"):
                 feed_rows.extend(snapshot["rows"])
                 feed_status[scope] = {**snapshot["status"], "cached": True}
                 continue
             start = len(feed_rows)
             loaded, reported, complete = 0, 0, False
+            offset = self._cyfirma_feed_offset(scope)
+            next_offset = offset
             for page in range(feed_pages):
                 if time.time() - feed_started >= feed_budget:
                     feed_status[scope] = {"status": "deferred", "loaded": loaded,
-                                          "reported": reported, "reason": "feed time budget reached"}
+                                          "reported": reported, "offset": next_offset,
+                                          "reason": "feed time budget reached"}
                     break
-                offset = page * 20
-                response = self.call("infokom", "cyfirma_ioc_feed", {"scope": scope, "limit": 20, "offset": offset, "response_format": "json"})
+                response = self.call("infokom", "cyfirma_ioc_feed", {
+                    "scope": scope, "limit": feed_page_size, "offset": next_offset, "response_format": "json",
+                })
                 data = response.get("data") or {}
                 if not response.get("ok") or data.get("errors"):
                     feed_status[scope] = {"status": "error", "error": response.get("error") or data.get("errors")}
@@ -2738,14 +3280,23 @@ class Automation:
                 feed_rows.extend(rows)
                 loaded += len(rows)
                 reported = data.get("feeds", {}).get(scope, {}).get("count", loaded)
+                next_offset = data.get("next_offset")
                 if data.get("next_offset") is None or not rows:
-                    complete = loaded >= reported
+                    # We may have started in the middle of a feed sweep. A
+                    # terminal offset completes that sweep even though this
+                    # particular cycle only fetched its final page.
+                    complete = True
+                    next_offset = 0
                     break
-            feed_status.setdefault(scope, {"status": "loaded" if complete else "partial", "loaded": loaded, "reported": reported})
+            feed_status.setdefault(scope, {"status": "loaded" if complete else "partial", "loaded": loaded,
+                                            "reported": reported, "offset": next_offset})
+            feed_status[scope]["fetched_at"] = now()
+            if feed_status[scope].get("status") != "error":
+                self._set_cyfirma_feed_offset(scope, next_offset, feed_status[scope])
             snapshot_ttl = (int_config(cfg, "SOC_CYFIRMA_FEED_CACHE_SECONDS", 1800) if complete
-                            else int_config(cfg, "SOC_PROVIDER_ERROR_BACKOFF_SECONDS", 14400))
+                            else max(60, min(int_config(cfg, "SOC_INTERVAL_SECONDS", 900), 900)))
             self.put("feed:" + scope, {"rows": feed_rows[start:],
-                "status": {**feed_status[scope], "fetched_at": now(), "cached_partial": not complete}}, snapshot_ttl)
+                "status": {**feed_status[scope], "cached_partial": not complete}}, snapshot_ttl)
         feed_index = {}
         for row in feed_rows:
             valid_until = row.get("valid_until")
@@ -2760,6 +3311,7 @@ class Automation:
         # Persist a daily, deduplicated provider ledger before local matching.
         # Historical UI reads this SQLite ledger and never replays CYFIRMA feeds.
         self._store_cyfirma_observations(feed_rows, feed_status)
+        ledger_matches = self._cyfirma_ledger_matches([row.get("indicator") for row in candidates])
         findings, used, queue_attempts, deferred = [], 0, [], 0
         enrichment_started = time.time()
         enrichment_cutoff = int_config(cfg, "SOC_ENRICHMENT_MAX_SECONDS", 420)
@@ -2776,7 +3328,13 @@ class Automation:
                 deferred += len(candidates) - index
                 break
             indicator = candidate["indicator"]
-            matches = feed_index.get(normalized(indicator), [])
+            # The current page and previously checkpointed pages are both local
+            # evidence. This makes provider matching cumulative while pagination
+            # remains deliberately throttled.
+            matches = list(feed_index.get(normalized(indicator), []))
+            for row in ledger_matches.get(normalized(indicator), []):
+                if row.get("id") not in {item.get("id") for item in matches}:
+                    matches.append(row)
             key = "ioc:" + indicator
             result = self.cached(key)
             if result is not None and self.history:
@@ -2802,7 +3360,6 @@ class Automation:
             if (result or {}).get("urlhaus"):
                 u = result["urlhaus"]
                 providers.append({"provider": "urlhaus", "status": "context" if u.get("ok") else "error", "detail": u.get("data"), "error": u.get("error")})
-            malicious = bool(matches) or any(r.get("is_malicious") for r in rows)
             kind = "hash" if candidate["kind"] in {"md5", "sha1", "sha256"} else candidate["kind"]
             try:
                 evidence_filter = {"kind": kind, "value": indicator, "range": "24h"}
@@ -2812,8 +3369,10 @@ class Automation:
                 evidence = self.evidence(evidence_filter)
             except Exception as exc:
                 evidence = {"events": [], "error": self.clean_error(exc)}
-            findings.append({**candidate, "status": "suspected" if malicious else "needs_review",
-                "evidence": evidence_summary(evidence.get("events", [])[:5]), "event_total": evidence.get("total"),
+            local_evidence = evidence_summary(evidence.get("events", [])[:5])
+            policy = provider_policy(candidate, providers, matches, local_evidence, (result or {}).get("generated_at"))
+            findings.append({**candidate, "status": policy["status"], "provider_policy": policy,
+                "evidence": local_evidence, "event_total": evidence.get("total"),
                 "providers": providers, "cyfirma_matches": matches[:5], "enriched_at": (result or {}).get("generated_at"),
                 "error": (result or {}).get("error") or evidence.get("error"), "compromise_confirmed": False})
             if self.pipeline and result is not None:
@@ -2942,7 +3501,13 @@ class Automation:
 
     def loop(self):
         while not self.stop.wait(10):
-            if self.config().get("SOC_AUTO_ENRICH") == "true" and time.time() >= self.next_run:
+            current = time.time()
+            if current >= self.next_external_refresh:
+                # The method's non-blocking lock plus per-collector cache,
+                # interval and error backoff keep this independent loop cheap.
+                self._refresh_external_collectors()
+                self.next_external_refresh = current + 60
+            if self.config().get("SOC_AUTO_ENRICH") == "true" and current >= self.next_run:
                 self.trigger()
 
     def start(self):

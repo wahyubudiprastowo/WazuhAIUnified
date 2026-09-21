@@ -56,6 +56,94 @@ class AutomationTests(unittest.TestCase):
         self.assertEqual(result['findings'][0]['status'], 'suspected')
         self.intel.assert_not_called()
 
+    def test_cyfirma_partial_feed_rotates_and_matches_ledger_without_redownload(self):
+        self.config.update(SOC_IOC_BUDGET='0', SOC_CYFIRMA_MAX_PAGES='1',
+                           SOC_CYFIRMA_PAGE_SIZE='20')
+
+        def feed_call(_source, _tool, request):
+            if request['offset'] == 0:
+                return {'ok': True, 'data': {'items': [{
+                    'id': 'indicator--page-one', 'scope': request['scope'],
+                    'name': 'first page', 'iocs': ['9.9.9.9'],
+                }], 'feeds': {request['scope']: {'count': 40}}, 'next_offset': 20}}
+            return {'ok': True, 'data': {'items': [{
+                'id': 'indicator--page-two', 'scope': request['scope'],
+                'name': 'later page', 'iocs': ['8.8.8.8'],
+            }], 'feeds': {request['scope']: {'count': 40}}, 'next_offset': None}}
+
+        self.call.side_effect = feed_call
+        first = self.worker.build()
+        self.assertEqual(first['findings'], [])
+        self.assertEqual(self.worker._cyfirma_feed_offset('tailored'), 20)
+        second = self.worker.build()
+        self.assertEqual(second['findings'][0]['indicator'], '8.8.8.8')
+        self.assertEqual(second['findings'][0]['status'], 'suspected')
+        self.assertEqual(self.worker._cyfirma_feed_offset('tailored'), 0)
+        self.intel.assert_not_called()
+
+    def test_taxii_partial_sweep_uses_a_durable_cursor(self):
+        self.config.update({
+            "SOC_CYFIRMA_TAXII_ENABLED": "true",
+            "SOC_CYFIRMA_TAXII_COLLECTION_URL": "https://api.cyfirma.com/taxii2/collections/abc/",
+            "SOC_CYFIRMA_TAXII_BEARER_TOKEN": "token",
+            "SOC_CYFIRMA_TAXII_MAX_PAGES": "1",
+            "SOC_CYFIRMA_TAXII_INTERVAL_SECONDS": "900",
+        })
+        pages = [
+            ([{"id": "indicator--first", "scope": "taxii", "type": "indicator", "name": "first", "iocs": ["8.8.8.8"], "valid_until": "2026-10-01T00:00:00Z"}],
+             {"reported": 1, "more": True, "next_cursor": "next-token"}),
+            ([{"id": "indicator--second", "scope": "taxii", "type": "indicator", "name": "second", "iocs": ["1.1.1.1"]}],
+             {"reported": 1, "more": False, "next_cursor": ""}),
+        ]
+        with patch.object(soc.cyfirma_taxii, "fetch", side_effect=pages) as fetch:
+            self.worker._refresh_external_collectors()
+            self.assertEqual(fetch.call_args.kwargs["cursor"], "")
+            self.assertEqual(self.worker._connector_cursor("taxii"), "next-token")
+            with self.worker.db() as db:
+                db.execute("DELETE FROM cache WHERE key='cyfirma_taxii:refresh'")
+            self.worker._refresh_external_collectors()
+        self.assertEqual(fetch.call_args.kwargs["cursor"], "next-token")
+        self.assertEqual(self.worker._connector_cursor("taxii"), "")
+        # Deployment verification runs in a separate Python process. It must
+        # derive collector status from durable cursor/cache state, not memory.
+        self.worker.external_collectors = {}
+        with self.worker.db() as db:
+            db.execute("DELETE FROM cache WHERE key='cyfirma_taxii:refresh'")
+        status = self.worker.external_intelligence_status()["cyfirma_taxii"]
+        self.assertEqual(status["cursor"]["status"], "loaded")
+        self.assertEqual(status["status"], "loaded")
+        self.assertEqual(status["collection"], "https://api.cyfirma.com/taxii2/collections/abc")
+        self.assertEqual(status["freshness"]["earliest_valid_until"], "2026-10-01T00:00:00Z")
+
+    def test_external_status_reports_stored_research_without_runtime_memory(self):
+        with self.worker.db() as db:
+            soc.cyfirma_research.store(db, [{
+                "title": "Stored CYFIRMA research", "url": "https://www.cyfirma.com/research/example/",
+            }])
+        self.worker.external_collectors = {}
+        status = self.worker.external_intelligence_status()["cyfirma_research"]
+        self.assertEqual(status["items"], 1)
+        self.assertEqual(status["status"], "stored")
+
+    def test_provider_policy_downranks_scanner_context_and_keeps_flow_direction(self):
+        scanner = soc.provider_policy(
+            {"indicator": "198.51.100.8", "level": 10},
+            [{"provider": "greynoise", "detail": {"classification": "unknown", "noise": True}}], [],
+            [{"source_ip": "198.51.100.8", "destination_ip": "10.0.0.8", "action": "deny"}],
+        )
+        self.assertEqual(scanner["status"], "scanner_context")
+        self.assertTrue(scanner["flow"]["blocked"])
+        self.assertEqual(scanner["flow"]["source_matches"], 1)
+        corroborated = soc.provider_policy(
+            {"indicator": "198.51.100.8", "level": 12},
+            [{"provider": "otx", "is_malicious": True}, {"provider": "virustotal", "is_malicious": True}],
+            [{"id": "indicator--1"}],
+            [{"source_ip": "198.51.100.8", "action": "allow"}],
+        )
+        self.assertEqual(corroborated["status"], "suspected")
+        self.assertEqual(corroborated["confidence"], "corroborated_local_evidence")
+        self.assertTrue(corroborated["flow"]["allowed"])
+
     def test_cyfirma_feed_is_daily_idempotent_and_history_uses_no_provider(self):
         observed = datetime(2026, 9, 19, 9, tzinfo=timezone.utc).timestamp()
         rows = [{
@@ -77,6 +165,8 @@ class AutomationTests(unittest.TestCase):
         self.assertEqual(history['summary']['cve_linked'], 1)
         self.assertEqual(history['items'][0]['cves'], ['CVE-2026-12345'])
         self.assertEqual(history['cve_items'][0]['cves'], ['CVE-2026-12345'])
+        self.assertEqual(history['items'][0]['indicator_type'], 'indicator')
+        self.assertEqual(history['timeline'][0]['doc_count'], 1)
         self.assertEqual(history['provider_calls'], 0)
         self.assertNotIn('iocs', history['items'][0])
         with self.worker.db() as db:

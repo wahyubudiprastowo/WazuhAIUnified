@@ -20,7 +20,7 @@
   let actionBusy = false;
   let signature = '';
   let reportTab = 'summary';
-  for (const view of ['l1', 'l2']) {
+  for (const view of ['l1']) {
     const host = document.querySelector(`#${view}View`);
     if (!host || host.querySelector(`[data-automation-digest="${view}"]`)) continue;
     const section = document.createElement('section');
@@ -150,25 +150,6 @@
       `).join('')}
     `;
   }
-  function renderProviderDeck(report) {
-    const target = document.querySelector('#workbenchProviderDeck');
-    if (!target) return;
-    const rows = deck(report).provider_coverage || [];
-    target.innerHTML = rows.length ? rows.slice(0, 10).map(row => `
-      <article class="providerCoverageItem ${row.errors ? 'attention' : 'ready'}">
-        <div>
-          <strong>${esc(row.provider)}</strong>
-          <small>${esc(row.status || 'ready')}</small>
-        </div>
-        <dl>
-          <dt>${tr('Match', 'Matches')}</dt><dd>${fmt.format(Number(row.matched || 0))}</dd>
-          <dt>${tr('Konteks', 'Context')}</dt><dd>${fmt.format(Number(row.context || 0))}</dd>
-          <dt>${tr('Error', 'Errors')}</dt><dd>${fmt.format(Number(row.errors || 0))}</dd>
-        </dl>
-        <div class="providerChips">${(row.tags || row.cves || []).slice(0, 5).map(tag => `<span>${esc(tag)}</span>`).join('') || `<span>${tr('Ready for pivot', 'Ready for pivot')}</span>`}</div>
-      </article>
-    `).join('') : `<div class="emptyState">${tr('Provider coverage appears after the next automation cycle.', 'Provider coverage appears after the next automation cycle.')}</div>`;
-  }
   function renderVulnBrief(report) {
     const target = document.querySelector('#vulnAiBrief');
     if (!target) return;
@@ -201,7 +182,6 @@
   function renderDeckSurfaces(report) {
     window.SocAutomation = { latest, report, deck: report ? deck(report) : null };
     renderCommandDeck(report);
-    renderProviderDeck(report);
     renderVulnBrief(report);
     if (report) renderLaneDigests(report);
     document.dispatchEvent(new CustomEvent('soc:automation', {detail: window.SocAutomation}));
@@ -439,6 +419,6 @@
       window.SocFindings?.open('cve', cvePivot.dataset.automationCve);
     }
   });
-  setInterval(() => { if (!actionBusy && (latest?.running || ['settings','workbench','l1','l2'].includes(state.view))) refresh(); }, 10000);
+  setInterval(() => { if (!actionBusy && (latest?.running || ['settings','workbench'].includes(state.view))) refresh(); }, 10000);
   refresh();
 })();

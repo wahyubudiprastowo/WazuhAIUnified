@@ -1,20 +1,4 @@
-/* Neutral surfaces keep evidence readable; colors carry severity and state. */
-:root { --bg0: #101417; --bg1: #181e22; --glass: rgba(30,37,42,.88); --glass-strong: #252e34; --muted: #b4c0c8; }
-body { background: #151b1f; }
-body::before { display: none; }
-.sidebar { background: #12191d; box-shadow: none; }
-.app { min-width: 0; }
-.topbar { background: rgba(25,32,36,.96); }
-.glassPanel { border-radius: 8px; box-shadow: none; }
-.heroPanel, .lanePanel { box-shadow: none; }
-.heroPanel h2 { font-size: 24px; }
-.providerGrid { grid-template-columns: repeat(2,minmax(0,1fr)); }
-.iocGrid { grid-template-columns: 1fr; }
-.iocCard { display: grid; grid-template-columns: minmax(180px,1fr) minmax(240px,2fr); gap: 12px; padding: 16px; }
-.iocCard strong, .iocCard p, .iocCard span { overflow-wrap: anywhere; }
-.iocCard .providerChips { grid-column: 1/-1; }
-.resultContent { font-size: 14px; }
-.resultContent .resultMetric strong { font-size: 20px; overflow-wrap: anywhere; }
+/* Findings-only evidence styling. The application shell is owned by styles.css. */
 #findingsView { --finding-border: #d6dfe2; --finding-muted: #51636b; --finding-text: #162e35; color: var(--finding-text); }
 #findingsView.active { display: block; }
 .findingsSummary { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); background: #eef4f3; border-bottom: 1px solid var(--finding-border); }
@@ -129,8 +113,6 @@ body::before { display: none; }
 .findingWorkflowOutput { grid-column: 1/-1; min-width: 0; padding-top: 10px; border-top: 1px solid #30454d; }
 .findingWorkflowOutput .findingSection { padding: 10px 0; }
 .findingEmpty, .findingLoading { padding: 28px 16px; color: var(--finding-muted); font-size: 13px; }
-.findingSourceHealth { padding: 22px; background: #f1f5f5; border-top: 1px solid var(--finding-border); }
-.findingSourceHealth h2 { font-size: 15px; margin-bottom: 14px; }
 .findingAiOperations { padding: 20px 22px; background: #f7faf9; border-top: 1px solid var(--finding-border); }
 .findingAiOperations > div:first-child { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
 .findingAiOperations h2 { font-size: 15px; margin: 0; }
@@ -169,7 +151,7 @@ body::before { display: none; }
   #findingHealth { grid-template-columns: repeat(2,minmax(0,1fr)); }
   .findingAiOpsMetrics { grid-template-columns: repeat(2,minmax(0,1fr)); }
   .findingAiOpsTable { display: block; overflow-x: auto; }
-  .iocCard, .providerGrid { grid-template-columns: 1fr; }
+  .iocCard, #settingsView .providerGrid { grid-template-columns: 1fr; }
 }
 @media (max-width: 420px) {
   .findingFields { grid-template-columns: 1fr; }
@@ -217,7 +199,6 @@ body::before { display: none; }
 .findingNotice { background: #302c1d; border-left-color: #e4b84e; color: #f1dfae; }
 .findingPaths code, .findingDataTable th { background: #202e33; }
 .findingRaw pre { background: #0e171b; }
-.findingSourceHealth { background: #1b262b; }
 .findingAiOperations { background: #192328; }
 .findingReferences a, .findingRaw summary { color: #72dacc; }
 .findingAiEmpty { margin: 20px 0; padding: 24px; border: 1px dashed #496068; text-align: center; }

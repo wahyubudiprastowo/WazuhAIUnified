@@ -9,9 +9,22 @@
     "criticality": "high",
     "environment": "production",
     "network_zone": "application",
-    "vendor": "Example Vendor",
-    "version": "1.0.0",
-    "cpe": "cpe:2.3:a:example:product:1.0.0:*:*:*:*:*:*:*",
-    "purpose": "Replace this example with verified inventory data"
+    "application": "example-service",
+    "internet_exposed": false,
+    "components": [
+      {
+        "name": "example-product",
+        "package_names": ["example-product", "example-product-server"],
+        "vendor": "Example Vendor",
+        "version": "1.0.0",
+        "cpe": "cpe:2.3:a:example:product:1.0.0:*:*:*:*:*:*:*",
+        "patch_state": "pending",
+        "source": "asset-owner attestation",
+        "last_verified": "2026-01-01T00:00:00Z"
+      }
+    ],
+    "verified": false,
+    "template": true,
+    "purpose": "SAMPLE - replace this example with verified inventory data"
   }
 ]

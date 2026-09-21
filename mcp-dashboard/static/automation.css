@@ -10,7 +10,6 @@
 .aiDeckHero,
 .aiMetricCard,
 .aiFindingCard,
-.providerCoverageItem,
 .vulnBriefCard,
 .laneBriefGrid article {
   min-width: 0;
@@ -56,8 +55,7 @@
   cursor: pointer;
 }
 .aiFindingCard:hover,
-.vulnBriefCard:hover,
-.providerCoverageItem:hover {
+.vulnBriefCard:hover {
   border-color: rgba(88, 213, 246, .58);
   background: rgba(18, 38, 61, .9);
 }
@@ -69,32 +67,6 @@
 .vulnBriefCard.medium { border-top: 3px solid var(--blue, #4dabf7); }
 .aiFindingCard.low,
 .vulnBriefCard.low { border-top: 3px solid var(--green, #27c498); }
-.providerCoverageDeck {
-  display: grid;
-  grid-template-columns: repeat(5, minmax(180px, 1fr));
-  gap: 12px;
-  padding: 14px;
-}
-.providerCoverageItem {
-  display: grid;
-  gap: 10px;
-}
-.providerCoverageItem.ready { border-top: 3px solid var(--green, #27c498); }
-.providerCoverageItem.attention { border-top: 3px solid var(--amber, #ffc857); }
-.providerCoverageItem dl {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 6px;
-  margin: 0;
-}
-.providerCoverageItem dt {
-  color: var(--muted, #9fb0c6);
-  font-size: 11px;
-}
-.providerCoverageItem dd {
-  margin: 0;
-  font-weight: 900;
-}
 .vulnBriefGrid {
   display: grid;
   grid-template-columns: repeat(3, minmax(220px, 1fr));
@@ -296,7 +268,6 @@
 #automationPanel summary:focus-visible { outline: 2px solid var(--cyan, #25c4c8); outline-offset: 3px; }
 @media (max-width: 700px) {
   .aiDeckGrid,
-  .providerCoverageDeck,
   .vulnBriefGrid,
   .laneBriefGrid {
     grid-template-columns: minmax(0, 1fr);

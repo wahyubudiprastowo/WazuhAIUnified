@@ -1,5 +1,8 @@
 (() => {
-    const t = (id, en) => SocLocale.t(id, en);
+  // The established dashboard remains the default until the optional overlay is explicitly requested.
+  if (new URLSearchParams(window.location.search).get("enterprise") !== "1") return;
+
+  const t = (id, en) => SocLocale.t(id, en);
   const n = value => new Intl.NumberFormat(SocLocale.language === "id" ? "id-ID" : "en-US").format(value ?? 0);
   const e = esc;
   const s = {coverage: null, inventory: null, selected: null, severity: "Critical", search: "", offset: 0, seq: 0, charts: [], vulnChart: null, overview: null, intel: null};
@@ -7,10 +10,9 @@
   const command = document.createElement("div"); command.id = "enterpriseCommand"; q("#commandView").prepend(command);
   const inventory = document.createElement("div"); inventory.id = "enterpriseInventory"; q("#vulnView").prepend(inventory);
   const oldVuln = q("#vulnView > .gridTwo"); oldVuln.hidden = true;
-  for (const selector of [".heroGrid", ".insightStrip", ".kpiGrid", ".gridThree", ".timelinePanel", ".coveragePanel"]) {
+  for (const selector of [".heroGrid", ".insightStrip", ".kpiGrid", ".gridThree", ".timelinePanel", ".dataQualityPanel", ".aiDeckPanel"]) {
     q(`#commandView > ${selector}`)?.classList.add("legacyCommandHidden");
   }
-  q("#attackPath")?.closest("section").classList.add("legacyCommandHidden");
   const metric = (label, value, hint) => `<div class="entMetric"><span>${label}</span><strong>${value}</strong><small>${hint}</small></div>`;
   const panel = (title, content, note = "") => `<section class="entPanel"><header><h2>${title}</h2><small>${note}</small></header>${content}</section>`;
   function chart(id, type, labels, datasets, options = {}) {
@@ -29,8 +31,6 @@
     for (const b of c.severity || []) severity[b.key >= 15 ? 0 : b.key >= 12 ? 1 : b.key >= 7 ? 2 : 3] += b.doc_count;
     const sources = (c.sources || []).slice(0, 6), timeline = c.timeline || [];
     const urgent = (c.rules || []).filter(r => r.level >= 7).slice(0, 6);
-    const geoNote = q("#attackMap")?.closest("section")?.querySelector(".panelHead span");
-    if (geoNote) geoNote.textContent=t("Lokasi jaringan IP, bukan identitas pelaku", "IP network location, not actor identity");
     const analysisText = (analysis, field) => SocLocale.analysis ? SocLocale.analysis(analysis, field) : (analysis?.[field] || "");
     command.innerHTML = `<div class="entHeading"><div><span class="entEyebrow">${t("SITUASI OPERASIONAL", "OPERATIONAL SITUATION")}</span><h2>${t("Prioritas, bukti, dan cakupan", "Priorities, evidence and coverage")}</h2><p>${t("Keparahan rule bukan konfirmasi serangan berhasil.", "Rule severity does not confirm a successful attack.")}</p></div><span class="entTimestamp">${e(c.range)} · ${e(c.generated_at.slice(0,19))} UTC</span></div>
       <div class="entMetrics">${metric(t("Alert terindeks", "Indexed alerts"), n(c.total_events), "wazuh-alerts-*")}${metric(t("Keparahan tinggi / kritis", "High / critical events"), n(severity[0] + severity[1]), t("Seluruh rentang, bukan sampel", "Full window, not a sample"))}${metric(t("Aset aktif", "Active agents"), `${n(o.agents?.counts?.active)} / ${n(o.agents?.total)}`, t("Cakupan agent Wazuh", "Wazuh agent coverage"))}${metric(t("Temuan paket kritis", "Critical package findings"), n(o.vulnerabilities?.critical), t("Inventaris saat ini, bukan alert", "Current inventory, not alerts"))}</div>
@@ -40,7 +40,6 @@
     chart("entTrend", "line", timeline.map(b => b.key_as_string?.slice(5,16).replace("T"," ")), [{label: t("Alert", "Alerts"), data: timeline.map(b=>b.doc_count), borderColor: "#53ccb2", backgroundColor: "#53ccb21a", fill: true, tension: .2, pointRadius: 2}]);
     chart("entSeverity", "doughnut", [t("Kritis", "Critical"), t("Tinggi", "High"), t("Sedang", "Medium"), t("Rendah", "Low")], [{data: severity, backgroundColor: colors, borderWidth: 0}], {cutout: "70%"});
     chart("entSources", "bar", sources.map(b=>b.key.length > 18 ? b.key.slice(0,15)+"..." : b.key), [{label: t("Event", "Events"), data: sources.map(b=>b.doc_count), backgroundColor: "#70b9e3", borderRadius: 3}], {indexAxis: "y", plugins: {legend: {display:false}, tooltip: {callbacks: {title: items=>sources[items[0].dataIndex].key}}}, scales: {x: {beginAtZero: true, grid: {color: "#344047"}, ticks: {color: "#a6bcc7", maxTicksLimit: 3, callback: value=>new Intl.NumberFormat(SocLocale.language,{notation:"compact"}).format(value)}}, y: {grid: {display:false}, ticks: {color:"#a6bcc7", font:{size:11}}}}});
-    renderThreatTable("#overviewThreats", c.rules.slice(0, 10));
     renderIntel();
   }
   function renderIntel() {

@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import Mock
 
 from soc_workflows import (
-    APPROVAL_TOOLS,
+    APPROVAL_TOOLS, AUTOMATIC_TOOLS,
     BINDINGS,
     FINDING_TOOLS,
     MENU_TOOLS,
@@ -36,7 +36,11 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue(FINDING_TOOLS <= set(BINDINGS))
         self.assertTrue(all('findings' in policy({'name': name})['surfaces'] for name in FINDING_TOOLS))
         self.assertEqual(policy({'name': 'future_unknown_tool'})['mode'], 'approval')
-        self.assertFalse(any(policy({'name': name})['automatic'] for name in names))
+        self.assertTrue(AUTOMATIC_TOOLS <= set(BINDINGS))
+        self.assertTrue(all(policy({'name': name})['automatic'] for name in AUTOMATIC_TOOLS))
+        self.assertEqual(policy({'name': 'blueteam_attack_chain'})['execution_class'], 'guided')
+        self.assertEqual(policy({'name': 'otx_lookup'})['execution_class'], 'on_demand')
+        self.assertEqual(policy({'name': 'wazuh_block_ip'})['execution_class'], 'approval_required')
 
     def test_atomic_deduplication_and_persistent_cache(self):
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:

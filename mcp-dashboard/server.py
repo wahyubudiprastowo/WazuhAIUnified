@@ -31,6 +31,8 @@ from cve_exposure import (
 import soc_automation
 import soc_pipeline
 import soc_workflows
+from detection_taxonomy import consensus_confidence
+from telemetry_contract import summary as telemetry_contract_summary
 
 
 ROOT = Path(__file__).resolve().parent
@@ -79,6 +81,9 @@ _overview_cache_lock = threading.Lock()
 _overview_db_init_lock = threading.Lock()
 _overview_db_initialized = False
 _overview_refreshing: set[str] = set()
+# Keep a short, non-sensitive operational state for stale snapshots. Previously
+# a failed asynchronous refresh was invisible and looked like unchanged data.
+_overview_refresh_errors: dict[str, str] = {}
 _incident_cache_lock = threading.Lock()
 _incident_cache: dict[str, dict[str, Any]] = {}
 _incident_refreshing: set[str] = set()
@@ -94,6 +99,7 @@ OVERVIEW_CACHE_TTL_SECONDS = int(os.environ.get("SOC_OVERVIEW_CACHE_TTL_SECONDS"
 OVERVIEW_HISTORY_RETENTION_DAYS = max(1, int(os.environ.get("SOC_OVERVIEW_HISTORY_RETENTION_DAYS", "180") or "180"))
 PREWARM_ENABLED = os.environ.get("SOC_PREWARM_ENABLED", "true").lower() == "true"
 PREWARM_RANGES = [item.strip() for item in os.environ.get("SOC_PREWARM_RANGES", "24h,7d,30d").split(",") if item.strip()]
+PIPELINE_WORKER_ENABLED = os.environ.get("SOC_PIPELINE_WORKER_ENABLED", "true").lower() == "true"
 _source_cmdb = ROOT.parent / "infokom-analysis" / "resource" / "assets.json"
 SOC_CMDB_FILE = Path(os.environ.get(
     "SOC_CMDB_FILE",
@@ -134,7 +140,7 @@ CONFIG_SCHEMA: list[dict[str, Any]] = [
     {"key": "M365_CLIENT_ID", "label": "M365 Client ID", "group": "SOC Sources", "type": "text", "required": False, "restart": True},
     {"key": "M365_CLIENT_SECRET", "label": "M365 Client Secret", "group": "SOC Sources", "type": "secret", "required": False, "restart": True},
     {"key": "M365_CONTENT_TYPES", "label": "M365 Content Types", "group": "SOC Sources", "type": "text", "required": False, "restart": True},
-    {"key": "CROWDSEC_WATCHLIST_IPS", "label": "CrowdSec Watchlist IPs", "group": "SOC Sources", "type": "csv_ips", "required": False, "restart": False},
+    {"key": "CROWDSEC_WATCHLIST_IPS", "label": "Manual IP watchlist for CrowdSec enrichment", "group": "SOC Sources", "type": "csv_ips", "required": False, "restart": False},
     {"key": "WAZUH_INDEXER_URL", "label": "Wazuh Indexer URL", "group": "Wazuh Indexer", "type": "url", "required": True, "restart": False},
     {"key": "WAZUH_INDEXER_USER", "label": "Wazuh Indexer User", "group": "Wazuh Indexer", "type": "text", "required": True, "restart": False},
     {"key": "WAZUH_INDEXER_PASSWORD", "label": "Wazuh Indexer Password", "group": "Wazuh Indexer", "type": "secret", "required": True, "restart": False},
@@ -188,6 +194,30 @@ def _normalize_cmdb_asset(asset: Any) -> dict[str, Any] | None:
     return normalized
 
 
+def _cmdb_identity_index(assets: list[dict[str, Any]]) -> tuple[dict[str, list[dict[str, Any]]], int]:
+    index: dict[str, list[dict[str, Any]]] = {}
+    for asset in assets:
+        if not asset.get("authoritative", True):
+            continue
+        for identifier in _asset_identifiers(asset):
+            index.setdefault(identifier, []).append(asset)
+    return index, sum(len(matches) > 1 for matches in index.values())
+
+
+def _unique_cmdb_match(index: dict[str, list[dict[str, Any]]], identifiers: list[Any]
+                       ) -> tuple[dict[str, Any] | None, str]:
+    for raw in identifiers:
+        identifier = _asset_identifier(raw)
+        if not identifier:
+            continue
+        matches = index.get(identifier, [])
+        if len(matches) == 1:
+            return matches[0], "matched"
+        if len(matches) > 1:
+            return None, "ambiguous"
+    return None, "unmatched"
+
+
 def _load_cmdb_assets() -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Read a bounded local CMDB and retain the last valid snapshot on parse errors."""
     path = Path(SOC_CMDB_FILE)
@@ -207,9 +237,15 @@ def _load_cmdb_assets() -> tuple[list[dict[str, Any]], dict[str, Any]]:
         if (_cmdb_cache.get("path") == path_key and _cmdb_cache.get("mtime_ns") == stat.st_mtime_ns
                 and _cmdb_cache.get("size") == stat.st_size):
             assets = list(_cmdb_cache["assets"])
+            quality = {
+                "authoritative_assets": sum(bool(row.get("authoritative", True)) for row in assets),
+                "sample_assets": sum(row.get("quality_status") == "sample" for row in assets),
+                "unverified_assets": sum(row.get("quality_status") == "unverified" for row in assets),
+            }
             return assets, {
                 "configured": True, "available": True, "file": path.name, "assets": len(assets),
                 "cached": True, "loaded_at": _cmdb_cache.get("loaded_at"), "error": _cmdb_cache.get("error"),
+                **quality,
             }
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
@@ -223,9 +259,14 @@ def _load_cmdb_assets() -> tuple[list[dict[str, Any]], dict[str, Any]]:
                 "path": path_key, "mtime_ns": stat.st_mtime_ns, "size": stat.st_size,
                 "assets": assets, "loaded_at": loaded_at, "error": None,
             })
+            quality = {
+                "authoritative_assets": sum(bool(row.get("authoritative", True)) for row in assets),
+                "sample_assets": sum(row.get("quality_status") == "sample" for row in assets),
+                "unverified_assets": sum(row.get("quality_status") == "unverified" for row in assets),
+            }
             return list(assets), {
                 "configured": True, "available": True, "file": path.name, "assets": len(assets),
-                "cached": False, "loaded_at": loaded_at, "error": None,
+                "cached": False, "loaded_at": loaded_at, "error": None, **quality,
             }
         except (OSError, UnicodeError, ValueError, TypeError, json.JSONDecodeError) as exc:
             previous = list(_cmdb_cache["assets"]) if _cmdb_cache.get("path") == path_key else []
@@ -238,23 +279,21 @@ def _load_cmdb_assets() -> tuple[list[dict[str, Any]], dict[str, Any]]:
 
 def _asset_context(agent_items: list[dict[str, Any]], limit: int = 200) -> dict[str, Any]:
     cmdb_assets, status = _load_cmdb_assets()
-    cmdb_index: dict[str, dict[str, Any]] = {}
-    for asset in cmdb_assets:
-        for identifier in _asset_identifiers(asset):
-            cmdb_index.setdefault(identifier, asset)
+    cmdb_index, ambiguous_identifiers = _cmdb_identity_index(cmdb_assets)
 
     rows: list[dict[str, Any]] = []
     matched_cmdb: set[int] = set()
     matched_agents = 0
+    ambiguous_agent_matches = 0
     for agent in agent_items[:limit]:
         if not isinstance(agent, dict):
             continue
         labels = agent.get("labels") if isinstance(agent.get("labels"), dict) else {}
-        identifiers = _asset_identifiers({
-            "id": agent.get("id"), "name": agent.get("name"), "host": agent.get("hostname"),
-            "ip": agent.get("ip"), "aliases": [labels.get("hostname"), labels.get("fqdn")],
-        })
-        cmdb = next((cmdb_index[value] for value in identifiers if value in cmdb_index), None)
+        cmdb, match_status = _unique_cmdb_match(cmdb_index, [
+            agent.get("id"), agent.get("name"), agent.get("hostname"), agent.get("ip"),
+            labels.get("hostname"), labels.get("fqdn"),
+        ])
+        ambiguous_agent_matches += match_status == "ambiguous"
         if cmdb:
             matched_cmdb.add(id(cmdb))
             matched_agents += 1
@@ -262,9 +301,13 @@ def _asset_context(agent_items: list[dict[str, Any]], limit: int = 200) -> dict[
             "id": agent.get("id"), "name": agent.get("name") or (cmdb or {}).get("name"),
             "ip": agent.get("ip") or (cmdb or {}).get("ip"), "managed": True,
             "source": "Wazuh + CMDB" if cmdb else "Wazuh",
+            "cmdb_match_status": match_status,
         }
         for field in ASSET_CONTEXT_FIELDS:
-            row[field] = agent.get(field) or labels.get(field) or (cmdb or {}).get(field)
+            # agent.version is the Wazuh agent release, not the asset/component
+            # version. Only explicit labels or CMDB evidence may populate it.
+            agent_value = None if field == "version" else agent.get(field)
+            row[field] = agent_value or labels.get(field) or (cmdb or {}).get(field)
         row["purpose"] = (cmdb or {}).get("purpose")
         row["application"] = (cmdb or {}).get("application")
         row["internet_exposed"] = (cmdb or {}).get("internet_exposed")
@@ -276,7 +319,7 @@ def _asset_context(agent_items: list[dict[str, Any]], limit: int = 200) -> dict[
         rows.append(row)
 
     for asset in cmdb_assets:
-        if len(rows) >= limit or id(asset) in matched_cmdb:
+        if len(rows) >= limit or id(asset) in matched_cmdb or not asset.get("authoritative", True):
             continue
         rows.append({
             "id": asset.get("id") or asset.get("agent_id"),
@@ -301,6 +344,8 @@ def _asset_context(agent_items: list[dict[str, Any]], limit: int = 200) -> dict[
     status.update({
         "matched_agents": matched_agents,
         "unmatched_agents": max(0, len(agent_items) - matched_agents),
+        "ambiguous_agent_matches": ambiguous_agent_matches,
+        "ambiguous_identifiers": ambiguous_identifiers,
         "unmanaged_assets": sum(1 for row in rows if not row.get("managed")),
         "displayed_assets": len(rows),
     })
@@ -312,10 +357,7 @@ def _finding_asset_context(finding: dict[str, Any], limit: int = 12) -> list[dic
     assets, _ = _load_cmdb_assets()
     if not assets:
         return []
-    index: dict[str, dict[str, Any]] = {}
-    for asset in assets:
-        for identifier in _asset_identifiers(asset):
-            index.setdefault(identifier, asset)
+    index, _ = _cmdb_identity_index(assets)
     candidates: list[Any] = []
     for field in ("assets", "affected_assets"):
         values = finding.get(field) or []
@@ -333,7 +375,7 @@ def _finding_asset_context(finding: dict[str, Any], limit: int = 12) -> list[dic
     matches: list[dict[str, Any]] = []
     seen: set[int] = set()
     for candidate in candidates:
-        asset = index.get(_asset_identifier(candidate))
+        asset, _ = _unique_cmdb_match(index, [candidate])
         if not asset or id(asset) in seen:
             continue
         seen.add(id(asset))
@@ -1112,21 +1154,11 @@ def _enrich_tool(tool: dict[str, Any]) -> dict[str, Any]:
     enriched["required_fields"] = _schema_param_required(tool)
     enriched["schema_fields"] = _schema_fields(tool)
     enriched["workflow"] = soc_workflows.policy(tool)
-    dashboard_tools = {
-        "get_wazuh_alert_summary", "get_top_security_threats", "get_wazuh_agents",
-        "advanced_three_sum_correlation", "get_wazuh_vulnerability_summary",
-        "get_wazuh_critical_vulnerabilities", "get_wazuh_statistics",
-        "blueteam_ai_bot_recon", "wazuh_alert_timeline", "blueteam_wazuh_geo_heatmap",
-        "blueteam_wazuh_syscheck", "blueteam_failed_logins", "blueteam_read_web_log",
-        "blueteam_case_list",
-    }
     provider_terms = ("crowdsec", "greynoise", "threatfox", "otx", "virustotal", "urlhaus", "abuseipdb", "cyfirma", "nvd", "epss", "kev")
-    enriched["operational_mode"] = "dashboard" if name in dashboard_tools else "menu_workflow"
+    enriched["operational_mode"] = enriched["workflow"]["execution_class"]
     enriched["readiness"] = "catalog_ready"
     enriched["readiness_note"] = (
-        "Discovered and used automatically by a cached dashboard workflow."
-        if name in dashboard_tools else
-        f"Mapped to {enriched['workflow']['menu']}; execution is not triggered during page load."
+        enriched["workflow"]["reason"]
     )
     if any(term in name.lower() for term in provider_terms):
         enriched["dependency"] = "external_provider"
@@ -1146,9 +1178,10 @@ def _tools_response() -> dict[str, Any]:
         lanes[tool["lane"]] = lanes.get(tool["lane"], 0) + 1
     summary = {
         "discovered": len(tools),
-        "dashboard": sum(1 for tool in tools if tool["operational_mode"] == "dashboard"),
-        "workflow": sum(1 for tool in tools if tool["operational_mode"] == "menu_workflow"),
+        "automatic": sum(1 for tool in tools if tool["operational_mode"] == "automatic"),
+        "guided": sum(1 for tool in tools if tool["operational_mode"] == "guided"),
         "on_demand": sum(1 for tool in tools if tool["operational_mode"] == "on_demand"),
+        "approval_required": sum(1 for tool in tools if tool["operational_mode"] == "approval_required"),
         "gensecai": sum(1 for tool in tools if tool.get("source") == "gensecai"),
         "infokom": sum(1 for tool in tools if tool.get("source") == "infokom"),
         "catalog_errors": len(catalog["errors"]),
@@ -1216,21 +1249,38 @@ def _normalized_call(source: str, name: str, arguments: dict[str, Any]) -> dict[
 
 
 def _incident_cases_sync(payload: dict[str, Any] | None = None) -> dict[str, Any]:
-    result = _normalized_call("infokom", "blueteam_case_list", {"response_format": "json"})
-    data = result.get("json")
-    if not result.get("ok") or not isinstance(data, list):
-        return {"ok": False, "cases": [], "error": result.get("text") or "Case store unavailable"}
     payload = payload or {}
-    start_ts = end_ts = None
+    limit = max(1, min(200, int(payload.get("limit", 100) or 100)))
+    offset = max(0, int(payload.get("offset", 0) or 0))
+    start_iso = end_iso = None
     if payload.get("range") or payload.get("start") or payload.get("end"):
         try:
-            start, end = soc_pipeline.bounds(_history_payload(payload))
-            start_ts, end_ts = datetime.fromisoformat(start).timestamp(), datetime.fromisoformat(end).timestamp()
+            start_iso, end_iso = soc_pipeline.bounds(_history_payload(payload))
         except (TypeError, ValueError):
-            start_ts = end_ts = None
+            start_iso = end_iso = None
+    arguments = {"response_format": "json", "paginated": True, "limit": limit, "offset": offset}
+    if start_iso and end_iso:
+        arguments.update(start=start_iso, end=end_iso)
+    result = _normalized_call("infokom", "blueteam_case_list", arguments)
+    date_filter_at_source = result.get("ok")
+    if not result.get("ok") and start_iso:
+        # Rolling deployments may still expose the older list schema.
+        result = _normalized_call("infokom", "blueteam_case_list", {
+            "response_format": "json", "paginated": True, "limit": limit, "offset": offset,
+        })
+        date_filter_at_source = False
+    data = result.get("json")
+    # Older MCP instances return the legacy JSON array. Accept it during a
+    # rolling deploy while preserving the newer durable paging contract.
+    page = data if isinstance(data, dict) else {"items": data, "total": len(data or []), "limit": limit, "offset": offset}
+    cases = page.get("items") if isinstance(page, dict) else None
+    if not result.get("ok") or not isinstance(cases, list):
+        return {"ok": False, "cases": [], "error": result.get("text") or "Case store unavailable"}
+    start_ts = datetime.fromisoformat(start_iso).timestamp() if start_iso else None
+    end_ts = datetime.fromisoformat(end_iso).timestamp() if end_iso else None
     filtered = []
     all_time = 0
-    for case in data[:200]:
+    for case in cases:
         if not isinstance(case, dict):
             continue
         raw_time = next((case.get(key) for key in ("created_at", "created", "opened_at", "updated_at", "updated") if case.get(key)), None)
@@ -1247,10 +1297,13 @@ def _incident_cases_sync(payload: dict[str, Any] | None = None) -> dict[str, Any
         row["all_time"] = case_ts is None
         if row["all_time"]:
             all_time += 1
-        if start_ts is not None and end_ts is not None and case_ts is not None and not (start_ts <= case_ts < end_ts):
+        if not date_filter_at_source and start_ts is not None and end_ts is not None and case_ts is not None and not (start_ts <= case_ts < end_ts):
             continue
         filtered.append(row)
-    return {"ok": True, "cases": filtered[:100], "all_time_count": all_time,
+    return {"ok": True, "cases": filtered, "all_time_count": all_time,
+            "pagination": {"offset": int(page.get("offset") or offset), "limit": int(page.get("limit") or limit),
+                           "total": int(page.get("total") or len(cases)),
+                           "next_offset": offset + limit if offset + limit < int(page.get("total") or len(cases)) else None},
             "window": {"start": start_ts, "end": end_ts} if start_ts is not None else {"scope": "all-time"},
             "duration_ms": result.get("duration_ms", 0)}
 
@@ -1259,7 +1312,7 @@ def _incident_cases(payload: dict[str, Any] | None = None) -> dict[str, Any]:
     """Serve incident scope quickly; refresh the remote case store outside the request path."""
     if payload is None:
         return _incident_cases_sync()
-    key = hashlib.sha256(json.dumps({k: payload.get(k) for k in ("range", "start", "end")},
+    key = hashlib.sha256(json.dumps({k: payload.get(k) for k in ("range", "start", "end", "limit", "offset")},
                                     sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     now = time.time()
     with _incident_cache_lock:
@@ -1296,6 +1349,30 @@ def _incident_cases(payload: dict[str, Any] | None = None) -> dict[str, Any]:
     return {"ok": False, "cases": [], "status": "materializing", "error": "Persistent case detail is still loading; retry shortly."}
 
 
+def _case_cve_links(cases: list[dict[str, Any]]) -> dict[str, list[str]]:
+    """Index explicit case entities by CVE; never mine free text for a match."""
+    links: dict[str, list[str]] = {}
+    for case in cases[:200]:
+        if not isinstance(case, dict):
+            continue
+        case_id = str(case.get("case_id") or "").strip()
+        if not case_id:
+            continue
+        values: list[Any] = list(case.get("iocs") or [])
+        for entity in case.get("entities") or []:
+            if not isinstance(entity, dict) or str(entity.get("type") or "").lower() not in {
+                    "cve", "vulnerability", "vulnerability_id", "ioc"}:
+                continue
+            values.append(entity.get("value"))
+        for value in values:
+            cve = str(value or "").strip().upper()
+            if not re.fullmatch(r"CVE-\d{4}-\d{4,}", cve):
+                continue
+            if case_id not in links.setdefault(cve, []):
+                links[cve].append(case_id)
+    return links
+
+
 def _incident_create(payload: dict[str, Any]) -> dict[str, Any]:
     title = str(payload.get("title") or "SOC investigation").strip()
     notes = str(payload.get("notes") or "").strip()
@@ -1314,12 +1391,112 @@ def _incident_create(payload: dict[str, Any]) -> dict[str, Any]:
     lifecycle["status"] = lifecycle["status"] or "open"
     if any(len(lifecycle[key]) > limit for key, limit in lifecycle_limits.items()):
         raise ValueError("Invalid case lifecycle field")
+    if lifecycle["status"] not in {"open", "triage", "investigating", "containment", "resolved", "closed"}:
+        raise ValueError("Invalid case status")
+    initial_evidence = []
+    for item in payload.get("initial_evidence") or []:
+        if not isinstance(item, dict) or len(initial_evidence) >= 20:
+            continue
+        evidence = {
+            "evidence_type": str(item.get("evidence_type") or "event")[:64],
+            "title": str(item.get("title") or "Initial case evidence")[:200],
+            "summary": str(item.get("summary") or "")[:4000],
+            "source": str(item.get("source") or "")[:120],
+            "source_ref": str(item.get("source_ref") or "")[:500],
+            "observed_at": str(item.get("observed_at") or "")[:64] or None,
+            "payload": item.get("payload") if isinstance(item.get("payload"), dict) else {},
+            "provenance": item.get("provenance") if isinstance(item.get("provenance"), dict) else {},
+            "idempotency_key": str(item.get("idempotency_key") or "")[:200] or None,
+        }
+        if not evidence["source"] or not evidence["source_ref"]:
+            raise ValueError("Initial evidence requires source and source_ref")
+        initial_evidence.append(evidence)
+    if len(json.dumps(initial_evidence, ensure_ascii=False, default=str)) > 65536:
+        raise ValueError("Initial evidence exceeds 64 KiB")
     result = _normalized_call("infokom", "blueteam_case_create", {
-        "title": title, "srcips": srcips[:50], "notes": notes, **lifecycle,
+        "title": title, "srcips": srcips[:50], "notes": notes,
+        "actor": DASHBOARD_ACCESS_USERNAME or "dashboard", "initial_evidence": initial_evidence,
+        **lifecycle,
     })
     data = result.get("json")
     if not result.get("ok") or not isinstance(data, dict) or data.get("error"):
         return {"ok": False, "error": data.get("error") if isinstance(data, dict) else result.get("text")}
+    with _incident_cache_lock:
+        _incident_cache.clear()
+    return {"ok": True, "case": data, "duration_ms": result.get("duration_ms", 0)}
+
+
+def _incident_get(payload: dict[str, Any]) -> dict[str, Any]:
+    case_id = str(payload.get("case_id") or "").strip()
+    if not re.fullmatch(r"case_[A-Za-z0-9_-]{4,58}", case_id):
+        raise ValueError("Invalid case ID")
+    result = _normalized_call("infokom", "blueteam_case_get", {
+        "case_id": case_id, "response_format": "json",
+    })
+    data = result.get("json")
+    if not result.get("ok") or not isinstance(data, dict) or data.get("error"):
+        return {"ok": False, "error": data.get("error") if isinstance(data, dict) else result.get("text"),
+                "status_code": 404 if isinstance(data, dict) and "not found" in str(data.get("error", "")).lower() else 503}
+    return {"ok": True, "case": data, "duration_ms": result.get("duration_ms", 0),
+            "source": "transactional_case_store"}
+
+
+_INCIDENT_ACTIONS: dict[str, tuple[str, tuple[str, ...]]] = {
+    "assign": ("blueteam_case_assign", ("owner", "sla_due")),
+    "status": ("blueteam_case_update_status", ("status", "reason")),
+    "note": ("blueteam_case_add_note", ("body",)),
+    "evidence": ("blueteam_case_add_evidence", (
+        "evidence_type", "title", "summary", "source", "source_ref", "observed_at",
+        "payload", "provenance", "entities", "idempotency_key",
+    )),
+    "containment": ("blueteam_case_record_containment", ("action", "result")),
+    "resolve": ("blueteam_case_resolve", ("resolution",)),
+    "reopen": ("blueteam_case_reopen", ("reason",)),
+    "close": ("blueteam_case_close", ("closure_reason",)),
+}
+
+
+def _incident_mutate(payload: dict[str, Any]) -> dict[str, Any]:
+    action = str(payload.get("action") or "").strip().lower()
+    if action not in _INCIDENT_ACTIONS:
+        raise ValueError("Unsupported incident action")
+    case_id = str(payload.get("case_id") or "").strip()
+    if not re.fullmatch(r"case_[A-Za-z0-9_-]{4,58}", case_id):
+        raise ValueError("Invalid case ID")
+    try:
+        expected_revision = int(payload.get("expected_revision"))
+    except (TypeError, ValueError):
+        raise ValueError("expected_revision is required") from None
+    if expected_revision < 1:
+        raise ValueError("expected_revision must be positive")
+    tool_name, allowed = _INCIDENT_ACTIONS[action]
+    arguments: dict[str, Any] = {
+        "case_id": case_id,
+        "expected_revision": expected_revision,
+        "actor": DASHBOARD_ACCESS_USERNAME or "dashboard",
+    }
+    for key in allowed:
+        if key in payload and payload[key] is not None:
+            arguments[key] = payload[key]
+    if action == "evidence":
+        arguments.setdefault("summary", "")
+        arguments.setdefault("payload", {})
+        arguments.setdefault("provenance", {})
+        arguments.setdefault("entities", [])
+        if len(json.dumps(arguments, ensure_ascii=False, default=str)) > 65536:
+            raise ValueError("Evidence request exceeds 64 KiB")
+    result = _normalized_call("infokom", tool_name, arguments)
+    data = result.get("json")
+    if not isinstance(data, dict):
+        return {"ok": False, "error": result.get("text") or "Case operation returned no data", "status_code": 503}
+    if data.get("error"):
+        error = str(data.get("error"))
+        status_code = 409 if error == "revision_conflict" else (404 if "not found" in error.lower() else 400)
+        return {"ok": False, **data, "status_code": status_code}
+    if not result.get("ok"):
+        return {"ok": False, "error": result.get("text") or "Case operation failed", "status_code": 503}
+    with _incident_cache_lock:
+        _incident_cache.clear()
     return {"ok": True, "case": data, "duration_ms": result.get("duration_ms", 0)}
 
 
@@ -1352,6 +1529,19 @@ def _sync_finding_case(finding: dict[str, Any], disposition: str, note: str = ""
             "title": title,
             "srcips": [srcip],
             "notes": f"Created from Security Findings analyst disposition for {finding.get('id') or srcip}.",
+            "initial_evidence": [{
+                "evidence_type": "analyst",
+                "title": str(finding.get("title") or "Security finding")[:200],
+                "summary": str(finding.get("summary") or finding.get("description") or "Analyst disposition source")[:4000],
+                "source": "security_findings",
+                "source_ref": str(finding.get("id") or f"ip:{srcip}")[:500],
+                "observed_at": finding.get("timestamp") or None,
+                "payload": {key: finding.get(key) for key in (
+                    "category", "severity", "rule_id", "ip", "destination_ip", "destination_port"
+                ) if finding.get(key) is not None},
+                "provenance": {"capture_mode": "analyst_disposition"},
+                "idempotency_key": f"finding:{finding.get('id') or srcip}",
+            }],
         })
         if not created.get("ok"):
             return created
@@ -1369,11 +1559,48 @@ def _sync_finding_case(finding: dict[str, Any], disposition: str, note: str = ""
                 verdict_data.get("status"), verdict_data.get("severity"), verdict_data.get("confidence")
             ) if value)
         )
+    expected_revision = int(case.get("revision") or 1)
+    ai_summary = str(advisory.get("summary") or "").strip()
+    ai_contract = advisory.get("contract") if isinstance(advisory.get("contract"), dict) else {}
+    if ai_summary and ai_contract.get("id") == "senior-soc-ai" and ai_contract.get("version"):
+        report_fields = (
+            "contract", "summary", "verdict", "source_facts", "inference", "gaps", "actions",
+            "action_plan", "network_flow", "identity_activity", "data_impact", "cves",
+            "confidence_drivers", "quality_checks",
+        )
+        report = {key: advisory[key] for key in report_fields if key in advisory}
+        serialized_report = json.dumps(report, ensure_ascii=False, default=str)
+        if len(serialized_report.encode("utf-8")) > 28000:
+            return {"ok": False, "case_id": case_id, "error": "AI advisory exceeds the case evidence size limit"}
+        finding_id = str(finding.get("id") or f"ip:{srcip}")[:500]
+        digest = hashlib.sha256(serialized_report.encode("utf-8")).hexdigest()[:24]
+        evidence_result = _incident_mutate({
+            "action": "evidence", "case_id": case_id, "expected_revision": expected_revision,
+            "evidence_type": "report", "title": "Senior SOC AI advisory",
+            "summary": ai_summary[:4000], "source": "senior_soc_ai", "source_ref": finding_id,
+            "observed_at": finding.get("timestamp"),
+            "payload": {"advisory": report, "advisory_only": True,
+                        "finding_id": finding_id, "source_evidence_ref": finding_id},
+            "provenance": {"contract": report.get("contract"), "model": advisory.get("model"),
+                           "use": "analyst_advisory_not_primary_evidence"},
+            "entities": [], "idempotency_key": f"finding-ai:{finding_id}:{digest}",
+        })
+        if not evidence_result.get("ok"):
+            return {"ok": False, "case_id": case_id,
+                    "error": evidence_result.get("error") or "AI advisory evidence could not be persisted",
+                    "status_code": evidence_result.get("status_code", 503)}
+        updated_case = evidence_result.get("case") or {}
+        try:
+            expected_revision = int(updated_case["revision"])
+        except (KeyError, TypeError, ValueError):
+            return {"ok": False, "case_id": case_id,
+                    "error": "Case evidence was stored but returned no revision; analyst verdict was not written"}
     result = _normalized_call("infokom", "blueteam_mark_investigated", {
         "srcip": srcip,
         "verdict": verdict,
         "notes": "; ".join(value for value in details if value)[:1024],
         "case_id": case_id,
+        "expected_revision": expected_revision,
     })
     data = result.get("json")
     if not result.get("ok") or (isinstance(data, dict) and data.get("error")):
@@ -1821,7 +2048,7 @@ def _overview_cache_ttl(window: dict[str, Any]) -> int:
 
 def _overview_cache_key(window: dict[str, Any]) -> str:
     payload = json.dumps({
-        "schema": 2,
+        "schema": 4,
         "requested": window.get("requested"),
         "bounds": window.get("bounds"),
         "tool_range": window.get("tool_range"),
@@ -1940,9 +2167,23 @@ def _overview_cache_init() -> None:
                     case_id TEXT,
                     risk_score REAL,
                     priority TEXT,
+                    owner TEXT,
+                    criticality TEXT,
+                    environment TEXT,
+                    network_zone TEXT,
+                    asset_match TEXT,
+                    component_match TEXT,
+                    patch_evidence TEXT,
                     PRIMARY KEY(snapshot_key, path_key)
                 )
             """)
+            existing_cve_columns = {row[1] for row in db.execute("PRAGMA table_info(cve_exposure_summary)")}
+            for column in (
+                "owner TEXT", "criticality TEXT", "environment TEXT", "network_zone TEXT",
+                "asset_match TEXT", "component_match TEXT", "patch_evidence TEXT",
+            ):
+                if column.split()[0] not in existing_cve_columns:
+                    db.execute(f"ALTER TABLE cve_exposure_summary ADD COLUMN {column}")
             db.execute("CREATE INDEX IF NOT EXISTS idx_cve_exposure_snapshot ON cve_exposure_summary(snapshot_key)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_cve_exposure_time ON cve_exposure_summary(observed_at)")
             db.execute("""
@@ -2016,7 +2257,7 @@ def _provider_health_rows() -> dict[str, dict[str, Any]]:
 
 def _materialize_cve_exposure(graph: dict[str, Any], request: dict[str, Any]) -> dict[str, Any]:
     """Persist bounded CVE exposure paths so historical views never need a provider call."""
-    request_key = json.dumps({key: request.get(key) for key in ("severity", "search", "sort", "limit", "historical", "start", "end")},
+    request_key = json.dumps({key: request.get(key) for key in ("schema", "severity", "search", "sort", "limit", "historical", "start", "end")},
                              sort_keys=True, separators=(",", ":"))
     snapshot_key = hashlib.sha256(request_key.encode("utf-8")).hexdigest()
     observed_at = time.time()
@@ -2038,14 +2279,16 @@ def _materialize_cve_exposure(graph: dict[str, Any], request: dict[str, Any]) ->
                      None if path.get("kev") is None else int(bool(path.get("kev"))),
                      None if path.get("poc") is None else int(bool(path.get("poc"))),
                      None if path.get("internet_exposed") is None else int(bool(path.get("internet_exposed"))),
-                     path.get("patch_state"), path.get("case_id"), numeric(path.get("risk_score")), path.get("priority")))
+                     path.get("patch_state"), path.get("case_id"), numeric(path.get("risk_score")), path.get("priority"),
+                     path.get("owner"), path.get("criticality"), path.get("environment"), path.get("network_zone"),
+                     path.get("asset_match"), path.get("component_match"), path.get("patch_evidence")))
     try:
         _overview_cache_init()
         with _sqlite_db(OVERVIEW_CACHE_DB) as db:
             db.execute("DELETE FROM cve_exposure_summary WHERE snapshot_key=?", (snapshot_key,))
             db.executemany("""INSERT OR REPLACE INTO cve_exposure_summary
-                (snapshot_key,path_key,observed_at,requested_range,cve,asset,agent_id,component,version,cpe,cpe_status,epss,kev,poc,internet_exposure,patch_state,case_id,risk_score,priority)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", rows)
+                (snapshot_key,path_key,observed_at,requested_range,cve,asset,agent_id,component,version,cpe,cpe_status,epss,kev,poc,internet_exposure,patch_state,case_id,risk_score,priority,owner,criticality,environment,network_zone,asset_match,component_match,patch_evidence)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", rows)
             db.execute("DELETE FROM cve_exposure_summary WHERE observed_at < ?",
                        (time.time() - OVERVIEW_HISTORY_RETENTION_DAYS * 86400,))
             counts = db.execute("""SELECT COUNT(*),COUNT(DISTINCT cve),
@@ -2456,13 +2699,15 @@ def _cache_stats() -> dict[str, Any]:
 def _automation_db_stats() -> dict[str, Any]:
     stats = {"reports": 0, "report_summaries": 0, "ai_runs": 0, "finding_ai": 0,
              "ioc_queue": 0, "scan_batches": 0, "rollup_windows": 0,
-             "cyfirma_observations": 0, "cyfirma_feed_runs": 0, "db_bytes": 0}
+             "cyfirma_observations": 0, "cyfirma_feed_runs": 0, "cyfirma_feed_cursor": 0,
+             "cyfirma_connector_cursor": 0, "db_bytes": 0}
     try:
         if AUTOMATION_DB.exists():
             stats["db_bytes"] = AUTOMATION_DB.stat().st_size
         with _sqlite_db(AUTOMATION_DB) as db:
             for table in ("reports", "report_summaries", "ai_runs", "finding_ai", "ioc_queue",
-                          "scan_batches", "rollup_windows", "cyfirma_observations", "cyfirma_feed_runs"):
+                          "scan_batches", "rollup_windows", "cyfirma_observations", "cyfirma_feed_runs",
+                          "cyfirma_feed_cursor", "cyfirma_connector_cursor"):
                 try:
                     stats[table] = int(db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] or 0)
                 except sqlite3.OperationalError:
@@ -2515,8 +2760,14 @@ def _overview_refresh_worker(cache_key: str, window: dict[str, Any], payload: An
         try:
             data = _overview(payload)
             _overview_cache_write(cache_key, window, data, ttl)
+            with _overview_cache_lock:
+                _overview_refresh_errors.pop(cache_key, None)
         except Exception:
-            pass
+            # Do not expose provider/indexer exception text here: a stale
+            # snapshot remains valid, while the UI must still explain why it
+            # has not advanced. Detailed diagnostics stay in server logs.
+            with _overview_cache_lock:
+                _overview_refresh_errors[cache_key] = 'Background refresh failed; retaining the last valid snapshot.'
     finally:
         with _overview_cache_lock:
             _overview_refreshing.discard(cache_key)
@@ -2581,6 +2832,16 @@ def _materialized_overview(window: dict[str, Any], payload: Any) -> dict[str, An
     asset_rows = dimensions.get("asset") or history.get("affected_assets") or []
     decoder_rows = dimensions.get("decoder") or []
     mitre_rows = dimensions.get("mitre") or []
+    forti_security_rows = dimensions.get("forti_security") or []
+    try:
+        external_intelligence = automation.external_intelligence_status()
+    except Exception:
+        external_intelligence = {}
+    telemetry_contract = telemetry_contract_summary(
+        dimensions, 0,
+        external_intelligence.get("defender_xdr") if isinstance(external_intelligence, dict) else {},
+        materialization_complete=rollup_complete,
+    )
     return {
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "requested_range": window.get("requested"),
@@ -2612,6 +2873,7 @@ def _materialized_overview(window: dict[str, Any], payload: Any) -> dict[str, An
         "timeline": {"ok": bool(timeline_source), "bucket_interval": "materialized", "total_alerts": indexed,
                      "buckets": _timeline_buckets({"buckets": timeline_source})},
         "cloud_m365": {"ok": True, "total": 0, "workloads": [], "operations": [], "client_ips": [], "events": []},
+        "telemetry_contract": telemetry_contract,
         "detection_layers": [],
         "operational_evidence": {
             "data_quality": {
@@ -2629,7 +2891,13 @@ def _materialized_overview(window: dict[str, Any], payload: Any) -> dict[str, An
                 "note": ("Rollup is complete; decoder coverage requires an exact alert-window aggregation."
                          if rollup_complete else "Historical rollup is partial; missing buckets are being backfilled in the background."),
             },
-            "network": {"events": [], "observed": 0}, "identity": {"events": [], "observed": 0},
+            "network": {
+                "events": [],
+                "observed": sum(int(row.get("count") or 0) for row in forti_security_rows),
+                "profiles": [{"name": row.get("label") or row.get("value"), "count": row.get("count"),
+                              "max_level": row.get("max_level"), "historical": True}
+                             for row in forti_security_rows],
+            }, "identity": {"events": [], "observed": 0},
             "mitre": {"techniques": [{"technique": row.get("value"), "count": row.get("count")}
                                       for row in mitre_rows], "timeline": [], "observed": len(mitre_rows)},
             "decoders": {"items": [{"name": row.get("value"), "count": row.get("count"),
@@ -2730,14 +2998,17 @@ def _overview_cached(payload: Any = "24h") -> dict[str, Any]:
     ttl = _overview_cache_ttl(window)
     cached = _overview_cache_read(cache_key)
     now = time.time()
+    with _overview_cache_lock:
+        refresh_error = _overview_refresh_errors.get(cache_key)
     if cached and cached["expires_at"] > now and not force_refresh:
         data = dict(cached["data"])
         _ensure_historical_detail(data, window)
         data["cache"] = {
             **(data.get("cache") or {}),
-            "status": "hit",
+            "status": "hit" if not refresh_error else "stale-error",
             "age_seconds": int(now - cached["created_at"]),
             "ttl_seconds": ttl,
+            **({"refresh_error": refresh_error} if refresh_error else {}),
         }
         return data
     if cached and not force_refresh:
@@ -2745,9 +3016,10 @@ def _overview_cached(payload: Any = "24h") -> dict[str, Any]:
         _ensure_historical_detail(data, window)
         data["cache"] = {
             **(data.get("cache") or {}),
-            "status": "stale-refreshing",
+            "status": "stale-error" if refresh_error else "stale-refreshing",
             "age_seconds": int(now - cached["created_at"]),
             "ttl_seconds": ttl,
+            **({"refresh_error": refresh_error} if refresh_error else {}),
         }
         _overview_refresh_async(cache_key, window, payload, ttl)
         return data
@@ -2941,7 +3213,7 @@ def _local_alert_window(window: dict[str, Any]) -> dict[str, Any]:
                     "sample": {
                         "top_hits": {
                             "size": 1,
-                            "_source": ["rule", "agent", "data.srcip", "data.office365.ClientIP", "GeoLocation", "location"],
+                            "_source": ["rule", "agent", "decoder", "data.srcip", "data.office365.ClientIP", "GeoLocation", "location"],
                         }
                     }
                 },
@@ -3018,6 +3290,7 @@ def _local_alert_window(window: dict[str, Any]) -> dict[str, Any]:
             "agent": (src.get("agent") or {}).get("name"),
             "threat_score": min(100, int(rule.get("level", 0) or 0) * 4 + min(40, int(row.get("doc_count", 0) or 0) // 10)),
         }
+        threat["detection"] = consensus_confidence(src)
         threat["analysis"] = explain_rule(threat)
         threats.append(threat)
     source_ips = [
@@ -3041,6 +3314,7 @@ def _local_alert_window(window: dict[str, Any]) -> dict[str, Any]:
             "identity": office365.get("UserId"),
             "agent": (source.get("agent") or {}).get("name"),
             "decoder": (source.get("decoder") or {}).get("name"),
+            "detection": consensus_confidence(source),
             "assignment": "unassigned", "status": "new",
             "sla_minutes": 15 if level >= 15 else 30 if level >= 12 else 120,
         })
@@ -3174,6 +3448,7 @@ def _detection_layers(
     web_count: int,
     vuln_data: dict[str, Any],
     cloud_data: dict[str, Any],
+    telemetry_contract: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     total_alerts = int(alert_data.get("total_alerts", 0) or 0)
     firewall_count = 0
@@ -3195,6 +3470,52 @@ def _detection_layers(
         if any(word in haystack for word in ("office365", "office 365", "microsoft 365", "o365", "azure", "entra", "graph")):
             m365_count += count
     web_recon = sum(int(row.get("alerts", 0) or 0) for row in ai_data.get("sources", [])[:10]) if isinstance(ai_data, dict) else 0
+    source_profiles = {
+        str(row.get("key")): row for row in ((telemetry_contract or {}).get("sources") or [])
+        if isinstance(row, dict)
+    }
+
+    def telemetry_count(*keys: str) -> int:
+        return sum(int((source_profiles.get(key) or {}).get("observed_events") or 0) for key in keys)
+
+    def state(count: int) -> str:
+        if not count:
+            return "not_observed"
+        # Count-only panels have no minimum-field contract and must not imply
+        # that the source is ready for field-level detection.
+        return "observed_incomplete"
+
+    def unmeasured_status_reason(count: int) -> str:
+        return ("No source event was observed."
+                if not count else "Events are counted, but minimum field coverage has not been measured.")
+
+    def source_state(*keys: str) -> str:
+        observed = [source_profiles[key] for key in keys
+                    if int((source_profiles.get(key) or {}).get("observed_events") or 0) > 0]
+        if not observed:
+            return "not_observed"
+        statuses = {str(row.get("status") or "observed_incomplete") for row in observed}
+        for candidate in ("degraded", "stale", "observed_incomplete", "ready"):
+            if candidate in statuses:
+                return candidate
+        return "observed_incomplete"
+
+    def source_detail(*keys: str) -> dict[str, Any]:
+        observed = [source_profiles[key] for key in keys
+                    if int((source_profiles.get(key) or {}).get("observed_events") or 0) > 0]
+        return {
+            "source_statuses": {str(row.get("key")): str(row.get("status") or "observed_incomplete") for row in observed},
+            "available_fields": sorted({str(field) for row in observed for field in (row.get("available_fields") or [])}),
+            "missing_fields": sorted({str(field) for row in observed for field in (row.get("missing_fields") or [])}),
+            "undercovered_fields": sorted({str(field) for row in observed for field in (row.get("undercovered_fields") or [])}),
+            "status_reason": "; ".join(str(row.get("status_reason")) for row in observed if row.get("status_reason"))
+                             or "No decoded source telemetry was observed in the selected window.",
+        }
+
+    network_observed = telemetry_count("fortigate", "ids_ndr")
+    web_observed = telemetry_count("fortiweb", "waf_web")
+    container_observed = telemetry_count("container_runtime")
+    cloud_observed = telemetry_count("m365_audit", "defender_xdr")
     layers = [
         {
             "key": "fim",
@@ -3202,7 +3523,8 @@ def _detection_layers(
             "count": int(fim.get("total", 0) or 0),
             "signal": "File and registry change monitoring",
             "tool": "blueteam_wazuh_syscheck",
-            "status": "active" if fim.get("total") else "ready",
+            "status": state(int(fim.get("total", 0) or 0)),
+            "status_reason": unmeasured_status_reason(int(fim.get("total", 0) or 0)),
         },
         {
             "key": "auth",
@@ -3210,39 +3532,44 @@ def _detection_layers(
             "count": auth_count,
             "signal": "SSH, sudo, PAM, failed login traces",
             "tool": "blueteam_failed_logins",
-            "status": "active" if auth_count else "ready",
+            "status": state(auth_count),
+            "status_reason": unmeasured_status_reason(auth_count),
         },
         {
             "key": "network",
             "name": "Network IDS / Firewall",
-            "count": firewall_count + nids_count + len(source_ips),
-            "signal": "Fortigate/syslog, ICMP, port scanning, source IP clusters",
+            "count": network_observed,
+            "signal": "Decoded FortiGate firewall or IDS/NDR telemetry",
             "tool": "blueteam_wazuh_alerts",
-            "status": "active" if firewall_count or nids_count or source_ips else "ready",
+            "status": source_state("fortigate", "ids_ndr"),
+            **source_detail("fortigate", "ids_ndr"),
         },
         {
             "key": "web",
             "name": "Web / DVWA Recon",
-            "count": web_recon + web_count,
-            "signal": "Sensitive path probes, web access logs, app-layer attacks",
+            "count": web_observed,
+            "signal": "Decoded WAF or web-access telemetry",
             "tool": "blueteam_ai_bot_recon",
-            "status": "active" if web_recon or web_count else "ready",
+            "status": source_state("fortiweb", "waf_web"),
+            **source_detail("fortiweb", "waf_web"),
         },
         {
             "key": "container",
             "name": "Container / Docker",
-            "count": docker_count,
-            "signal": "Docker engine, container runtime, image and process telemetry",
+            "count": container_observed,
+            "signal": "Decoded Docker, container runtime, image and process telemetry",
             "tool": "wazuh_alert_aggregate_analysis",
-            "status": "active" if docker_count else "ready",
+            "status": source_state("container_runtime"),
+            **source_detail("container_runtime"),
         },
         {
             "key": "cloud",
             "name": "Cloud / Microsoft 365",
-            "count": int(cloud_data.get("total", 0) or m365_count),
+            "count": cloud_observed,
             "signal": "Office 365, Azure/Entra, Graph and SaaS audit activity",
             "tool": "wazuh_alert_aggregate_analysis",
-            "status": "active" if cloud_data.get("total") or m365_count else "ready",
+            "status": source_state("m365_audit", "defender_xdr"),
+            **source_detail("m365_audit", "defender_xdr"),
         },
         {
             "key": "vuln",
@@ -3250,7 +3577,8 @@ def _detection_layers(
             "count": int(vuln_data.get("total_vulnerabilities", 0) or 0),
             "signal": "CVE, EPSS, KEV, PoC, affected packages",
             "tool": "blueteam_cve_score",
-            "status": "active" if vuln_data.get("total_vulnerabilities") else "ready",
+            "status": state(int(vuln_data.get("total_vulnerabilities", 0) or 0)),
+            "status_reason": unmeasured_status_reason(int(vuln_data.get("total_vulnerabilities", 0) or 0)),
         },
         {
             "key": "siem",
@@ -3258,7 +3586,8 @@ def _detection_layers(
             "count": total_alerts,
             "signal": "Rules, severity, MITRE tags, 3-Sum correlation",
             "tool": "advanced_three_sum_correlation",
-            "status": "active" if total_alerts else "ready",
+            "status": state(total_alerts),
+            "status_reason": unmeasured_status_reason(total_alerts),
         },
     ]
     return layers
@@ -3271,13 +3600,34 @@ def _attack_surface(
     geo: dict[str, Any],
 ) -> dict[str, Any]:
     targets: dict[str, dict[str, Any]] = {}
+    relationships: dict[tuple[str, str], dict[str, Any]] = {}
     for threat in threats:
-        for agent in threat.get("affected_agents", []) or []:
-            name = str(agent.get("name") or agent.get("id") or "unknown")
+        affected_agents = list(threat.get("affected_agents", []) or [])
+        if threat.get("agent"):
+            affected_agents.append({"name": threat["agent"]})
+        agent_names: list[str] = []
+        for agent in affected_agents:
+            if isinstance(agent, dict):
+                name = str(agent.get("name") or agent.get("id") or "unknown")
+            else:
+                name = str(agent or "unknown")
+            if name in agent_names:
+                continue
+            agent_names.append(name)
             row = targets.setdefault(name, {"name": name, "alerts": 0, "rules": set()})
             row["alerts"] += int(threat.get("count", 0) or 0)
             if threat.get("rule_id"):
                 row["rules"].add(str(threat["rule_id"]))
+        for source_ip in dict.fromkeys(str(value) for value in (threat.get("source_ips") or []) if value):
+            for name in agent_names:
+                key = (source_ip, name)
+                link = relationships.setdefault(key, {
+                    "source_ip": source_ip, "target": name, "alerts": 0, "rules": set(),
+                    "relationship": "co_observed_in_rule_aggregation",
+                })
+                link["alerts"] += int(threat.get("count", 0) or 0)
+                if threat.get("rule_id"):
+                    link["rules"].add(str(threat["rule_id"]))
     ai_sources = ai_data.get("sources", [])[:10] if isinstance(ai_data, dict) else []
     return {
         "sources": source_ips[:16],
@@ -3286,6 +3636,11 @@ def _attack_surface(
             {"name": row["name"], "alerts": row["alerts"], "rules": sorted(row["rules"])[:5]}
             for row in sorted(targets.values(), key=lambda item: item["alerts"], reverse=True)[:10]
         ],
+        "relationships": [
+            {**row, "rules": sorted(row["rules"])[:5]}
+            for row in sorted(relationships.values(), key=lambda item: item["alerts"], reverse=True)[:24]
+        ],
+        "relationship_note": "Source and asset were co-observed in the same bounded rule aggregation; this does not prove a direct attack path.",
         "cities": geo.get("cities", [])[:12],
     }
 
@@ -3429,6 +3784,21 @@ def _overview(payload: Any = "24h") -> dict[str, Any]:
     for threat in threats:
         threat["analysis"] = explain_rule(threat)
     critical_items = critical_vuln_data.get("affected_items", []) if isinstance(critical_vuln_data, dict) else []
+    try:
+        org_cve_context = automation.cyfirma_org_cve_context({
+            str((item.get("vulnerability") or {}).get("id") or item.get("cve") or "").upper()
+            for item in critical_items if isinstance(item, dict)
+        })
+        for item in critical_items:
+            if not isinstance(item, dict):
+                continue
+            cve = str((item.get("vulnerability") or {}).get("id") or item.get("cve") or "").upper()
+            if cve in org_cve_context:
+                item["cyfirma_org_vulnerability"] = org_cve_context[cve]
+    except Exception:
+        # Organization context is optional local enrichment, never a reason to
+        # drop Wazuh inventory results from the overview.
+        pass
     source_ips = _source_ip_leaderboard(threats)
     fim = _fim_summary(fim_data)
     geo = _geo_summary(geo_data)
@@ -3451,9 +3821,63 @@ def _overview(payload: Any = "24h") -> dict[str, Any]:
         "mitre": {"techniques": [], "observed": 0}, "decoders": {"items": [], "observed": 0, "unmatched_events": 0},
         "telemetry": {"indexer": {"health": "unavailable", "scope": "Local aggregation was unavailable."}},
     }
+    try:
+        external_intelligence = automation.external_intelligence_status()
+    except Exception:
+        external_intelligence = {}
+    # Telemetry readiness is a local, time-scoped rollup view. Do not infer
+    # source coverage from whichever small decoder sample happened to be in the
+    # live overview aggregation, and never add another Indexer query here.
+    telemetry_dimensions = {"decoder": operational_evidence.get("decoders", {}).get("items", [])}
+    try:
+        telemetry_history_window = _history_payload(payload)
+        telemetry_rollup = pipeline.rollup_summary(
+            datetime.fromisoformat(str(telemetry_history_window["start"]).replace("Z", "+00:00")).isoformat(),
+            datetime.fromisoformat(str(telemetry_history_window["end"]).replace("Z", "+00:00")).isoformat(),
+        )
+        if telemetry_rollup.get("dimensions"):
+            telemetry_dimensions = dict(telemetry_rollup["dimensions"])
+            # Exact current-window decoder aggregation has better unmatched
+            # detail; retain it as the fallback decoder surface.
+            telemetry_dimensions.setdefault("decoder", operational_evidence.get("decoders", {}).get("items", []))
+    except Exception:
+        telemetry_rollup = {}
+    telemetry_contract = telemetry_contract_summary(
+        telemetry_dimensions,
+        int((cloud_m365 or {}).get("total") or 0),
+        external_intelligence.get("defender_xdr") if isinstance(external_intelligence, dict) else {},
+        materialization_complete=bool((telemetry_rollup.get("coverage") or {}).get("complete")),
+    )
+    telemetry_contract["materialization"] = {
+        "source": "local detection rollups",
+        "complete": bool((telemetry_rollup.get("coverage") or {}).get("complete")),
+        "coverage": telemetry_rollup.get("coverage") or {},
+    }
+    # Rebuild layer cards from the same source contract shown in Settings.
+    # This prevents a generic source-IP aggregate from claiming that a firewall,
+    # WAF, or NDR decoder has been observed.
+    layers = _detection_layers(
+        alert_data, threats, source_ips, fim, ai_data, auth_count, web_count,
+        vuln_data, cloud_m365, telemetry_contract,
+    )
     asset_context = _asset_context(agent_items)
     asset_context_rows = asset_context["rows"]
     asset_coverage = asset_context["coverage"]
+    if isinstance(external_intelligence, dict) and isinstance(external_intelligence.get("defender_xdr"), dict):
+        try:
+            defender_context = {
+                "network": (operational_evidence.get("network") or {}).get("events", []),
+                "identity": (operational_evidence.get("identity") or {}).get("events", []),
+                "m365": (cloud_m365 or {}).get("events", []),
+                "assets": asset_context_rows,
+            }
+            external_intelligence["defender_xdr"]["correlations"] = automation.defender_xdr_correlations(defender_context)
+        except Exception:
+            # A local correlation failure must never prevent the Wazuh overview
+            # from rendering or cause an additional Indexer request.
+            external_intelligence["defender_xdr"]["correlations"] = {
+                "total": 0, "items": [], "source": "local correlation unavailable", "provider_calls": 0,
+            }
     vuln_encoded = json.dumps(critical_items, default=str).lower()
     return {
         "generated_at": generated_at,
@@ -3520,6 +3944,8 @@ def _overview(payload: Any = "24h") -> dict[str, Any]:
             **geo,
         },
         "cloud_m365": cloud_m365,
+        "external_intelligence": external_intelligence,
+        "telemetry_contract": telemetry_contract,
         "detection_layers": layers,
         "operational_evidence": operational_evidence,
         "provider_freshness": _provider_freshness(),
@@ -3825,6 +4251,10 @@ def _settings() -> dict[str, Any]:
         pipeline_status = pipeline.status()
     except Exception as exc:
         pipeline_status = {"enabled": False, "error": str(exc)}
+    try:
+        external_intelligence = automation.external_intelligence_status()
+    except Exception as exc:
+        external_intelligence = {"error": str(exc)}
     return {
         "urls": {
             "gensecai": GENSECAI_MCP_URL,
@@ -3846,8 +4276,8 @@ def _settings() -> dict[str, Any]:
             "total": len(catalog["tools"]),
             "gensecai": sum(1 for t in catalog["tools"] if t.get("source") == "gensecai"),
             "infokom": sum(1 for t in catalog["tools"] if t.get("source") == "infokom"),
-            "dashboard": sum(1 for t in catalog["tools"] if _enrich_tool(t).get("operational_mode") == "dashboard"),
-            "workflow": sum(1 for t in catalog["tools"] if _enrich_tool(t).get("operational_mode") == "menu_workflow"),
+            "automatic": sum(1 for t in catalog["tools"] if _enrich_tool(t).get("operational_mode") == "automatic"),
+            "guided": sum(1 for t in catalog["tools"] if _enrich_tool(t).get("operational_mode") == "guided"),
             "guided_findings": sum(1 for t in catalog["tools"] if "findings" in _enrich_tool(t)["workflow"].get("surfaces", [])),
             "on_demand": sum(1 for t in catalog["tools"] if _enrich_tool(t).get("operational_mode") == "on_demand"),
             "cached_read": sum(1 for t in catalog["tools"] if _enrich_tool(t)["workflow"]["mode"] == "cached_read"),
@@ -3871,6 +4301,7 @@ def _settings() -> dict[str, Any]:
             "prewarm_ranges": PREWARM_RANGES,
         },
         "pipeline": pipeline_status,
+        "external_intelligence": external_intelligence,
     }
 
 
@@ -3969,6 +4400,35 @@ class Handler(SimpleHTTPRequestHandler):
                         automation.cyfirma_updates(start, end, limit), 60)
                 _json_response(self, 200, cached)
                 return
+            if self.path == '/api/intelligence/cyfirma-research':
+                window = _history_payload(payload)
+                start, end = soc_pipeline.bounds(window)
+                try:
+                    limit = min(max(int(payload.get('limit', 30)), 1), 100)
+                except (TypeError, ValueError):
+                    raise ValueError('Invalid research result limit') from None
+                cache_payload = {**window, 'limit': limit}
+                cached = _api_cache_read('cyfirma_research', cache_payload, 60)
+                if cached is None:
+                    cached = _api_cache_write('cyfirma_research', cache_payload,
+                        automation.cyfirma_research_updates(start, end, limit), 60)
+                _json_response(self, 200, cached)
+                return
+            if self.path == '/api/intelligence/defender-xdr':
+                window = _history_payload(payload)
+                start, end = soc_pipeline.bounds(window)
+                try:
+                    limit = min(max(int(payload.get('limit', 30)), 1), 100)
+                    offset = max(int(payload.get('offset', 0)), 0)
+                except (TypeError, ValueError):
+                    raise ValueError('Invalid Defender XDR result pagination') from None
+                cache_payload = {**window, 'limit': limit, 'offset': offset}
+                cached = _api_cache_read('defender_xdr', cache_payload, 60)
+                if cached is None:
+                    cached = _api_cache_write('defender_xdr', cache_payload,
+                        automation.defender_xdr_updates(start, end, limit, offset), 60)
+                _json_response(self, 200, cached)
+                return
             if self.path == '/api/history/events':
                 history_payload = _history_payload(payload)
                 cached = _api_cache_read("history_events", history_payload, 180)
@@ -4027,6 +4487,14 @@ class Handler(SimpleHTTPRequestHandler):
                 return
             if self.path == "/api/incidents/create":
                 _json_response(self, 200, _incident_create(payload))
+                return
+            if self.path == "/api/incidents/get":
+                result = _incident_get(payload)
+                _json_response(self, int(result.pop("status_code", 200)), result)
+                return
+            if self.path == "/api/incidents/action":
+                result = _incident_mutate(payload)
+                _json_response(self, int(result.pop("status_code", 200)), result)
                 return
             if self.path == "/api/analysis/coverage":
                 window = _window_from_payload(payload)
@@ -4093,7 +4561,7 @@ class Handler(SimpleHTTPRequestHandler):
                 request = {
                     "severity": payload.get("severity", "all"), "search": payload.get("search", ""),
                     "sort": payload.get("sort", "cve"), "limit": min(int(payload.get("limit", 100)), 100),
-                    "include_summary": False, "range": payload.get("range", "24h"),
+                    "include_summary": False, "range": payload.get("range", "24h"), "schema": 3,
                 }
                 if historical:
                     start, end = soc_pipeline.bounds(_history_payload(payload))
@@ -4118,16 +4586,28 @@ class Handler(SimpleHTTPRequestHandler):
                     for item in items if isinstance(item, dict)
                 }
                 cached_intelligence = automation.cached_cve_intelligence(cves)
+                cyfirma_org_cves = automation.cyfirma_org_cve_context(cves)
                 for item in items:
                     cve = str((item.get("vulnerability") or {}).get("id") or item.get("cve") or "").upper()
                     if cve in cached_intelligence:
                         item["intelligence"] = cached_intelligence[cve]["data"]
                         item["intelligence_expires_at"] = cached_intelligence[cve]["expires_at"]
-                graph = build_exposure_graph(items, cmdb_assets, request["limit"])
+                    if cve in cyfirma_org_cves:
+                        item["cyfirma_org_vulnerability"] = cyfirma_org_cves[cve]
+                case_page = _incident_cases({"limit": 200})
+                case_links = _case_cve_links(case_page.get("cases") or []) if case_page.get("ok") else {}
+                graph = build_exposure_graph(items, cmdb_assets, request["limit"], case_links=case_links)
                 graph.update({
                     "inventory_total": inventory.get("inventory_total", inventory.get("total", 0)),
                     "inventory_ok": inventory.get("ok", False), "cmdb": cmdb_status,
                     "cached_cve_enrichment": len(cached_intelligence),
+                    "cyfirma_org_cve_matches": sum(len(rows) for rows in cyfirma_org_cves.values()),
+                    "case_correlation": {
+                        "status": "ready" if case_page.get("ok") else case_page.get("status", "unavailable"),
+                        "cases_loaded": len(case_page.get("cases") or []),
+                        "cves_indexed": len(case_links),
+                        "source": "persistent case entities",
+                    },
                     "history": history,
                 })
                 graph = _materialize_cve_exposure(graph, request)
@@ -4279,7 +4759,8 @@ workflows = soc_workflows.Workflows(
 if __name__ == "__main__":
     workflows.start()
     automation.start()
-    pipeline.start()
+    if PIPELINE_WORKER_ENABLED:
+        pipeline.start()
     _start_overview_prewarm()
     if not DASHBOARD_ACCESS_TOKEN and HOST not in {'127.0.0.1', '::1', 'localhost'}:
         print('WARNING: DASHBOARD_ACCESS_TOKEN is empty while listening on a public interface')

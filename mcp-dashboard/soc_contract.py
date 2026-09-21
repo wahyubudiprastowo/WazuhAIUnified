@@ -70,6 +70,8 @@ def apply_contract(result: dict[str, Any], scope: str) -> dict[str, Any]:
     """Normalize core enums and attach validation metadata without dropping legacy fields."""
     if not isinstance(result, dict):
         raise ValueError("Senior SOC AI result must be an object")
+    if scope not in SCOPE_FIELDS:
+        raise ValueError("Unsupported Senior SOC AI scope")
     violations: list[str] = []
     if not str(result.get("summary") or "").strip():
         violations.append("summary is required")
@@ -88,14 +90,25 @@ def apply_contract(result: dict[str, Any], scope: str) -> dict[str, Any]:
     if not str(verdict.get("reason") or "").strip():
         verdict["reason"] = str(result.get("summary") or "Analyst validation required")[:900]
         violations.append("verdict.reason was missing")
-    list_requirements = (
-        ("gaps",),
-        ("source_facts",) if scope == "finding" else ("confidence_drivers",),
-    )
-    for requirement in list_requirements:
-        key = requirement[0]
-        if not isinstance(result.get(key), list):
-            result[key] = []
-            violations.append(f"{key} must be an array")
+    list_fields = {"gaps", "source_facts", "confidence_drivers"}
+    object_fields = {"verdict", "actions", "action_plan"}
+    for key in SCOPE_FIELDS[scope]["required"]:
+        value = result.get(key)
+        if key in list_fields:
+            if not isinstance(value, list):
+                result[key] = []
+                violations.append(f"{key} must be an array")
+        elif key in object_fields:
+            if not isinstance(value, dict):
+                result[key] = {}
+                violations.append(f"{key} must be an object")
+        elif not str(value or "").strip():
+            violations.append(f"{key} is required")
+    for lane in ("l1", "l2", "l3", "response"):
+        container_key = "actions" if scope == "finding" else "action_plan"
+        lanes = result.get(container_key)
+        if isinstance(lanes, dict) and not isinstance(lanes.get(lane), list):
+            lanes[lane] = []
+            violations.append(f"{container_key}.{lane} must be an array")
     result["contract"] = metadata(scope, "normalized" if violations else "valid", violations)
     return result

@@ -50,9 +50,10 @@ async def test_indexer_cache_distinguishes_queries(monkeypatch):
 
 def test_case_timeline_chronological():
     case_store._cases.clear()
-    cid = case_store.create_case("Timeline test")["case_id"]
-    case_store.add_verdict(cid, "1.2.3.4", "suspicious", "first")
-    case_store.add_verdict(cid, "5.6.7.8", "true_positive", "second")
+    created = case_store.create_case("Timeline test")
+    cid = created["case_id"]
+    first = case_store.add_verdict(cid, "1.2.3.4", "suspicious", "first", created["revision"])
+    case_store.add_verdict(cid, "5.6.7.8", "true_positive", "second", first["revision"])
     tl = case_store.case_timeline(cid)
     assert tl[0]["event"] == "case_created"
     assert [e["event"] for e in tl[1:]] == ["verdict", "verdict"]

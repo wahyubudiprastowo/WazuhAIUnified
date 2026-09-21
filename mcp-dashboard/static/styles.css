@@ -1,20 +1,20 @@
 :root {
   color-scheme: dark;
-  --bg0: #020713;
-  --bg1: #0c1b2f;
-  --glass: rgba(10, 25, 46, 0.70);
-  --glass-strong: rgba(19, 36, 62, 0.86);
+  --bg0: #101417;
+  --bg1: #181e22;
+  --glass: rgba(30,37,42,.88);
+  --glass-strong: #252e34;
   --line: rgba(159, 180, 210, 0.22);
   --line-strong: rgba(180, 202, 232, 0.34);
   --text: #eef5ff;
-  --muted: #9fb0c6;
+  --muted: #b4c0c8;
   --blue: #4dabf7;
   --cyan: #20c7d9;
   --green: #27c498;
   --amber: #ffc857;
   --red: #ff6b6b;
   --violet: #b197fc;
-  --panel-shadow: 0 18px 60px rgba(0, 0, 0, 0.34), inset 0 1px 0 rgba(255,255,255,0.08);
+  --panel-shadow: none;
 }
 
 * { box-sizing: border-box; }
@@ -24,27 +24,14 @@ body {
   min-height: 100vh;
   display: grid;
   grid-template-columns: 280px minmax(0, 1fr);
-  background:
-    radial-gradient(circle at 14% 12%, rgba(32,199,217,0.25), transparent 24%),
-    radial-gradient(circle at 86% 14%, rgba(177,151,252,0.16), transparent 25%),
-    radial-gradient(circle at 72% 88%, rgba(39,196,152,0.18), transparent 24%),
-    repeating-linear-gradient(0deg, rgba(255,255,255,0.032) 0 1px, transparent 1px 42px),
-    repeating-linear-gradient(90deg, rgba(255,255,255,0.028) 0 1px, transparent 1px 42px),
-    linear-gradient(135deg, var(--bg0), var(--bg1));
+  background: #151b1f;
   color: var(--text);
   font: 14px/1.45 "Fira Sans", Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   overflow-x: hidden;
 }
 
 body::before {
-  content: "";
-  position: fixed;
-  inset: 0;
-  pointer-events: none;
-  background:
-    linear-gradient(90deg, transparent 0, rgba(255,255,255,0.06) 50%, transparent 100%),
-    linear-gradient(180deg, rgba(255,255,255,0.08), transparent 120px);
-  opacity: 0.28;
+  display: none;
 }
 
 h1, h2, p { margin: 0; }
@@ -92,8 +79,8 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
   gap: 20px;
   padding: 18px;
   border-right: 1px solid var(--line);
-  background: rgba(5, 12, 23, 0.62);
-  box-shadow: 18px 0 50px rgba(0, 0, 0, 0.22);
+  background: #12191d;
+  box-shadow: none;
   backdrop-filter: blur(24px);
 }
 
@@ -128,6 +115,27 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
   display: grid;
   align-content: start;
   gap: 8px;
+}
+
+.navGroup {
+  display: grid;
+  gap: 4px;
+  padding-top: 8px;
+  border-top: 1px solid rgba(159,180,210,0.12);
+}
+
+.navGroup:first-child {
+  padding-top: 0;
+  border-top: 0;
+}
+
+.navGroupLabel {
+  padding: 0 10px 3px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: .12em;
+  text-transform: uppercase;
 }
 
 .nav button {
@@ -205,7 +213,7 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
   gap: 18px;
   padding: 18px 22px;
   border-bottom: 1px solid var(--line);
-  background: rgba(8, 17, 31, 0.46);
+  background: rgba(25,32,36,.96);
   backdrop-filter: blur(22px);
 }
 
@@ -250,6 +258,10 @@ select option { color: #111827; }
   max-width: 1720px;
 }
 
+.view > *, .view .gridTwo > *, .view .gridThree > * {
+  min-width: 0;
+}
+
 .view.active { display: block; }
 
 .panelIntro {
@@ -287,6 +299,9 @@ select option { color: #111827; }
   backdrop-filter: blur(22px);
 }
 
+.glassPanel { border-radius: 8px; box-shadow: none; }
+.heroPanel, .lanePanel { box-shadow: none; }
+
 .heroPanel {
   min-height: 260px;
   display: flex;
@@ -309,7 +324,7 @@ select option { color: #111827; }
 .heroPanel h2 {
   max-width: 780px;
   margin-top: 8px;
-  font-size: 32px;
+  font-size: 24px;
   line-height: 1.08;
 }
 
@@ -1032,12 +1047,18 @@ select option { color: #111827; }
   grid-template-columns: 42px 1fr auto;
   gap: 10px;
   align-items: center;
-  min-height: 74px;
+  min-height: 92px;
   border: 1px solid var(--line);
   border-radius: 12px;
   padding: 10px;
   background: rgba(255,255,255,0.055);
 }
+
+.layerCard.ready { border-left: 3px solid var(--green); }
+.layerCard.observed_incomplete { border-left: 3px solid var(--amber); }
+.layerCard.degraded { border-left: 3px solid var(--red); }
+.layerCard.stale { border-left: 3px solid var(--violet); }
+.layerCard.not_observed { border-left: 3px solid var(--line); }
 
 .layerIcon {
   width: 36px;
@@ -1057,6 +1078,12 @@ select option { color: #111827; }
 
 .layerCard small {
   color: var(--muted);
+}
+
+.layerCard .layerReadiness {
+  margin-top: 4px;
+  color: var(--text);
+  opacity: .82;
 }
 
 .layerMeter {
@@ -1296,6 +1323,32 @@ select option { color: #111827; }
   font-weight: 800;
 }
 
+.exposureEvidenceNote {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.exposureEvidenceNote strong {
+  color: var(--text);
+}
+
+.incidentPager {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px;
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.incidentPager button {
+  min-height: 34px;
+}
+
 .providerToolbar {
   display: flex;
   align-items: center;
@@ -1316,6 +1369,8 @@ select option { color: #111827; }
   gap: 10px;
   padding: 14px;
 }
+
+#settingsView .providerGrid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 
 .providerCard {
   min-height: 188px;
@@ -1773,21 +1828,25 @@ select option { color: #111827; }
 
 .iocGrid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  grid-template-columns: 1fr;
   gap: 10px;
 }
 
 .iocCard {
   display: grid;
-  gap: 8px;
+  grid-template-columns: minmax(180px,1fr) minmax(240px,2fr);
+  gap: 12px;
   min-height: 132px;
   border: 1px solid rgba(159,184,216,0.18);
   border-radius: 12px;
-  padding: 11px;
+  padding: 16px;
   background:
     linear-gradient(145deg, rgba(72,219,251,0.08), rgba(255,255,255,0.025)),
     rgba(8, 21, 38, 0.72);
 }
+
+.iocCard strong, .iocCard p, .iocCard span { overflow-wrap: anywhere; }
+.iocCard .providerChips { grid-column: 1 / -1; }
 
 .iocCard strong,
 .iocCard small {
@@ -1880,6 +1939,9 @@ select option { color: #111827; }
 .incidentDetail {
   display: grid;
   gap: 12px;
+  max-height: calc(100vh - 210px);
+  overflow: auto;
+  padding-right: 4px;
 }
 
 .incidentHero {
@@ -1954,6 +2016,156 @@ select option { color: #111827; }
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
+}
+
+.caseMessage {
+  border-left: 3px solid var(--cyan);
+  padding: 9px 11px;
+  color: #dbeafe;
+  background: rgba(88, 213, 246, 0.08);
+}
+
+.caseMessage.error {
+  border-left-color: var(--red);
+  color: #ffd5d5;
+  background: rgba(255, 107, 107, 0.09);
+}
+
+.caseWorkspace {
+  display: grid;
+  border-top: 1px solid var(--line);
+}
+
+.caseWorkspaceSection {
+  display: grid;
+  gap: 12px;
+  padding: 15px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.caseSectionHead {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.caseSectionHead h3 {
+  margin: 0;
+  font-size: 14px;
+  color: var(--cyan);
+}
+
+.caseSectionHead span,
+.caseWorkspace label,
+.caseEvidenceList small,
+.caseAuditList span,
+.caseAuditList time {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.caseFormGrid,
+.caseWideForm {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px 12px;
+}
+
+.caseFormGrid > form,
+.caseInlineForm {
+  min-width: 0;
+  display: grid;
+  align-content: start;
+  gap: 10px;
+}
+
+.caseFormGrid > form + form {
+  border-left: 1px solid var(--line);
+  padding-left: 12px;
+}
+
+.caseWorkspace label {
+  min-width: 0;
+  display: grid;
+  gap: 5px;
+  font-weight: 700;
+}
+
+.caseWorkspace input,
+.caseWorkspace select,
+.caseWorkspace textarea {
+  width: 100%;
+  min-height: 36px;
+  height: auto;
+  resize: vertical;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 8px 9px;
+  color: var(--text);
+  background: rgba(255,255,255,0.055);
+  font: inherit;
+}
+
+.caseWideForm {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.caseWideForm .caseFieldWide {
+  grid-column: 1 / -1;
+}
+
+.caseWideForm button {
+  width: fit-content;
+}
+
+.caseEvidenceList,
+.caseAuditList {
+  display: grid;
+  max-height: 280px;
+  overflow: auto;
+  border-top: 1px solid var(--line);
+}
+
+.caseEvidenceList article {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(140px, .7fr);
+  gap: 4px 12px;
+  padding: 10px 0;
+  border-bottom: 1px solid rgba(159, 184, 216, 0.12);
+}
+
+.caseEvidenceList article div,
+.caseEvidenceList article strong,
+.caseEvidenceList article small {
+  min-width: 0;
+  display: block;
+}
+
+.caseEvidenceList article span {
+  overflow-wrap: anywhere;
+  color: var(--cyan);
+  font-size: 12px;
+}
+
+.caseEvidenceList article p {
+  grid-column: 1 / -1;
+  margin: 2px 0 0;
+  color: #dbeafe;
+}
+
+.caseAuditList > div {
+  display: grid;
+  grid-template-columns: minmax(170px, .8fr) minmax(130px, .7fr) minmax(0, 1fr);
+  gap: 10px;
+  padding: 8px 0;
+  border-bottom: 1px solid rgba(159, 184, 216, 0.12);
+}
+
+.dangerButton {
+  border-color: rgba(255, 107, 107, .55);
+  color: #ffd5d5;
+  background: rgba(255, 107, 107, .1);
 }
 
 .coverageGrid, .correlationGrid {
@@ -2509,15 +2721,32 @@ select option { color: #111827; }
   overflow-wrap: anywhere;
 }
 
+.telemetryReadiness { display: grid; gap: 12px; }
+.telemetrySummary { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; align-items: baseline; }
+.telemetrySummary strong { font-size: 22px; color: var(--cyan); }
+.telemetrySummary small { grid-column: 1 / -1; color: var(--muted); }
+.telemetrySourceGrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 8px; }
+.telemetrySource, .telemetryExternal article { border: 1px solid var(--line); border-radius: 8px; padding: 12px; background: rgba(7, 19, 34, .46); min-width: 0; }
+.telemetrySource > div { display: flex; justify-content: space-between; gap: 8px; }
+.telemetrySource span, .telemetryExternal span { color: var(--muted); text-transform: uppercase; font-size: 11px; }
+.telemetrySource b, .telemetryExternal b { display: block; margin-top: 8px; font-size: 18px; }
+.telemetrySource small, .telemetryExternal small { display: block; color: var(--muted); overflow-wrap: anywhere; }
+.telemetrySource.ready { border-left: 3px solid var(--green); }
+.telemetrySource.observed_incomplete { border-left: 3px solid var(--amber); }
+.telemetrySource.degraded { border-left: 3px solid var(--red); }
+.telemetrySource.stale { border-left: 3px solid var(--violet); }
+.telemetrySource.not_observed { border-left: 3px solid var(--line); }
+.telemetrySource details { margin-top: 8px; color: var(--muted); font-size: 12px; }
+.telemetrySource details p { margin: 6px 0 0; }
+.telemetryExternal { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 8px; }
+
 .settingsShell {
   display: grid;
   gap: 14px;
 }
 
 .settingsActions {
-  position: sticky;
-  top: 0;
-  z-index: 4;
+  position: static;
   display: flex;
   gap: 8px;
   flex-wrap: wrap;
@@ -2527,9 +2756,15 @@ select option { color: #111827; }
   backdrop-filter: blur(16px);
 }
 
+#settingsView .settingsShell > section:first-child .settingsActions {
+  position: sticky;
+  top: 0;
+  z-index: 4;
+}
+
 .settingsGrid {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 360px), 1fr));
   gap: 14px;
   padding: 14px;
 }
@@ -2572,12 +2807,14 @@ select option { color: #111827; }
 
 .settingField {
   display: grid;
-  grid-template-columns: minmax(170px, .45fr) minmax(0, 1fr);
+  grid-template-columns: minmax(150px, .7fr) minmax(0, 1.3fr);
   gap: 12px;
   align-items: center;
   padding: 12px;
   border-bottom: 1px solid rgba(159,180,210,0.13);
 }
+
+.settingField > * { min-width: 0; }
 
 .settingField:last-child {
   border-bottom: 0;
@@ -2827,7 +3064,10 @@ pre, .resultPane {
   display: grid;
   gap: 12px;
   padding: 14px;
+  font-size: 14px;
 }
+
+.resultContent .resultMetric strong { font-size: 20px; overflow-wrap: anywhere; }
 
 .reportGrid {
   display: grid;
@@ -3166,6 +3406,7 @@ pre, .resultPane {
   .insightStrip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .flowBoard, .huntMatrix { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .reportGrid, .incidentSections { grid-template-columns: 1fr; }
+  .caseWideForm { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .mapLayout, .attackPath { grid-template-columns: 1fr; }
   .cloudM365 { grid-template-columns: 1fr; }
   .gridThree, .settingsGrid { grid-template-columns: 1fr; }
@@ -3210,6 +3451,8 @@ pre, .resultPane {
   .providerToolbar, .exposureLegend { align-items: stretch; flex-direction: column; }
   .resultMetrics, .jsonRow, .reportRow, .incidentCard, .settingField { grid-template-columns: 1fr; }
   .insightStrip, .flowBoard, .huntMatrix { grid-template-columns: 1fr; }
+  .caseFormGrid, .caseWideForm, .caseEvidenceList article, .caseAuditList > div { grid-template-columns: 1fr; }
+  .caseFormGrid > form + form { border-left: 0; border-top: 1px solid var(--line); padding: 12px 0 0; }
   .nav { grid-template-columns: repeat(2, 1fr); }
 
   .tableHeader, .tableRow, .agentTable .tableHeader, .agentTable .tableRow,

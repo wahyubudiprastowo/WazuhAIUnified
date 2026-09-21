@@ -24,11 +24,13 @@
     const updates = items.slice(0, 12).map(item => {
       const cves = (item.cves || []).map(value => badge(value, "cve")).join("");
       const labels = (item.labels || []).slice(0, 5).map(value => badge(value)).join("");
+      const phases = (item.kill_chain_phases || []).slice(0, 4).map(value => badge(value)).join("");
+      const types = (item.ioc_types || []).slice(0, 4).map(value => badge(value, "neutral")).join("");
       return `<article class="intelUpdate">
         <header><div><span class="intelSource">CYFIRMA ${esc(item.scope || "feed")}</span><h3>${esc(item.name || "STIX indicator")}</h3></div><strong>${fmt.format(Number(item.confidence || 0))}<small>confidence</small></strong></header>
         <p>${esc(item.description || "No provider description supplied.")}</p>
-        <div class="intelBadges">${cves}${labels}</div>
-        <footer><span>Captured ${esc(stamp(item.observed_at))}</span><span>Modified ${esc(stamp(item.modified || item.created))}</span><span>${fmt.format(Number(item.ioc_count || 0))} IOC values</span></footer>
+        <div class="intelBadges">${cves}${labels}${phases}${types}</div>
+        <footer><span>Type ${esc(item.indicator_type || "indicator")}</span><span>Captured ${esc(stamp(item.observed_at))}</span><span>Modified ${esc(stamp(item.modified || item.created))}</span><span>Valid until ${esc(stamp(item.valid_until))}</span><span>${fmt.format(Number(item.ioc_count || 0))} IOC values</span><span>${fmt.format(Number(item.reference_count || (item.references || []).length || 0))} references</span></footer>
       </article>`;
     }).join("");
     const cveNotice = linked.length

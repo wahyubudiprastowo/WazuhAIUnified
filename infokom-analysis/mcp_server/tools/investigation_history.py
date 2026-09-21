@@ -8,7 +8,7 @@ import json, os
 from datetime import datetime, timedelta
 from typing import Optional, Literal
 from collections import Counter
-from pydantic import field_validator, BaseModel, ConfigDict, Field
+from pydantic import field_validator, model_validator, BaseModel, ConfigDict, Field
 from mcp_server import (mcp, _INVESTIGATION_HISTORY_FILE)
 from mcp_server.core.audit import _audit_log, _truncate_if_needed
 from mcp_server.core.attacker_registry import register_attacker_ioc
@@ -30,6 +30,14 @@ class MarkInvestigatedInput(BaseModel):
         description="Analyst notes (max 1024 chars).")
     case_id: str = Field(default="", max_length=64,
         description="Optional case ID - if set, this verdict is also recorded on that case.")
+    expected_revision: int | None = Field(default=None, ge=1,
+        description="Required when case_id is set; stale case writes are rejected.")
+
+    @model_validator(mode="after")
+    def case_revision_required(self):
+        if self.case_id and self.expected_revision is None:
+            raise ValueError("expected_revision is required when case_id is set")
+        return self
 
 
 @mcp.tool(
@@ -58,8 +66,17 @@ async def blueteam_mark_investigated(params: MarkInvestigatedInput) -> str:
         register_attacker_ioc(params.srcip, source="verdict")  # confirmed attacker - keep IOC unmasked
     if params.verdict == "false_positive":
         register_false_positive(params.srcip, source="verdict", reason=params.notes)  # auto-suppress in 3-Sum
+    case_revision = None
     if params.case_id:
-        case_store.add_verdict(params.case_id, params.srcip, params.verdict, params.notes)  # P8: case wiring
+        try:
+            case = case_store.add_verdict(params.case_id, params.srcip, params.verdict, params.notes,
+                                          params.expected_revision, "investigation_history")
+        except case_store.CaseConflict as exc:
+            return json.dumps({"error": "revision_conflict", "case_id": params.case_id,
+                               "current_revision": exc.current_revision}, indent=2)
+        if not case:
+            return json.dumps({"error": f"Case '{params.case_id}' not found."}, indent=2)
+        case_revision = case.get("revision")
     if not _INVESTIGATION_HISTORY_FILE:
         return json.dumps({"error": "BLUETEAM_INVESTIGATION_HISTORY env var not set.",
                            "detail": "Set this to a writable JSONL file path for investigation persistence."}, indent=2)
@@ -72,7 +89,8 @@ async def blueteam_mark_investigated(params: MarkInvestigatedInput) -> str:
     if not _append_history(entry):
         return json.dumps({"error": "Failed to write history file.",
                            "detail": f"Check {_INVESTIGATION_HISTORY_FILE} is writable."}, indent=2)
-    return json.dumps({"status": "recorded", "entry": entry}, indent=2)
+    return json.dumps({"status": "recorded", "entry": entry,
+                       "case_id": params.case_id or None, "case_revision": case_revision}, indent=2)
 
 
 class FalsePositiveTrackerInput(BaseModel):

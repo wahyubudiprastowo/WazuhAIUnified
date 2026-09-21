@@ -2,10 +2,13 @@
 (() => {
   const t = (id, en) => window.SocLocale?.t ? window.SocLocale.t(id, en) : en;
   const ax = (analysis, field) => window.SocLocale?.analysis ? window.SocLocale.analysis(analysis, field) : (analysis?.[field] || "");
-  const a = {coverage: null, selected: "", results: new Map(), pending: new Map(), generation: 0, busy: false};
+  const a = {coverage: null, coverageWindow: "", coverageLoadedAt: 0, loadingWindow: "", selected: "", results: new Map(), pending: new Map(), generation: 0, busy: false};
   const providers = ["otx", "greynoise", "virustotal", "cyfirma"];
   const names = {otx: "AlienVault OTX", greynoise: "GreyNoise", virustotal: "VirusTotal", cyfirma: "CYFIRMA"};
   const areas = ["workbench", "l1", "l2"];
+  const coverageViews = new Set(["findings", ...areas]);
+  const coverageEnabled = view => coverageViews.has(view) ||
+    (view === "command" && new URLSearchParams(window.location.search).get("enterprise") === "1");
   for (const view of areas) {
     const node = document.createElement("section");
     node.className = "analysisOverview glassPanel";
@@ -14,6 +17,9 @@
     else if (view === "l1") q(`#${view}View`).append(node);
     else q(`#${view}View`).prepend(node);
   }
+  const coveragePayload = () => window.SocWindow?.payload ? window.SocWindow.payload() : {range: els.range.value};
+  const coverageKey = payload => JSON.stringify(payload);
+  const activeAreas = () => [...document.querySelectorAll("[data-analysis-view]")].filter(el => el.dataset.analysisView === state.view);
   function eligible() { return (a.coverage?.observables || []).filter(r => r.public && r.indicator); }
   function verdict(row) {
     if (!row) return t("Belum dianalisis", "Not analyzed");
@@ -55,7 +61,7 @@
     const completed = [...a.results.keys()].filter(k => candidates.some(r => r.indicator === k)).length;
     const decoders = (c.decoders || []).length ? c.decoders : (c.sources || []).map(row => ({name: row.key, count: row.doc_count}));
     const decoderSummary = decoders.slice(0, 5).map(row => `${row.name || "unknown"} (${fmt.format(row.count || 0)})`).join(", ") || t("belum tersedia", "not available");
-    for (const area of document.querySelectorAll("[data-analysis-view]")) {
+    for (const area of activeAreas()) {
       const view = area.dataset.analysisView;
       area.innerHTML = `<div class="panelHead"><h2>${view === "l1" ? t("Konteks triage", "Triage context") : view === "l2" ? t("Bukti investigasi lintas sumber", "Cross-source investigation evidence") : t("Analisis indikator dari log Wazuh", "Indicator analysis from Wazuh logs")}</h2><span>${esc(c.range)} | ${esc(c.index)}</span></div><div class="analysisBody"><div class="analysisMetrics"><div><span>${t("Alert terindeks", "Indexed alerts")}</span><b>${fmt.format(c.total_events)}</b></div><div><span>${t("Event dengan field indikator", "Events with indicator fields")}</span><b>${fmt.format(c.events_with_observable)}</b></div><div><span>${t("Kandidat publik dimuat", "Public candidates loaded")}</span><b>${candidates.length}</b></div><div><span>${t("Indikator diproses", "Indicators processed")}</span><b>${completed} / ${candidates.length}</b></div></div><p class="analysisScope"><strong>${t("Cakupan decoder", "Decoder coverage")}:</strong> ${esc(decoderSummary)} | <strong>${t("Rule unik dimuat", "Unique rules loaded")}:</strong> ${fmt.format(number(c.rule_candidates?.unique || c.rules?.length))}</p><p class="analysisScope">${esc(SocLocale.language === "en" ? "Indexed alert aggregation for the selected range; raw archives are not read. Candidates are limited to 30 values per field. Enrichment only covers processed indicators, not every log." : c.scope_note)} ${c.other_rule_events ? t(`${fmt.format(c.other_rule_events)} event berada di luar daftar rule yang dimuat.`, `${fmt.format(c.other_rule_events)} events are outside the loaded rule list.`) : ""}</p><div class="analysisControls"><label>${t("Indikator dari log", "Indicator from logs")}<select data-analysis-select>${candidates.map(r => `<option value="${esc(r.indicator)}" ${r.indicator === a.selected ? "selected" : ""}>${esc(r.indicator)} · ${r.kind} · ${fmt.format(r.occurrences)} ${t("kemunculan field", "field occurrences")}</option>`).join("")}</select></label><button type="button" data-analysis-batch ${a.busy || completed >= candidates.length ? "disabled" : ""}>${a.busy ? t("Analisis berjalan...", "Analysis running...") : t("Analisis 3 berikutnya", "Analyze next 3")}</button><button type="button" data-analysis-open="${esc(a.selected)}" ${a.selected ? "" : "disabled"}>${t("Bukti lengkap", "Full evidence")}</button></div><p class="analysisScope">Field: ${esc(target?.fields?.join(", ") || "-")} | Rule: ${esc(target?.rules?.join(", ") || "-")} | ${t("Hitungan kemunculan antar-field dapat tumpang tindih.", "Field occurrence counts can overlap.")}</p><div class="analysisTableWrap"><table class="analysisTable"><thead><tr><th>${t("Penyedia", "Provider")}</th><th>${t("Hasil", "Result")}</th><th>${t("Makna untuk analis", "Meaning for analyst")}</th></tr></thead><tbody>${providerRows(a.selected)}</tbody></table></div><p class="analysisScope">${a.results.get(a.selected)?.generated_at ? t(`Hasil diperiksa ${esc(a.results.get(a.selected).generated_at)}. `, `Result checked ${esc(a.results.get(a.selected).generated_at)}. `) : ""}${t("Tidak semua log memiliki IP publik, domain atau hash yang dapat diperiksa oleh layanan intelijen.", "Not every log contains a public IP, domain or hash that can be checked by intelligence services.")}</p><details class="analysisRuleGuide" ${view === "l1" ? "open" : ""}><summary>${t("Penjelasan rule prioritas dan saran", "Priority rule explanation and guidance")} ${view === "l1" ? "L1" : "L2"}</summary>${(c.rules || []).slice(0, view === "l1" ? 3 : 5).map(r => ruleText(r, view === "l1")).join("")}</details></div>`;
     }
@@ -74,25 +80,40 @@
     });
     a.pending.set(indicator, promise); render(); return promise;
   }
-  async function loadCoverage() {
+  async function loadCoverage(force = false) {
+    if (!coverageEnabled(state.view)) return;
+    const payload = coveragePayload();
+    const windowKey = coverageKey(payload);
+    if (!force && a.coverage && a.coverageWindow === windowKey && Date.now() - a.coverageLoadedAt < 120000) {
+      window.SocFindings?.setCoverage(a.coverage);
+      render();
+      return;
+    }
+    if (a.loadingWindow === windowKey) return;
     const generation = ++a.generation;
-    a.coverage = null; a.results.clear(); a.pending.clear(); a.busy = false;
-    document.querySelectorAll("[data-analysis-view]").forEach(el => el.innerHTML = `<div class="analysisBody">${t("Menghitung cakupan alert terindeks...", "Calculating indexed alert coverage...")}</div>`);
+    a.loadingWindow = windowKey;
+    if (a.coverageWindow !== windowKey) {
+      a.coverage = null; a.results.clear(); a.pending.clear(); a.busy = false;
+    }
+    activeAreas().forEach(el => el.innerHTML = `<div class="analysisBody">${t("Menghitung cakupan alert terindeks...", "Calculating indexed alert coverage...")}</div>`);
     try {
-      const payload = window.SocWindow?.payload ? window.SocWindow.payload() : {range: els.range.value};
       const data = await postJson("/api/analysis/coverage", payload);
       if (generation !== a.generation) return;
       if (!data.ok) throw new Error(t("Indexer mengembalikan hasil parsial atau timeout. Cakupan belum dapat dinyatakan lengkap.", "Indexer returned partial results or timed out. Coverage cannot be declared complete."));
       a.coverage = data;
+      a.coverageWindow = windowKey;
+      a.coverageLoadedAt = Date.now();
       document.dispatchEvent(new CustomEvent("soc:coverage", {detail: data}));
       window.SocFindings?.setCoverage(data);
-      renderThreatTable("#l1Queue", data.rules.slice(0, 25));
-      a.selected = eligible()[0]?.indicator || "";
+      if (state.view === "l1") renderThreatTable("#l1Queue", data.rules.slice(0, 25));
+      if (!eligible().some(row => row.indicator === a.selected)) a.selected = eligible()[0]?.indicator || "";
       render();
-      analyze(a.selected);
-    } catch (e) { if (generation === a.generation) document.querySelectorAll("[data-analysis-view]").forEach(el => el.innerHTML = `<div class="analysisBody">${t("Cakupan belum tersedia", "Coverage unavailable")}: ${esc(e.message)}</div>`); }
+    } catch (e) { if (generation === a.generation) activeAreas().forEach(el => el.innerHTML = `<div class="analysisBody">${t("Cakupan belum tersedia", "Coverage unavailable")}: ${esc(e.message)}</div>`); }
+    finally { if (generation === a.generation) a.loadingWindow = ""; }
   }
-  document.addEventListener("soc:overview", () => { setTimeout(loadCoverage, 0); });
+  document.addEventListener("soc:overview", () => { if (coverageEnabled(state.view)) setTimeout(loadCoverage, 0); });
+  document.addEventListener("soc:view", event => { if (coverageEnabled(event.detail.view)) setTimeout(loadCoverage, 0); });
+  document.querySelector("#refreshBtn")?.addEventListener("click", () => { if (coverageEnabled(state.view)) setTimeout(() => loadCoverage(true), 0); });
   document.addEventListener("soc:language", render);
   document.addEventListener("change", e => {
     if (!e.target.matches("[data-analysis-select]")) return;

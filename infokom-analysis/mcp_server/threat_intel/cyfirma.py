@@ -134,6 +134,16 @@ def _extract_iocs_from_pattern(pattern: str) -> list[str]:
     return values
 
 
+def _extract_ioc_types(pattern: str) -> list[str]:
+    """Return bounded STIX object types without exposing the full pattern."""
+    values: list[str] = []
+    for match in re.finditer(r"\[\s*([a-zA-Z0-9_-]+):", pattern or ""):
+        value = match.group(1).strip().lower()
+        if value and value not in values:
+            values.append(value)
+    return values[:12]
+
+
 def _normalize_indicator(obj: dict[str, Any], scope: str) -> dict[str, Any]:
     pattern = str(obj.get("pattern") or "")
     external_refs = obj.get("external_references") if isinstance(obj.get("external_references"), list) else []
@@ -147,6 +157,7 @@ def _normalize_indicator(obj: dict[str, Any], scope: str) -> dict[str, Any]:
         "labels": obj.get("labels") if isinstance(obj.get("labels"), list) else [],
         "pattern": pattern,
         "iocs": _extract_iocs_from_pattern(pattern),
+        "ioc_types": _extract_ioc_types(pattern),
         "confidence": obj.get("confidence"),
         "created": obj.get("created"),
         "modified": obj.get("modified"),

@@ -80,17 +80,28 @@ def normalize_component(component: Any, inherited: dict[str, Any] | None = None)
     inherited = inherited or {}
     cpe = parse_cpe(component.get("cpe"))
     vendor = _text(component.get("vendor")) or cpe.get("vendor") or inherited.get("vendor")
-    product = (_text(component.get("product")) or _text(component.get("name")) or
-               cpe.get("product") or inherited.get("application"))
+    # A display name such as "web portal" is not necessarily the package
+    # product. Prefer explicit/CPE product identity and retain names as aliases.
+    product = (_text(component.get("product")) or cpe.get("product") or
+               _text(component.get("name")) or inherited.get("application"))
     version = _text(component.get("version")) or cpe.get("version") or inherited.get("version")
     if not any((vendor, product, version, cpe.get("value"))):
         return None
     patch_state = str(component.get("patch_state") or inherited.get("patch_state") or "unknown").lower()
     if patch_state not in PATCH_STATES:
         patch_state = "unknown"
+    aliases: list[str] = []
+    for value in (
+        _list(component.get("aliases")), _list(component.get("package_names")),
+        _list(component.get("packages")), [_text(component.get("name")), product, cpe.get("product")],
+    ):
+        for alias in value:
+            if alias and alias not in aliases:
+                aliases.append(alias)
     return {
         "name": _text(component.get("name")) or product or "unnamed component",
         "vendor": vendor, "product": product, "version": version,
+        "aliases": aliases,
         "cpe": cpe.get("value"), "cpe_status": cpe["status"], "cpe_reason": cpe.get("reason"),
         "cpe_part": cpe.get("part_label"), "patch_state": patch_state,
         "source": _text(component.get("source")) or inherited.get("source") or "CMDB",
@@ -107,6 +118,12 @@ def normalize_cmdb_asset(asset: Any) -> dict[str, Any] | None:
         "purpose", "application", "source", "last_verified", "patch_state",
     )
     normalized = {field: value for field in scalar_fields if (value := _text(asset.get(field))) is not None}
+    purpose = str(normalized.get("purpose") or "").strip().lower()
+    explicit_verified = asset.get("verified") if isinstance(asset.get("verified"), bool) else None
+    is_sample = purpose.startswith("sample") or purpose.startswith("example") or bool(asset.get("template"))
+    normalized["verified"] = explicit_verified
+    normalized["authoritative"] = not is_sample and explicit_verified is not False
+    normalized["quality_status"] = "sample" if is_sample else ("unverified" if explicit_verified is False else "authoritative")
     if isinstance(asset.get("internet_exposed"), bool):
         normalized["internet_exposed"] = asset["internet_exposed"]
     for field in ("aliases", "ips", "addresses", "tags"):
@@ -127,6 +144,7 @@ def normalize_cmdb_asset(asset: Any) -> dict[str, Any] | None:
     if not components and any(normalized.get(key) for key in ("vendor", "version", "application", "cpe")):
         component = normalize_component({
             "name": normalized.get("application") or normalized.get("name"),
+            "product": root_cpe.get("product"),
             "vendor": normalized.get("vendor"), "version": normalized.get("version"),
             "cpe": normalized.get("cpe"), "patch_state": normalized.get("patch_state"),
         }, inherited)
@@ -143,6 +161,76 @@ def asset_identifiers(asset: dict[str, Any]) -> set[str]:
     for field in ("aliases", "ips", "addresses"):
         values.extend(asset.get(field) or [])
     return {str(value).strip().lower().rstrip(".")[:256] for value in values if str(value or "").strip()}
+
+
+def _package_identifier(value: Any) -> str:
+    return str(value or "").strip().lower().rstrip(".")[:256]
+
+
+def _version_compatible(installed: Any, expected: Any) -> bool | None:
+    """Conservatively compare CMDB/CPE version with an installed package version."""
+    actual = str(installed or "").strip().lower()
+    wanted = str(expected or "").strip().lower()
+    if not actual or not wanted or wanted in {"*", "-"}:
+        return None
+    if actual == wanted:
+        return True
+    # Package managers commonly append release/build metadata to an upstream
+    # version. Do not accept arbitrary substring/fuzzy matches.
+    return any(actual.startswith(wanted + separator) for separator in ("-", "+", "~", "."))
+
+
+def _cmdb_index(cmdb_assets: list[dict[str, Any]]) -> tuple[dict[str, list[dict[str, Any]]], dict[str, int]]:
+    index: dict[str, list[dict[str, Any]]] = {}
+    quality = {"configured": len(cmdb_assets), "authoritative": 0, "sample": 0, "unverified": 0,
+               "ambiguous_identifiers": 0}
+    for asset in cmdb_assets:
+        status = str(asset.get("quality_status") or "authoritative")
+        quality[status if status in quality else "unverified"] += 1
+        if not asset.get("authoritative", True):
+            continue
+        for identifier in asset_identifiers(asset):
+            index.setdefault(identifier, []).append(asset)
+    quality["ambiguous_identifiers"] = sum(len(rows) > 1 for rows in index.values())
+    return index, quality
+
+
+def _match_asset(agent: dict[str, Any], index: dict[str, list[dict[str, Any]]]) -> tuple[dict[str, Any] | None, str]:
+    candidates = (
+        ("agent_id", agent.get("id")), ("hostname", agent.get("name")),
+        ("hostname", agent.get("hostname")), ("ip", agent.get("ip")),
+    )
+    for method, raw in candidates:
+        identifier = _package_identifier(raw)
+        matches = index.get(identifier, []) if identifier else []
+        if len(matches) == 1:
+            return matches[0], method
+        if len(matches) > 1:
+            return None, f"ambiguous_{method}"
+    return None, "unmatched"
+
+
+def _match_component(cmdb: dict[str, Any] | None, package_name: str,
+                     package_version: str | None) -> tuple[dict[str, Any] | None, str]:
+    if not cmdb:
+        return None, "cmdb_unmatched"
+    wanted = _package_identifier(package_name)
+    candidates: list[dict[str, Any]] = []
+    for component in cmdb.get("components", []):
+        names = {_package_identifier(value) for value in (
+            list(component.get("aliases") or []) + [component.get("name"), component.get("product")]
+        ) if _package_identifier(value)}
+        if wanted in names:
+            candidates.append(component)
+    if not candidates:
+        return None, "package_unmatched"
+    compatible = [row for row in candidates if _version_compatible(package_version, row.get("version")) is not False]
+    if len(compatible) == 1:
+        version_match = _version_compatible(package_version, compatible[0].get("version"))
+        return compatible[0], "package_version" if version_match is True else "package"
+    if not compatible:
+        return None, "version_mismatch"
+    return None, "ambiguous_component"
 
 
 def _first(mapping: dict[str, Any], paths: tuple[tuple[str, ...], ...]) -> Any:
@@ -189,12 +277,11 @@ def _cached_intelligence_signals(item: dict[str, Any]) -> tuple[Any, bool | None
     return epss, kev, poc
 
 
-def build_exposure_graph(items: list[dict[str, Any]], cmdb_assets: list[dict[str, Any]], max_paths: int = 100) -> dict[str, Any]:
+def build_exposure_graph(items: list[dict[str, Any]], cmdb_assets: list[dict[str, Any]], max_paths: int = 100,
+                         case_links: dict[str, list[str]] | None = None) -> dict[str, Any]:
     max_paths = min(max(int(max_paths), 1), 100)
-    cmdb_index: dict[str, dict[str, Any]] = {}
-    for asset in cmdb_assets:
-        for identifier in asset_identifiers(asset):
-            cmdb_index.setdefault(identifier, asset)
+    cmdb_index, cmdb_quality = _cmdb_index(cmdb_assets)
+    case_links = case_links or {}
     nodes: dict[str, dict[str, Any]] = {}
     edges: dict[tuple[str, str, str], dict[str, Any]] = {}
     paths: list[dict[str, Any]] = []
@@ -217,26 +304,39 @@ def build_exposure_graph(items: list[dict[str, Any]], cmdb_assets: list[dict[str
         cve = str(vuln.get("id") or raw.get("cve") or raw.get("id") or "").upper()
         if not CVE_RE.match(cve):
             continue
-        identifiers = asset_identifiers(agent)
-        cmdb = next((cmdb_index[value] for value in identifiers if value in cmdb_index), None)
+        cmdb, asset_match = _match_asset(agent, cmdb_index)
         asset_label = str(agent.get("name") or agent.get("id") or (cmdb or {}).get("name") or "unknown asset")
         asset_key = str(agent.get("id") or asset_label).lower()
         package_name = str(package.get("name") or raw.get("package_name") or "unknown component")
         package_version = _text(package.get("version") or raw.get("package_version"))
-        matched_component = None
-        for component in (cmdb or {}).get("components", []):
-            names = {str(component.get(key) or "").lower() for key in ("name", "product")}
-            if package_name.lower() in names:
-                matched_component = component
-                break
+        matched_component, component_match = _match_component(cmdb, package_name, package_version)
         item_cpe = _first(raw, (("package", "cpe"), ("vulnerability", "cpe"), ("cpe",)))
-        cpe = parse_cpe(item_cpe or (matched_component or {}).get("cpe") or (cmdb or {}).get("cpe"))
-        patch_state = str(_first(raw, (("package", "patch_state"), ("vulnerability", "status"), ("patch_state",)))
-                          or (matched_component or {}).get("patch_state") or (cmdb or {}).get("patch_state") or "unknown").lower()
+        cpe = parse_cpe(item_cpe or (matched_component or {}).get("cpe"))
+        raw_patch_state = _first(raw, (("package", "patch_state"), ("vulnerability", "status"), ("patch_state",)))
+        component_patch_state = str((matched_component or {}).get("patch_state") or "unknown").lower()
+        if raw_patch_state:
+            patch_state = str(raw_patch_state).lower()
+        elif component_patch_state in {"pending", "vulnerable"}:
+            patch_state = component_patch_state
+        else:
+            # An active Wazuh CVE finding confirms exposure, not the package's
+            # patch lifecycle. Do not turn missing/conflicting CMDB data into
+            # measured patch-state coverage.
+            patch_state = "unknown"
         if patch_state not in PATCH_STATES:
             patch_state = "unknown"
+        if raw_patch_state:
+            patch_evidence = "inventory field"
+        elif component_patch_state in {"pending", "vulnerable"}:
+            patch_evidence = "verified CMDB and Wazuh active vulnerability state"
+        elif component_patch_state in {"patched", "not_applicable"}:
+            patch_evidence = "CMDB patch state conflicts with active Wazuh vulnerability; verify package/version"
+        else:
+            patch_evidence = "Patch state not supplied; active Wazuh CVE finding is not patch verification"
         severity = str(vuln.get("severity") or raw.get("severity") or "unknown").lower()
         cached_epss, cached_kev, cached_poc = _cached_intelligence_signals(raw)
+        org_vulnerabilities = raw.get("cyfirma_org_vulnerability") if isinstance(raw.get("cyfirma_org_vulnerability"), list) else []
+        org_vulnerabilities = [entry for entry in org_vulnerabilities[:5] if isinstance(entry, dict)]
         epss = _first(raw, (("epss",), ("vulnerability", "epss"), ("intelligence", "epss_probability")))
         epss = cached_epss if epss is None else epss
         kev = _bool_signal(raw, ("kev", "in_kev", "vulnerability.kev", "intelligence.in_kev"))
@@ -263,10 +363,17 @@ def build_exposure_graph(items: list[dict[str, Any]], cmdb_assets: list[dict[str
              internet_exposed=internet)
         node(component_id, "component", package_name, version=package_version, cpe=cpe.get("value"),
              cpe_status=cpe["status"], patch_state=patch_state)
-        node(cve_id, "cve", cve, severity=severity, epss=epss, kev=kev, poc=poc)
+        node(cve_id, "cve", cve, severity=severity, epss=epss, kev=kev, poc=poc,
+             cyfirma_org_records=len(org_vulnerabilities))
         edge(asset_id, component_id, "runs", provenance="Wazuh inventory")
         edge(component_id, cve_id, "affected_by", provenance="Wazuh vulnerability state")
-        case_id = _text(raw.get("case_id") or raw.get("incident_id"))
+        linked_cases = []
+        explicit_case = _text(raw.get("case_id") or raw.get("incident_id"))
+        for value in ([explicit_case] if explicit_case else []) + list(case_links.get(cve, [])):
+            case = _text(value, 128)
+            if case and case not in linked_cases:
+                linked_cases.append(case)
+        case_id = linked_cases[0] if linked_cases else None
         if case_id:
             case_node = f"case:{case_id.lower()}"
             node(case_node, "case", case_id)
@@ -275,12 +382,17 @@ def build_exposure_graph(items: list[dict[str, Any]], cmdb_assets: list[dict[str
             "asset": asset_label, "agent_id": agent.get("id"), "owner": (cmdb or {}).get("owner"),
             "criticality": criticality, "environment": (cmdb or {}).get("environment"),
             "network_zone": (cmdb or {}).get("network_zone"), "internet_exposed": internet,
+            "asset_match": asset_match, "component_match": component_match,
             "component": package_name, "version": package_version, "cpe": cpe.get("value"),
             "cpe_status": cpe["status"], "cpe_reason": cpe.get("reason"), "cve": cve,
             "severity": severity, "epss": epss, "kev": kev, "poc": poc,
-            "observed_exploitation": exploited, "patch_state": patch_state, "case_id": case_id,
+            "observed_exploitation": exploited, "patch_state": patch_state,
+            "patch_evidence": patch_evidence, "case_id": case_id, "case_ids": linked_cases,
+            "cyfirma_org_vulnerability": org_vulnerabilities,
+            "cyfirma_org_records": len(org_vulnerabilities),
             "exposure_state": exposure_state, "priority": priority, "risk_score": score,
-            "provenance": ["Wazuh vulnerability state", "local CMDB"] if cmdb else ["Wazuh vulnerability state"],
+            "provenance": (["Wazuh vulnerability state", "verified local CMDB"] if cmdb else ["Wazuh vulnerability state"])
+                          + (["CYFIRMA Organization Vulnerability V2 STIX local ledger"] if org_vulnerabilities else []),
         })
         unique_cves.add(cve)
         unique_assets.add(asset_key)
@@ -296,6 +408,7 @@ def build_exposure_graph(items: list[dict[str, Any]], cmdb_assets: list[dict[str
             "patch_unknown": sum(row["patch_state"] == "unknown" for row in paths),
             "valid_cpe": sum(row["cpe_status"] == "valid" for row in paths),
             "case_linked": sum(bool(row["case_id"]) for row in paths),
+            "cyfirma_org_context": sum(bool(row["cyfirma_org_records"]) for row in paths),
         },
         "coverage": {
             "wazuh_inventory": bool(paths),
@@ -306,12 +419,18 @@ def build_exposure_graph(items: list[dict[str, Any]], cmdb_assets: list[dict[str
             "internet_exposure": sum(row["internet_exposed"] is not None for row in paths),
             "patch_state": sum(row["patch_state"] != "unknown" for row in paths),
             "case": sum(bool(row["case_id"]) for row in paths),
+            "cmdb_asset": sum(row["asset_match"] not in {"unmatched", "cmdb_unmatched"} and not row["asset_match"].startswith("ambiguous_") for row in paths),
+            "cmdb_component": sum(row["component_match"] in {"package", "package_version"} for row in paths),
+            "cyfirma_org_vulnerability": sum(bool(row["cyfirma_org_records"]) for row in paths),
             "denominator": len(paths),
         },
         "nodes": list(nodes.values()), "edges": list(edges.values()), "paths": paths,
+        "cmdb_quality": cmdb_quality,
         "limitations": [
             "EPSS, KEV and PoC appear only when already stored with the inventory record; drill-down enrichment remains on demand and cached.",
             "A CPE match is product identity evidence, not proof of exploitation.",
+            "CYFIRMA Organization records are retained vendor context; they do not prove that the local asset is exploitable or compromised.",
             "Unlinked cases and unknown patch state are shown as evidence gaps, not negative findings.",
+            "Sample/template CMDB rows and ambiguous identifiers are excluded from correlation.",
         ],
     }

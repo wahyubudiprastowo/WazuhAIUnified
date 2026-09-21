@@ -97,6 +97,15 @@ FINDING_TOOLS = frozenset('''analyze_alert_patterns blueteam_attack_chain
     blueteam_cve_epss blueteam_cve_kev blueteam_cve_poc blueteam_cve_ssvc
     blueteam_cve_attack_mapping blueteam_cve_advisory'''.split())
 
+# These are the small, cached read calls actually made by the overview builder.
+# Everything else remains analyst-led. Keeping this list explicit avoids
+# presenting catalog membership as an automatically running integration.
+AUTOMATIC_TOOLS = frozenset('''get_wazuh_alert_summary get_top_security_threats
+    get_wazuh_agents advanced_three_sum_correlation get_wazuh_vulnerability_summary
+    get_wazuh_critical_vulnerabilities get_wazuh_statistics blueteam_ai_bot_recon
+    wazuh_alert_timeline blueteam_wazuh_geo_heatmap blueteam_wazuh_syscheck
+    blueteam_failed_logins blueteam_read_web_log blueteam_case_list'''.split())
+
 # Explicitly reviewed exclusions, not a destructive-name heuristic.
 APPROVAL_TOOLS = {
     'wazuh_block_ip', 'wazuh_isolate_host', 'wazuh_kill_process',
@@ -129,15 +138,22 @@ def policy(tool):
     surfaces = [menu] if menu else ['tools']
     if name in FINDING_TOOLS:
         surfaces.append('findings')
+    execution_class = ('approval_required' if approved else 'automatic' if name in AUTOMATIC_TOOLS
+                       else 'guided' if name in FINDING_TOOLS else 'on_demand')
     return {
         'menu': menu or 'tools', 'mapped': menu is not None,
         'surfaces': surfaces,
         'mode': 'approval' if approved else 'cached_read',
-        'trigger': 'analyst_request', 'automatic': False,
+        'trigger': ('overview_refresh' if execution_class == 'automatic' else 'finding_pivot'
+                    if execution_class == 'guided' else 'analyst_request'),
+        'execution_class': execution_class,
+        'automatic': execution_class == 'automatic',
         'cache_seconds': 21600 if external else 900,
         'dependency': 'provider_or_feed' if external else 'local_or_wazuh',
-        'reason': ('Explicit operator confirmation required; excluded from background reads.'
-                   if approved else 'Cached, deduplicated read; queued only on analyst request.'),
+        'reason': ('Explicit operator confirmation required; excluded from background reads.' if approved else
+                   'Bounded cached read used by the overview refresh.' if execution_class == 'automatic' else
+                   'Bounded cached read offered from a relevant finding context.' if execution_class == 'guided' else
+                   'Available from its owning menu or Tool Console; never called during page load.'),
     }
 
 

@@ -8,6 +8,12 @@ const state = {
   incidents: [],
   l1Queue: [],
   persistentCases: [],
+  caseDetails: {},
+  caseDetailLoading: "",
+  caseMutationError: "",
+  caseMutationBusy: false,
+  casePagination: {offset: 0, limit: 25, total: 0, next_offset: null},
+  caseWindow: "",
   selectedIncident: 0,
   filter: "all",
   category: "all",
@@ -82,6 +88,7 @@ const els = {
   toolMeta: q("#toolMeta"),
   incidentBoard: q("#incidentBoard"),
   incidentDetail: q("#incidentDetail"),
+  incidentPager: q("#incidentPager"),
   settingsForm: q("#settingsForm"),
   settingsFields: q("#settingsFields"),
   settingsStatus: q("#settingsStatus"),
@@ -219,6 +226,62 @@ function syncDateRangeVisibility() {
   if (!els.dateRange.hidden) initDateRange();
 }
 
+const routableRanges = new Set(["24h", "7d", "30d", "custom"]);
+
+function routeWindowKey() {
+  try {
+    return JSON.stringify(currentWindowPayload());
+  } catch (_) {
+    return "invalid";
+  }
+}
+
+function routeDate(value) {
+  if (!value) return "";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? "" : toDatetimeLocal(date);
+}
+
+function writeRoute({ replace = false } = {}) {
+  let windowPayload;
+  try {
+    windowPayload = currentWindowPayload();
+  } catch (_) {
+    return;
+  }
+  const params = new URLSearchParams({ view: state.view, range: windowPayload.range });
+  if (windowPayload.range === "custom") {
+    params.set("start", windowPayload.start);
+    params.set("end", windowPayload.end);
+  }
+  const hash = `#${params.toString()}`;
+  if (window.location.hash === hash) return;
+  if (replace) {
+    window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}${hash}`);
+  } else {
+    window.location.hash = hash;
+  }
+}
+
+function applyRoute({ load = false } = {}) {
+  const previousWindow = routeWindowKey();
+  const params = new URLSearchParams(window.location.hash.replace(/^#/, ""));
+  const view = viewTitles[params.get("view")] ? params.get("view") : "command";
+  const range = routableRanges.has(params.get("range")) ? params.get("range") : "24h";
+  if (els.range) els.range.value = range;
+  if (range === "custom") {
+    const start = routeDate(params.get("start"));
+    const end = routeDate(params.get("end"));
+    if (start && els.globalStart) els.globalStart.value = start;
+    if (end && els.globalEnd) els.globalEnd.value = end;
+  }
+  syncDateRangeVisibility();
+  if (state.view !== view) setView(view, { updateRoute: false });
+  if (load && previousWindow !== routeWindowKey()) {
+    loadDashboard().catch(showLoadError);
+  }
+}
+
 window.SocWindow = {
   payload: currentWindowPayload,
   label: currentRangeLabel,
@@ -251,7 +314,7 @@ function defaultArgs(tool) {
     return { bypass_redaction: false };
   }
   if (tool.name === "blueteam_read_web_log") {
-    return { server: "nginx", log_type: "access", lines: 300, grep: "DVWA|.env|wp-|php|select|union|cmd|shell|passwd", bypass_redaction: false };
+    return { server: "nginx", log_type: "access", lines: 300, grep: "\\.env|wp-|php|select|union|cmd|shell|passwd", bypass_redaction: false };
   }
   if (tool.name === "blueteam_investigate_ip") {
     return { srcip: "8.8.8.8", since: "24h", response_format: "markdown" };
@@ -339,7 +402,7 @@ function contextualArgs(tool, base = defaultArgs(tool)) {
   fillAny(["hours_back"], range === "24h" ? 24 : range === "7d" ? 168 : 720);
   fillAny(["lookback_minutes"], 60);
   fillAny(["threshold_score"], 35);
-  if (accepts("grep") && empty(args.grep)) args.grep = "failed|invalid|DVWA|.env|scan|malware|office365|fortigate";
+  if (accepts("grep") && empty(args.grep)) args.grep = "failed|invalid|\\.env|scan|malware|office365|fortigate";
   if (accepts("indicator_type") && empty(args.indicator_type)) args.indicator_type = "ip";
   if (accepts("exact_match") && empty(args.exact_match)) args.exact_match = false;
   if (accepts("bypass_redaction") && empty(args.bypass_redaction)) args.bypass_redaction = false;
@@ -399,8 +462,8 @@ function renderTools() {
   const summary = state.toolSummary || {};
   setHtml("#toolReadiness", `
     <span><strong>${fmt.format(number(summary.discovered || state.tools.length))}</strong> discovered</span>
-    <span><strong>${fmt.format(number(summary.dashboard))}</strong> dashboard workflows</span>
-    <span><strong>${fmt.format(number(summary.workflow))}</strong> menu workflows</span>
+    <span><strong>${fmt.format(number(summary.automatic))}</strong> automatic reads</span>
+    <span><strong>${fmt.format(number(summary.guided))}</strong> guided pivots</span>
     <span><strong>${fmt.format(number(summary.cached_read))}</strong> cached reads</span>
     <span><strong>${fmt.format(number(summary.approval_required))}</strong> approval required</span>
     <small>All discovered tools have a menu and execution policy. Opening a page never runs a tool.</small>
@@ -414,7 +477,7 @@ function renderTools() {
       <div class="toolBadges">
         <span>${esc(tool.category || "Utility")}</span>
         <span>${esc(tool.lane || "SOC")}</span>
-        <span>${tool.operational_mode === "dashboard" ? "dashboard" : "menu workflow"}</span>
+        <span>${esc((tool.operational_mode || "on_demand").replaceAll("_", " "))}</span>
         ${tool.requires_params ? "<span>params</span>" : ""}
       </div>
       <div class="desc">${descriptionOf(tool)}</div>
@@ -435,7 +498,7 @@ function selectTool(tool) {
       <span>${esc(tool.category || "Utility")}</span>
       <span>${esc(tool.lane || "SOC")}</span>
       <span>${tool.requires_params ? "auto params wrapper" : "direct args"}</span>
-      <span>${esc(tool.operational_mode === "dashboard" ? "cached dashboard workflow" : `${tool.workflow?.menu || "tools"} menu workflow`)}</span>
+      <span>${esc((tool.workflow?.execution_class || tool.operational_mode || "on_demand").replaceAll("_", " "))}</span>
       <span>${esc(tool.dependency || "local")}</span>
       ${required.length ? `<span>required: ${esc(required.join(", "))}</span>` : ""}
       ${fields.length ? `<span>fields: ${esc(fields.map((field) => field.name).join(", "))}</span>` : ""}
@@ -911,6 +974,10 @@ function renderAttackMap(data) {
   `).join("") || '<div class="emptyState">No geo rows.</div>');
 }
 
+function readinessTone(status) {
+  return ({ready: "low", observed_incomplete: "medium", stale: "high", degraded: "critical", not_observed: "medium"})[status] || "medium";
+}
+
 function renderSocCoverage(data) {
   const caps = data.tools?.capabilities || {};
   const funnel = data.analysis_funnel || {};
@@ -951,7 +1018,7 @@ function renderSocCoverage(data) {
       source: "Wazuh Agent",
       value: number(layerByKey.fim?.count),
       detail: "file, registry and integrity changes",
-      tone: layerByKey.fim?.status === "active" ? "low" : "medium",
+      tone: readinessTone(layerByKey.fim?.status),
       tool: "blueteam_wazuh_syscheck",
     },
     {
@@ -959,7 +1026,7 @@ function renderSocCoverage(data) {
       source: "Fortigate / Syslog",
       value: number(layerByKey.network?.count),
       detail: topIp ? `top source ${topIp}` : "ICMP, scans and firewall rules",
-      tone: layerByKey.network?.status === "active" ? "low" : "medium",
+      tone: readinessTone(layerByKey.network?.status),
       tool: "blueteam_wazuh_alerts",
       ip: topIp,
     },
@@ -1035,18 +1102,21 @@ function renderDetectionLayers(data) {
     siem: "SI",
   };
   setHtml("#detectionLayers", layers.map((layer) => {
-    const width = Math.max(3, Math.round((number(layer.count) / max) * 100));
-    const statusClass = layer.status === "active" ? "low" : "medium";
+    const count = number(layer.count);
+    const width = count ? Math.max(3, Math.round((count / max) * 100)) : 0;
+    const status = layer.status || "not_observed";
+    const gap = (layer.missing_fields || []).join(", ");
     return `
-      <article class="layerCard" data-tool-name="${esc(layer.tool)}">
+      <article class="layerCard ${esc(status)}" data-tool-name="${esc(layer.tool)}">
         <span class="layerIcon">${esc(icon[layer.key] || "LY")}</span>
         <div>
           <strong>${esc(layer.name)}</strong>
           <small>${esc(layer.signal)}</small>
+          <small class="layerReadiness">${esc(layer.status_reason || (gap ? `Missing: ${gap}` : "Stored evidence status"))}</small>
           <div class="layerMeter"><span style="width:${width}%"></span></div>
         </div>
         <div>
-          <span class="pill ${statusClass}">${esc(layer.status || "ready")}</span>
+          <span class="pill ${readinessTone(status)}">${esc(status.replaceAll("_", " "))}</span>
           <small>${fmt.format(number(layer.count))}</small>
         </div>
       </article>
@@ -1098,20 +1168,7 @@ function renderCloudM365(data) {
 }
 
 function renderAttackPath(data) {
-  const graphHtml = (suffix) => renderExposureGraphHtml(data, suffix);
-  setHtml("#attackPath", graphHtml("command"));
-  setHtml("#l3AttackPath", graphHtml("l3"));
-}
-
-function exposureMetric(data, key) {
-  const layers = Object.fromEntries((data.detection_layers || []).map((layer) => [layer.key, layer]));
-  if (key === "m365") return number(data.cloud_m365?.total || layers.cloud?.count);
-  if (key === "agents") return number(data.agents?.counts?.active || data.agents?.total);
-  if (key === "cves") return number(data.vulnerabilities?.critical);
-  if (key === "recon") return number(data.ai_recon?.ai_agent_sources);
-  if (key === "fim") return number(data.fim?.total || layers.fim?.count);
-  if (key === "network") return number(layers.network?.count);
-  return 0;
+  setHtml("#l3AttackPath", renderExposureGraphHtml(data, "l3"));
 }
 
 function compactLabel(value, limit = 22) {
@@ -1151,98 +1208,68 @@ function exposureNode({ x, y, r = 36, title, sub, kind = "neutral", tool = "", i
 }
 
 function renderExposureGraphHtml(data, suffix) {
-  const sources = data.attack_surface?.sources || data.source_ips || [];
-  const targets = data.attack_surface?.targets || data.agents?.items || [];
-  const hotIp = sources[0]?.ip || (data.cloud_m365?.client_ips || [])[0]?.key || "no source IP";
-  const secondIp = sources[1]?.ip || hotIp;
-  const topAgent = targets[0]?.name || targets[0]?.id || (data.agents?.items || [])[0]?.name || "managed asset";
-  const secondAgent = targets[1]?.name || targets[1]?.id || "cloud workload";
-  const cve = data.vulnerabilities?.critical_items?.[0]?.cve || data.vulnerabilities?.critical_items?.[0]?.id || "CVE triage";
-  const cloudOp = (data.cloud_m365?.operations || [])[0]?.key || "M365 audit";
-  const topRule = data.threats?.[0]?.rule_id || "rule pivot";
-  const m365 = exposureMetric(data, "m365");
-  const agents = exposureMetric(data, "agents");
-  const cves = exposureMetric(data, "cves");
-  const recon = exposureMetric(data, "recon");
-  const fim = exposureMetric(data, "fim");
-  const network = exposureMetric(data, "network");
+  const surface = data.attack_surface || {};
+  const relationships = (surface.relationships || []).filter(row => row.source_ip && row.target);
+  const sourceMap = new Map((surface.sources || data.source_ips || []).filter(row => row.ip).map(row => [String(row.ip), row]));
+  const targetMap = new Map((surface.targets || []).filter(row => row.name).map(row => [String(row.name), row]));
+  for (const row of relationships) {
+    if (!sourceMap.has(String(row.source_ip))) sourceMap.set(String(row.source_ip), {ip: row.source_ip, hits: row.alerts});
+    if (!targetMap.has(String(row.target))) targetMap.set(String(row.target), {name: row.target, alerts: row.alerts, rules: row.rules});
+  }
+  const relatedSources = new Set(relationships.map(row => String(row.source_ip)));
+  const relatedTargets = new Set(relationships.map(row => String(row.target)));
+  const sources = [...sourceMap.values()].sort((a, b) => Number(relatedSources.has(String(b.ip))) - Number(relatedSources.has(String(a.ip))) || number(b.hits) - number(a.hits)).slice(0, 5);
+  const targets = [...targetMap.values()].sort((a, b) => Number(relatedTargets.has(String(b.name))) - Number(relatedTargets.has(String(a.name))) || number(b.alerts) - number(a.alerts)).slice(0, 5);
+  if (!sources.length && !targets.length) {
+    return `<div class="emptyState"><strong>No exposure entities observed</strong><span>The selected window has no source IP or affected-asset evidence for this view.</span></div>`;
+  }
   const arrowId = `arrow-${suffix}`;
-  const glowId = `exposureGlow-${suffix}`;
-  const edges = [
-    [176, 360, 234, 305, "hot"], [176, 260, 234, 190, "warn"], [176, 160, 234, 185, "weak"],
-    [386, 84, 444, 240, "hot"], [386, 185, 444, 252, "weak"], [386, 305, 444, 266, "weak"], [386, 430, 444, 282, "weak"],
-    [596, 255, 654, 105, "weak"], [596, 255, 654, 205, "hot"], [596, 255, 654, 305, "warn"], [596, 255, 654, 405, "weak"],
-    [806, 105, 854, 110, "weak"], [806, 205, 854, 210, "weak"], [806, 305, 854, 310, "warn"], [806, 405, 854, 410, "weak"],
-    [940, 310, 940, 410, "hot"], [310, 305, 730, 205, "hot"],
-  ].map(([x1, y1, x2, y2, tone]) => `
-    <path class="exposureEdge ${tone}" d="M${x1} ${y1} C ${Math.round((x1 + x2) / 2)} ${y1}, ${Math.round((x1 + x2) / 2)} ${y2}, ${x2} ${y2}" marker-end="url(#${arrowId})"></path>
-  `).join("");
-  const nodes = [
-    exposureNode({ x: 100, y: 160, title: "Web app", sub: "DVWA/app logs", kind: "neutral", tool: "blueteam_read_web_log", icon: "WB" }),
-    exposureNode({ x: 100, y: 260, title: "Identity", sub: "auth failures", kind: "warn", tool: "blueteam_failed_logins", icon: "ID" }),
-    exposureNode({ x: 100, y: 360, title: "Public IP", sub: hotIp, kind: "hot", tool: "blueteam_investigate_ip", ip: hotIp, icon: "IP" }),
-    exposureNode({ x: 310, y: 84, title: "Sensitive data", sub: `${fmt.format(m365)} M365`, kind: "hot", shape: "wide", tool: "wazuh_alert_aggregate_analysis", icon: "SD" }),
-    exposureNode({ x: 310, y: 185, title: "Evidence store", sub: "Wazuh + M365", kind: "critical", shape: "wide", tool: "wazuh_alert_aggregate_analysis", icon: "LOG" }),
-    exposureNode({ x: 310, y: 305, title: "Virtual machine", sub: topAgent, kind: cves ? "hot" : "neutral", tool: "blueteam_cve_score", cve, icon: "VM" }),
-    exposureNode({ x: 310, y: 430, title: "SQL server", sub: `${fmt.format(fim)} FIM`, kind: "neutral", tool: "blueteam_wazuh_syscheck", icon: "DB" }),
-    exposureNode({ x: 520, y: 255, title: "SOC correlation", sub: `Rule ${topRule}`, kind: "soc", shape: "wide", tool: "advanced_three_sum_correlation", icon: "SO" }),
-    exposureNode({ x: 730, y: 105, title: "Network group", sub: `${fmt.format(network)} events`, kind: "neutral", tool: "blueteam_wazuh_alerts", icon: "NW" }),
-    exposureNode({ x: 730, y: 205, title: "Virtual machine", sub: secondAgent, kind: "critical", shape: "wide", tool: "get_wazuh_agents", icon: "VM" }),
-    exposureNode({ x: 730, y: 305, title: "SQL on VM", sub: `${fmt.format(cves)} critical CVE`, kind: cves ? "warn" : "neutral", tool: "blueteam_cve_score", cve, icon: "SQL" }),
-    exposureNode({ x: 730, y: 405, title: "M365 audit", sub: cloudOp, kind: "neutral", shape: "wide", tool: "wazuh_alert_aggregate_analysis", icon: "MS" }),
-    exposureNode({ x: 940, y: 110, title: "Cloud storage", sub: `${fmt.format(m365)} events`, kind: "neutral", tool: "wazuh_alert_aggregate_analysis", icon: "ST" }),
-    exposureNode({ x: 940, y: 210, title: "App service", sub: "web surface", kind: "neutral", tool: "blueteam_read_web_log", icon: "AP" }),
-    exposureNode({ x: 940, y: 310, title: "Internet exposed", sub: secondIp, kind: "hot", shape: "wide", tool: "blueteam_investigate_ip", ip: secondIp, icon: "EX" }),
-    exposureNode({ x: 940, y: 410, title: "Public IP", sub: secondIp, kind: "hot", tool: "blueteam_investigate_ip", ip: secondIp, icon: "IP" }),
-  ].join("");
+  const positions = count => Array.from({length: count}, (_, index) => count === 1 ? 250 : 90 + index * (320 / (count - 1)));
+  const sourceY = new Map(sources.map((row, index) => [String(row.ip), positions(sources.length)[index]]));
+  const targetY = new Map(targets.map((row, index) => [String(row.name), positions(targets.length)[index]]));
+  const visibleLinks = relationships.filter(row => sourceY.has(String(row.source_ip)) && targetY.has(String(row.target))).slice(0, 16);
+  const maxAlerts = Math.max(1, ...visibleLinks.map(row => number(row.alerts)));
+  const edges = visibleLinks.map(row => {
+    const y1 = sourceY.get(String(row.source_ip));
+    const y2 = targetY.get(String(row.target));
+    const tone = number(row.alerts) >= maxAlerts ? "hot" : "weak";
+    return `<path class="exposureEdge ${tone}" d="M226 ${y1} C 420 ${y1}, 620 ${y2}, 814 ${y2}" marker-end="url(#${arrowId})"><title>${esc(`${fmt.format(number(row.alerts))} alerts; rules ${(row.rules || []).join(", ") || "not returned"}`)}</title></path>`;
+  }).join("");
+  const sourceNodes = sources.map(row => exposureNode({
+    x: 150, y: sourceY.get(String(row.ip)), title: "Observed source IP",
+    sub: `${row.ip} · ${fmt.format(number(row.hits))} events`, kind: "hot",
+    tool: "blueteam_investigate_ip", ip: row.ip, shape: "wide", icon: "IP",
+  })).join("");
+  const targetNodes = targets.map(row => exposureNode({
+    x: 890, y: targetY.get(String(row.name)), title: "Observed asset",
+    sub: `${row.name} · ${fmt.format(number(row.alerts))} alerts`, kind: "soc",
+    tool: "get_wazuh_agents", shape: "wide", icon: "AS",
+  })).join("");
+  const note = surface.relationship_note || "No source-to-asset relationship has been materialized for this selected window.";
   return `
     <div class="exposureShell">
-      <svg class="exposureGraph" viewBox="0 0 1040 520" role="img" aria-label="Enterprise SOC external exposure relationship graph">
+      <svg class="exposureGraph" viewBox="0 0 1040 500" role="img" aria-label="Observed source and asset evidence graph">
         <defs>
-          <filter id="${glowId}" x="-35%" y="-35%" width="170%" height="170%">
-            <feGaussianBlur stdDeviation="4" result="blur"></feGaussianBlur>
-            <feMerge><feMergeNode in="blur"></feMergeNode><feMergeNode in="SourceGraphic"></feMergeNode></feMerge>
-          </filter>
           <marker id="${arrowId}" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
             <path d="M 0 0 L 10 5 L 0 10 z"></path>
           </marker>
         </defs>
         <g class="exposureBack">
-          <rect x="28" y="26" width="484" height="458" rx="26"></rect>
-          <rect x="558" y="26" width="454" height="458" rx="26"></rect>
-          <text x="52" y="52">SOURCE, DATA, AND IDENTITY RISK</text>
-          <text x="582" y="52">AFFECTED ASSETS AND INTERNET EXPOSURE</text>
+          <rect x="28" y="26" width="332" height="448" rx="18"></rect>
+          <rect x="680" y="26" width="332" height="448" rx="18"></rect>
+          <text x="52" y="52">OBSERVED SOURCE ENTITIES</text>
+          <text x="704" y="52">AFFECTED ASSETS IN RULE AGGREGATES</text>
         </g>
         <g class="exposureEdges">${edges}</g>
-        <g class="exposureNodes" filter="url(#${glowId})">${nodes}</g>
+        <g class="exposureNodes">${sourceNodes}${targetNodes}</g>
       </svg>
+      <p class="exposureEvidenceNote"><strong>${visibleLinks.length ? `${visibleLinks.length} bounded co-observations` : "Relationship not established"}.</strong> ${esc(note)}</p>
       <div class="exposureLegend">
-        <button type="button" data-tool-name="blueteam_investigate_ip" data-pivot-ip="${esc(hotIp)}">Investigate ${esc(hotIp)}</button>
+        ${sources[0] ? `<button type="button" data-tool-name="blueteam_investigate_ip" data-pivot-ip="${esc(sources[0].ip)}">Investigate ${esc(sources[0].ip)}</button>` : ""}
         <button type="button" data-tool-name="wazuh_alert_aggregate_analysis">Open Wazuh evidence</button>
-        <button type="button" data-tool-name="advanced_three_sum_correlation">Correlate path</button>
-        <button type="button" data-tool-name="blueteam_cve_score" data-pivot-cve="${esc(cve)}">Score ${esc(cve)}</button>
       </div>
     </div>
   `;
-}
-
-function renderCoverageGrid(data) {
-  const caps = data.tools?.capabilities || {};
-  const rows = [
-    ["Wazuh SIEM", number(data.tools?.gensecai), "gensecai", "tools"],
-    ["Threat Intel", capCount(caps, "threat_intel"), "infokom", "l3"],
-    ["Hunting", capCount(caps, "hunt"), "infokom", "l3"],
-    ["Vulnerability", capCount(caps, "vulnerability"), "critical", "vuln"],
-    ["Response", capCount(caps, "response"), "high", "l3"],
-    ["Compliance", capCount(caps, "compliance"), "medium", "l3"],
-  ];
-  setHtml("#coverageGrid", rows.map(([label, value, tone, view]) => `
-    <div class="coverageItem" data-view-link="${esc(view)}">
-      <span class="pill ${esc(tone)}">${fmt.format(value)}</span>
-      <strong>${esc(label)}</strong>
-      <small>available tools</small>
-    </div>
-  `).join(""));
 }
 
 function findToolByNames(names) {
@@ -1475,12 +1502,12 @@ function renderCveExposureGraph(data) {
     <div class="cvePathList" aria-label="CVE exposure relationships">
       ${rows.map(row => `
         <article class="cvePathRow">
-          <div><span>Asset</span><strong>${esc(row.asset)}</strong><small>${esc(row.owner || "owner unknown")} · ${esc(row.criticality || "criticality unknown")}${row.internet_exposed === true ? " · internet exposed" : ""}</small></div>
+          <div><span>Asset</span><strong>${esc(row.asset)}</strong><small>${esc(row.owner || "owner unknown")} · ${esc(row.criticality || "criticality unknown")}${row.internet_exposed === true ? " · internet exposed" : ""} · ${esc(row.asset_match || "unmatched")}</small></div>
           <div class="cveRelation" aria-hidden="true">runs</div>
-          <div><span>Component</span><strong>${esc(row.component)}</strong><small>${esc(row.version || "version unknown")} · CPE ${esc(row.cpe_status)}</small></div>
+          <div><span>Component</span><strong>${esc(row.component)}</strong><small>${esc(row.version || "version unknown")} · CPE ${esc(row.cpe_status)} · ${esc(row.component_match || "unmatched")}</small></div>
           <div class="cveRelation" aria-hidden="true">affected by</div>
           <div><span>Vulnerability</span><strong>${esc(row.cve)}</strong><small>${esc(row.severity)} · score ${fmt.format(number(row.risk_score))}</small></div>
-          <div class="cvePathSignals">${evidenceSignal(row.kev, "KEV", "not KEV")}${evidenceSignal(row.poc, "PoC", "no PoC")}${evidenceSignal(row.observed_exploitation, "observed exploit", "not observed")}<span class="statusMark ${row.patch_state === "patched" ? "available" : "skipped"}">${esc(row.patch_state)}</span>${row.case_id ? `<span class="statusMark available">${esc(row.case_id)}</span>` : '<span class="statusMark unavailable">case unlinked</span>'}</div>
+          <div class="cvePathSignals">${evidenceSignal(row.kev, "KEV", "not KEV")}${evidenceSignal(row.poc, "PoC", "no PoC")}${evidenceSignal(row.observed_exploitation, "observed exploit", "not observed")}<span class="statusMark ${row.patch_state === "patched" ? "available" : "skipped"}" title="${esc(row.patch_evidence || "patch evidence unavailable")}">${esc(row.patch_state)}</span>${row.case_id ? `<span class="statusMark available">${esc(row.case_id)}</span>` : '<span class="statusMark unavailable">case unlinked</span>'}</div>
         </article>
       `).join("") || '<div class="emptyState">No valid CVE exposure paths were returned from the current Wazuh vulnerability state.</div>'}
     </div>
@@ -1520,7 +1547,7 @@ async function loadCveExposureGraph(force = false) {
     }}});
     const cache = data.cache?.status ? ` · cache ${data.cache.status} (${evidenceAge(data.cache.age_seconds)})` : "";
     const source = data.history ? `stored history · ${fmt.format(number(data.history.unique_cves))} unique CVEs · no provider calls` : "current Wazuh inventory";
-    setText("#cveExposureStatus", `${fmt.format(number(data.inventory_total))} inventory records · ${fmt.format(number(data.summary?.paths))} paths loaded · ${source}${cache}`);
+    setText("#cveExposureStatus", `${fmt.format(number(data.inventory_total))} inventory records · ${fmt.format(number(data.summary?.paths))} paths loaded · ${fmt.format(number(exposureCoverage.cmdb_asset))}/${fmt.format(number(exposureCoverage.denominator))} CMDB matched · ${source}${cache}`);
   } catch (error) {
     setHtml("#cveExposureGraph", `<div class="errorPanel"><strong>Exposure graph unavailable</strong><p>${esc(error.message)}</p></div>`);
     setText("#cveExposureStatus", "Current-state inventory could not be loaded");
@@ -1531,9 +1558,6 @@ async function loadCveExposureGraph(force = false) {
 
 function renderAgents(data) {
   const agents = data.agents?.items || [];
-  const counts = data.agents?.counts || {};
-  const active = number(counts.active);
-  setText("#assetSummary", ui(`${fmt.format(active)} aktif dari ${fmt.format(number(data.agents?.total))} agent`, `${fmt.format(active)} active of ${fmt.format(number(data.agents?.total))} agents`));
   setText("#agentCountLabel", ui(`${fmt.format(agents.length)} ditampilkan`, `${fmt.format(agents.length)} displayed`));
   const table = `
     <div class="tableHeader">
@@ -1550,7 +1574,6 @@ function renderAgents(data) {
     `).join("") || `<div class="emptyState">${ui("Tidak ada agent dikembalikan.", "No agents returned.")}</div>`}
   `;
   setHtml("#agentTable", table);
-  setHtml("#l1Agents", table);
 }
 
 function renderInsights(data) {
@@ -1645,7 +1668,27 @@ function buildIncidents(data) {
   const layers = data.detection_layers || [];
   const criticalCves = number(data.vulnerabilities?.critical);
   const layerNames = layers.filter((layer) => number(layer.count) > 0).map((layer) => layer.name);
-  const rows = sources.slice(0, 10).map((source, index) => {
+  const defenderClusters = data.external_intelligence?.defender_xdr?.correlations?.items || [];
+  const clusteredSources = new Set(defenderClusters.flatMap(row => row.matches?.ip || []));
+  const defenderRows = [...new Map(defenderClusters.map(row => [row.cluster_id || row.incident_id, row])).values()].map((row) => {
+    const score = number(row.score);
+    const [severity, tone] = severityFromScore(score);
+    return {
+      id: row.cluster_id || `DEF-${row.incident_id || row.alert_id}`,
+      title: row.title || "Microsoft Defender XDR correlation",
+      source: row.matches?.ip?.[0] || "-",
+      target: row.matches?.asset?.[0] || row.matches?.identity?.[0] || "correlated local evidence",
+      city: "Defender and local canonical entity graph",
+      score, severity, tone,
+      hits: number(row.evidence_ids?.length),
+      maxScore: score,
+      rules: [],
+      layers: ["Microsoft Defender XDR", "Canonical entity correlation"],
+      sensitivePaths: [],
+      correlation: row,
+    };
+  });
+  const rows = sources.filter(source => !clusteredSources.has(source.ip)).slice(0, 10).map((source, index) => {
     const recon = reconRows.find((row) => (row.srcip || row.source_ip) === source.ip) || {};
     const target = targets[index % Math.max(targets.length, 1)] || {};
     const city = cities[index % Math.max(cities.length, 1)] || {};
@@ -1672,7 +1715,7 @@ function buildIncidents(data) {
       sensitivePaths: (recon.sensitive_paths || []).slice(0, 5),
     };
   });
-  if (rows.length) return rows;
+  if (defenderRows.length || rows.length) return [...defenderRows, ...rows];
   return (data.threats || []).slice(0, 6).map((threat, index) => {
     const score = Math.min(100, Math.round(number(threat.threat_score) / 8));
     const [severity, tone] = severityFromScore(score);
@@ -1694,12 +1737,41 @@ function buildIncidents(data) {
   });
 }
 
+function persistentCaseIncident(item) {
+  const verdict = item.latest_verdict?.verdict || (item.verdicts || []).at(-1)?.verdict || "stored";
+  const verdictStyle = {
+    true_positive: ["Confirmed", "critical", 100], suspicious: ["Suspicious", "high", 75],
+    false_positive: ["False positive", "low", 10], clean: ["Clean", "low", 5],
+    unknown: ["Needs review", "medium", 40], stored: ["Stored", "low", 0],
+  }[verdict] || ["Stored", "low", 0];
+  return {
+    id: item.case_id, title: item.title || "Stored SOC case",
+    source: (item.srcips || [])[0] || "-", target: "case evidence", city: "stored investigation",
+    score: verdictStyle[2], severity: verdictStyle[0], tone: verdictStyle[1],
+    hits: number(item.evidence_count ?? item.evidence?.length ?? item.iocs?.length),
+    rules: [], layers: ["Persistent case store"],
+    sensitivePaths: item.latest_verdict?.notes ? [item.latest_verdict.notes] : [],
+    owner: item.owner, slaDue: item.sla_due, caseStatus: item.status,
+    latestVerdict: verdict === "stored" ? "" : verdict, containment: item.containment,
+    closureReason: item.closure_reason, caseNotes: item.notes, revision: item.revision,
+    persisted: true, caseRecord: item,
+  };
+}
+
 function renderIncidentDetail(incident) {
   if (!els.incidentDetail) return;
   if (!incident) {
     els.incidentDetail.innerHTML = '<div class="emptyState">No incident selected.</div>';
     return;
   }
+  const record = incident.caseRecord || state.caseDetails[incident.id] || {};
+  const evidenceRows = (record.evidence || []).slice(0, 20);
+  const auditRows = (record.audit_log || []).slice(-20).reverse();
+  const isClosed = record.status === "closed";
+  const isResolved = record.status === "resolved";
+  const loading = state.caseDetailLoading === incident.id;
+  const mutationMessage = state.caseMutationError
+    ? `<div class="caseMessage error" role="alert">${esc(state.caseMutationError)}</div>` : "";
   els.incidentDetail.innerHTML = `
     <div class="incidentHero ${esc(incident.tone)}">
       <span>${esc(incident.id)}</span>
@@ -1725,16 +1797,72 @@ function renderIncidentDetail(incident) {
       ${incident.persisted ? `<section>
         <h3>Case Lifecycle</h3>
         <dl class="caseLifecycle">
-          <dt>Owner</dt><dd>${esc(evidenceValue(incident.owner, "Unassigned"))}</dd>
-          <dt>Status</dt><dd>${esc(evidenceValue(incident.caseStatus, "Open"))}</dd>
-          <dt>SLA due</dt><dd>${esc(evidenceValue(incident.slaDue, "Not set"))}</dd>
+          <dt>Owner</dt><dd>${esc(evidenceValue(record.owner || incident.owner, "Unassigned"))}</dd>
+          <dt>Status</dt><dd>${esc(evidenceValue(record.status || incident.caseStatus, "Open"))}</dd>
+          <dt>SLA due</dt><dd>${esc(evidenceValue(record.sla_due || incident.slaDue, "Not set"))}</dd>
           <dt>Verdict</dt><dd>${esc(evidenceValue(incident.latestVerdict, "Not recorded"))}</dd>
-          <dt>Containment</dt><dd>${esc(evidenceValue(incident.containment, "Not recorded"))}</dd>
-          <dt>Closure reason</dt><dd>${esc(evidenceValue(incident.closureReason, "Not recorded"))}</dd>
-          <dt>Notes</dt><dd>${esc(evidenceValue(incident.caseNotes, "Not recorded"))}</dd>
+          <dt>Revision</dt><dd>${fmt.format(number(record.revision || incident.revision))}</dd>
+          <dt>Resolution</dt><dd>${esc(evidenceValue(record.resolution, "Not recorded"))}</dd>
+          <dt>Closure reason</dt><dd>${esc(evidenceValue(record.closure_reason || incident.closureReason, "Not recorded"))}</dd>
         </dl>
       </section>` : ""}
     </div>
+    ${incident.persisted ? `
+      ${loading ? '<div class="caseMessage">Loading durable case workspace...</div>' : ""}
+      ${mutationMessage}
+      <div class="caseWorkspace" data-case-id="${esc(incident.id)}" data-case-revision="${esc(record.revision || incident.revision)}">
+        <section class="caseWorkspaceSection">
+          <div class="caseSectionHead"><h3>Assignment and Status</h3><span>Every write checks revision ${fmt.format(number(record.revision || incident.revision))}</span></div>
+          <div class="caseFormGrid">
+            <form data-case-action="assign">
+              <label>Owner<input name="owner" required maxlength="120" value="${esc(record.owner || incident.owner || "")}" placeholder="SOC analyst or team"></label>
+              <label>SLA due<input name="sla_due" maxlength="64" value="${esc(record.sla_due || incident.slaDue || "")}" placeholder="ISO-8601 timestamp"></label>
+              <button type="submit" ${state.caseMutationBusy ? "disabled" : ""}>Save assignment</button>
+            </form>
+            <form data-case-action="status">
+              <label>Status<select name="status" required>
+                ${["open", "triage", "investigating", "containment"].map(value => `<option value="${value}" ${value === record.status ? "selected" : ""}>${value}</option>`).join("")}
+              </select></label>
+              <label>Transition reason<input name="reason" required maxlength="1000" placeholder="Why this status is changing"></label>
+              <button type="submit" ${state.caseMutationBusy ? "disabled" : ""}>Update status</button>
+            </form>
+          </div>
+        </section>
+        <section class="caseWorkspaceSection">
+          <div class="caseSectionHead"><h3>Evidence and Notes</h3><span>${fmt.format(evidenceRows.length)} evidence item(s) loaded</span></div>
+          <form class="caseWideForm" data-case-action="evidence">
+            <label>Type<select name="evidence_type"><option>event</option><option>provider</option><option>analyst</option><option>artifact</option><option>query</option><option>report</option></select></label>
+            <label>Source<input name="source" required maxlength="120" placeholder="Wazuh, Defender, CYFIRMA"></label>
+            <label>Source reference<input name="source_ref" required maxlength="500" placeholder="event ID, incident ID, or URL"></label>
+            <label>Title<input name="title" required maxlength="200" placeholder="Evidence title"></label>
+            <label class="caseFieldWide">Summary<textarea name="summary" maxlength="4000" rows="2" placeholder="Observed facts only"></textarea></label>
+            <button type="submit" ${state.caseMutationBusy ? "disabled" : ""}>Add evidence</button>
+          </form>
+          <form class="caseInlineForm" data-case-action="note">
+            <label>Analyst note<textarea name="body" required maxlength="4000" rows="2" placeholder="Decision, hypothesis, or handoff note"></textarea></label>
+            <button type="submit" ${state.caseMutationBusy ? "disabled" : ""}>Add note</button>
+          </form>
+          <div class="caseEvidenceList">
+            ${evidenceRows.map(item => `<article><div><strong>${esc(item.title)}</strong><small>${esc(item.evidence_type)} | ${esc(item.source)} | ${esc(item.observed_at)}</small></div><span>${esc(item.source_ref)}</span><p>${esc(item.summary || "No summary")}</p></article>`).join("") || '<div class="emptyState">No durable evidence attached yet.</div>'}
+          </div>
+        </section>
+        <section class="caseWorkspaceSection">
+          <div class="caseSectionHead"><h3>Containment and Resolution</h3><span>Actions are retained in the audit trail</span></div>
+          <div class="caseFormGrid">
+            <form data-case-action="containment">
+              <label>Containment action<textarea name="action" required maxlength="4000" rows="2" placeholder="Blocked IP, isolated endpoint, disabled account"></textarea></label>
+              <label>Result<input name="result" maxlength="2000" placeholder="Succeeded, failed, pending approval"></label>
+              <button type="submit" ${state.caseMutationBusy || isClosed ? "disabled" : ""}>Record containment</button>
+            </form>
+            ${isClosed || isResolved ? `<form data-case-action="reopen"><label>Reopen reason<textarea name="reason" required maxlength="2000" rows="2"></textarea></label><button type="submit" ${state.caseMutationBusy ? "disabled" : ""}>Reopen case</button></form>` : `<form data-case-action="resolve"><label>Resolution<textarea name="resolution" required maxlength="4000" rows="2" placeholder="Root cause and remediation"></textarea></label><button type="submit" ${state.caseMutationBusy ? "disabled" : ""}>Resolve case</button></form>`}
+            ${!isClosed ? `<form data-case-action="close"><label>Closure reason<textarea name="closure_reason" required maxlength="2000" rows="2" placeholder="Validated closure rationale"></textarea></label><button class="dangerButton" type="submit" ${state.caseMutationBusy ? "disabled" : ""}>Close case</button></form>` : ""}
+          </div>
+        </section>
+        <section class="caseWorkspaceSection">
+          <div class="caseSectionHead"><h3>Audit Trail</h3><span>Newest first</span></div>
+          <div class="caseAuditList">${auditRows.map(item => `<div><time>${esc(item.created_at)}</time><strong>${esc(item.action)}</strong><span>${esc(item.actor || "system")} | revision ${fmt.format(number(item.revision))}</span></div>`).join("") || '<div class="emptyState">Audit detail is loading.</div>'}</div>
+        </section>
+      </div>` : ""}
     <div class="incidentActions">
       ${incident.persisted ? '<span class="evidenceChip">Persistent case</span>' : `<button type="button" data-save-incident="${esc(incident.id)}">Save as case</button>`}
       <button type="button" data-tool-name="blueteam_investigate_ip" data-pivot-ip="${esc(incident.source)}">Investigate IP</button>
@@ -1747,41 +1875,11 @@ function renderIncidentDetail(incident) {
 
 function renderIncidentBoard(data) {
   if (!els.incidentBoard) return;
-  const persistent = (state.persistentCases || []).map((item) => {
-    const verdict = item.latest_verdict?.verdict || "stored";
-    const verdictStyle = {
-      true_positive: ["Confirmed", "critical", 100],
-      suspicious: ["Suspicious", "high", 75],
-      false_positive: ["False positive", "low", 10],
-      clean: ["Clean", "low", 5],
-      unknown: ["Needs review", "medium", 40],
-      stored: ["Stored", "low", 0],
-    }[verdict] || ["Stored", "low", 0];
-    return {
-      id: item.case_id,
-      title: item.title || "Stored SOC case",
-      source: (item.srcips || [])[0] || "-",
-      target: "case evidence",
-      city: "stored investigation",
-      score: verdictStyle[2],
-      severity: verdictStyle[0],
-      tone: verdictStyle[1],
-      hits: (item.iocs || []).length,
-      rules: [],
-      layers: ["Persistent case store"],
-      sensitivePaths: item.latest_verdict?.notes ? [item.latest_verdict.notes] : [],
-      owner: item.owner,
-      slaDue: item.sla_due,
-      caseStatus: item.status,
-      latestVerdict: item.latest_verdict?.verdict,
-      containment: item.containment,
-      closureReason: item.closure_reason,
-      caseNotes: item.notes,
-      persisted: true,
-    };
-  });
+  const persistent = (state.persistentCases || []).map((item) =>
+    persistentCaseIncident(state.caseDetails[item.case_id] || item));
   const storedSources = new Set(persistent.map(item => item.source).filter(value => value && value !== "-"));
-  const incidents = [...persistent, ...buildIncidents(data).filter(item => !storedSources.has(item.source))];
+  const liveCandidates = state.casePagination.offset === 0 ? buildIncidents(data).filter(item => !storedSources.has(item.source)) : [];
+  const incidents = [...persistent, ...liveCandidates];
   state.incidents = incidents;
   if (state.selectedIncident >= incidents.length) state.selectedIncident = 0;
   els.incidentBoard.innerHTML = incidents.map((incident, index) => `
@@ -1797,18 +1895,89 @@ function renderIncidentBoard(data) {
       </div>
     </button>
   `).join("") || '<div class="emptyState">No incident candidates built from current telemetry.</div>';
+  if (els.incidentPager) {
+    const page = Math.floor(number(state.casePagination.offset) / Math.max(1, number(state.casePagination.limit))) + 1;
+    const pages = Math.max(1, Math.ceil(number(state.casePagination.total) / Math.max(1, number(state.casePagination.limit))));
+    els.incidentPager.innerHTML = `<button type="button" data-case-page="previous" ${state.casePagination.offset <= 0 ? "disabled" : ""}>Previous</button><span>Persistent cases ${fmt.format(number(state.casePagination.total))} · page ${page} / ${pages}</span><button type="button" data-case-page="next" ${state.casePagination.next_offset == null ? "disabled" : ""}>Next</button>`;
+  }
   renderIncidentDetail(incidents[state.selectedIncident]);
 }
 
-async function loadPersistentCases() {
+async function loadPersistentCases(offset = state.casePagination.offset) {
+  const windowPayload = currentWindowPayload();
+  const windowKey = JSON.stringify(windowPayload);
+  if (state.caseWindow !== windowKey) {
+    state.caseWindow = windowKey;
+    offset = 0;
+  }
   try {
-    const result = await postJson("/api/incidents/list", currentWindowPayload());
+    const result = await postJson("/api/incidents/list", {...windowPayload, offset, limit: state.casePagination.limit});
     state.persistentCases = result.ok ? result.cases || [] : [];
+    state.casePagination = result.ok ? {...state.casePagination, ...(result.pagination || {}), offset} : {...state.casePagination, offset};
   } catch (_) {
     state.persistentCases = [];
   }
-  renderIncidentBoard(state.overview || {});
-  renderL1Queue(state.overview || {});
+  if (state.view === "incidents") renderIncidentBoard(state.overview || {});
+  if (state.view === "l1") renderL1Queue(state.overview || {});
+  const selected = state.incidents[state.selectedIncident];
+  if (state.view === "incidents" && selected?.persisted && !state.caseDetails[selected.id]) {
+    void loadCaseDetail(selected);
+  }
+}
+
+async function loadCaseDetail(incident, force = false) {
+  if (!incident?.persisted || (!force && state.caseDetails[incident.id]) || state.caseDetailLoading === incident.id) return;
+  state.caseDetailLoading = incident.id;
+  state.caseMutationError = "";
+  renderIncidentDetail(incident);
+  try {
+    const result = await postJson("/api/incidents/get", {case_id: incident.id});
+    if (!result.ok || !result.case) throw new Error(result.error || "Case detail unavailable");
+    state.caseDetails[incident.id] = result.case;
+    state.persistentCases = state.persistentCases.map(item => item.case_id === incident.id ? {...item, ...result.case} : item);
+  } catch (error) {
+    state.caseMutationError = error.message;
+  } finally {
+    state.caseDetailLoading = "";
+    if (state.view === "incidents") renderIncidentBoard(state.overview || {});
+  }
+}
+
+async function mutateIncidentCase(form) {
+  const incident = state.incidents[state.selectedIncident];
+  if (!incident?.persisted || state.caseMutationBusy) return;
+  const record = state.caseDetails[incident.id] || incident.caseRecord || incident;
+  const action = form.dataset.caseAction;
+  const values = Object.fromEntries(new FormData(form).entries());
+  const payload = {action, case_id: incident.id, expected_revision: number(record.revision), ...values};
+  if (action === "evidence") {
+    payload.payload = {};
+    payload.provenance = {entry_point: "incident_workspace", capture_mode: "analyst_supplied"};
+    payload.entities = incident.source && incident.source !== "-"
+      ? [{type: "source_ip", value: incident.source}] : [];
+    payload.idempotency_key = globalThis.crypto?.randomUUID?.() || `dashboard-${Date.now()}`;
+  }
+  state.caseMutationBusy = true;
+  state.caseMutationError = "";
+  renderIncidentDetail({...incident, caseRecord: record});
+  try {
+    const result = await postJson("/api/incidents/action", payload);
+    if (!result.ok || !result.case) throw new Error(result.error || "Case update failed");
+    state.caseDetails[incident.id] = result.case;
+    state.persistentCases = state.persistentCases.map(item => item.case_id === incident.id ? {...item, ...result.case} : item);
+    form.reset();
+  } catch (error) {
+    if (error.payload?.error === "revision_conflict") {
+      await loadCaseDetail(incident, true);
+      state.caseMutationError = `This case changed at revision ${error.payload.current_revision}. Latest data has been reloaded.`;
+    } else {
+      state.caseMutationError = error.message;
+    }
+  } finally {
+    state.caseMutationBusy = false;
+    if (state.view === "incidents") renderIncidentBoard(state.overview || {});
+    void loadPersistentCases(state.casePagination.offset);
+  }
 }
 
 async function saveIncidentCase(incident, button) {
@@ -1820,6 +1989,15 @@ async function saveIncidentCase(incident, button) {
       title: incident.title,
       srcips: [incident.source].filter(value => value && value !== "-"),
       notes: `Dashboard candidate ${incident.id}; target ${incident.target}; severity ${incident.severity}; rules ${(incident.rules || []).join(", ")}`,
+      initial_evidence: [{
+        evidence_type: "event", title: incident.title,
+        summary: `Observed ${fmt.format(number(incident.hits))} matching events; target ${incident.target}; rules ${(incident.rules || []).join(", ") || "not supplied"}.`,
+        source: "wazuh_dashboard_snapshot", source_ref: incident.id,
+        observed_at: state.overview?.generated_at || null,
+        payload: {rules: incident.rules || [], source_ip: incident.source, target: incident.target, severity: incident.severity},
+        provenance: {window: state.overview?.requested_range || els.range?.value || "24h", capture_mode: "bounded_dashboard_aggregation"},
+        idempotency_key: `dashboard:${incident.id}`,
+      }],
     });
     if (!result.ok) throw new Error(result.error || "Case could not be saved");
     await loadPersistentCases();
@@ -2541,7 +2719,7 @@ async function loadCrowdSecIntel(silent = true, live = false) {
   };
   (state.overview.source_ips || []).slice(0, 14).forEach((row, index) => addCandidate(row.ip, "Wazuh observed", 100 - index));
   (window.SocAutomation?.report?.findings || []).slice(0, 12).forEach((row, index) => addCandidate(row.indicator, "Automation finding", 90 - index));
-  (state.overview.crowdsec_watchlist_ips || []).slice(0, 8).forEach((ip, index) => addCandidate(ip, "Watchlist", 80 - index));
+  (state.overview.crowdsec_watchlist_ips || []).slice(0, 8).forEach((ip, index) => addCandidate(ip, "Manual watchlist", 80 - index));
   state.crowdSecLoading = true;
   const automationByIndicator = new Map((window.SocAutomation?.report?.findings || []).map((row) => [row.indicator, row]));
   let historicalByIndicator = new Map();
@@ -2837,7 +3015,12 @@ function renderSettings() {
   const automationStore = s.storage?.automation || {};
   const pipeline = s.pipeline || {};
   const backfill = pipeline.rollup?.backfill || {};
+  const fortiBackfill = pipeline.rollup?.forti_security_backfill || {};
   const rollupGaps = pipeline.rollup?.gaps || {};
+  const telemetry = state.overview?.telemetry_contract || {};
+  const external = s.external_intelligence || {};
+  const feed = external.cyfirma_feed || {};
+  const feedCursor = (feed.cursors || []).map(row => `${row.scope}: next ${fmt.format(number(row.next_offset))} (${row.status || "unknown"})`).join(" | ") || "not started";
   const backfillEta = number(backfill.estimated_completion_seconds) > 0
     ? `${Math.max(1, Math.ceil(number(backfill.estimated_completion_seconds) / 3600))}h ETA`
     : (backfill.complete ? "complete" : "calculating ETA");
@@ -2850,7 +3033,7 @@ function renderSettings() {
     <dt>AI Analyst</dt><dd>${esc(s.ai_agent?.mode || "rules-only")} | auto ${s.ai_agent?.auto_analyze ? "enabled" : "disabled"}</dd>
     <dt>AI Model</dt><dd>${esc(s.ai_agent?.model || "not configured")}</dd>
     <dt>AI Provider</dt><dd>${esc(s.ai_agent?.provider_base_url || "not configured")}</dd>
-    <dt>Tools</dt><dd>${fmt.format(number(s.tools?.total))} total, ${fmt.format(number(s.tools?.gensecai))} GenSecAI, ${fmt.format(number(s.tools?.infokom))} INFOKOM | ${fmt.format(number(s.tools?.dashboard))} direct dashboard, ${fmt.format(number(s.tools?.workflow))} menu workflows, ${fmt.format(number(s.tools?.approval_required))} approval required</dd>
+    <dt>Tools</dt><dd>${fmt.format(number(s.tools?.total))} total, ${fmt.format(number(s.tools?.gensecai))} GenSecAI, ${fmt.format(number(s.tools?.infokom))} INFOKOM | ${fmt.format(number(s.tools?.automatic))} automatic, ${fmt.format(number(s.tools?.guided))} guided, ${fmt.format(number(s.tools?.on_demand))} on-demand, ${fmt.format(number(s.tools?.approval_required))} approval required</dd>
   `);
   setHtml("#storageList", `
     <dt>Docker data-root</dt><dd>${esc(s.storage?.docker_data_root)}</dd>
@@ -2864,12 +3047,59 @@ function renderSettings() {
     <dt>Cache snapshots</dt><dd>${fmt.format(number(cache.overview_snapshots))} overview, ${fmt.format(number(cache.api_snapshots))} API | ${fmtBytes(cache.db_bytes)}</dd>
     <dt>SOC history database</dt><dd>${esc(s.storage?.automation_db || "-")}</dd>
     <dt>Historical snapshots</dt><dd>${fmt.format(number(automationStore.report_summaries))} summaries, ${fmt.format(number(automationStore.reports))} reports, ${fmt.format(number(automationStore.ai_runs))} AI runs | ${fmtBytes(automationStore.db_bytes)}</dd>
-    <dt>CYFIRMA ledger</dt><dd>${fmt.format(number(automationStore.cyfirma_observations))} daily observations, ${fmt.format(number(automationStore.cyfirma_feed_runs))} feed runs</dd>
+    <dt>CYFIRMA ledger</dt><dd>${fmt.format(number(automationStore.cyfirma_observations))} daily observations, ${fmt.format(number(automationStore.cyfirma_feed_runs))} feed runs, ${fmt.format(number(automationStore.cyfirma_feed_cursor))} cursors</dd>
+    <dt>CYFIRMA feed sweep</dt><dd>${esc(feedCursor)}</dd>
     <dt>Prewarm</dt><dd>${s.storage?.prewarm_enabled ? "enabled" : "disabled"} | ${(s.storage?.prewarm_ranges || []).join(", ")} | TTL ${fmt.format(number(s.storage?.overview_cache_ttl_seconds))}s</dd>
     <dt>IOC stream</dt><dd>${pipeline.enabled ? "enabled" : "disabled"} | ${esc(pipeline.scan_status || "unknown")} | ${fmt.format(number(pipeline.checkpoint_events_scanned))} checkpoint events | ${fmt.format(number(pipeline.queued_indicators))} unique indicators | lag ${fmt.format(number(pipeline.lag_seconds))}s</dd>
     <dt>Detection rollup</dt><dd>${pipeline.rollup?.enabled ? "enabled" : "disabled"} | ${fmt.format(number(pipeline.rollup?.events))} events in ${fmt.format(number(pipeline.rollup?.buckets))} five-minute buckets | ${fmt.format(number(pipeline.rollup?.retention_days))} day retention</dd>
+    <dt>Attack taxonomy</dt><dd>${fmt.format(number(pipeline.rollup?.taxonomy_materialization?.completed_buckets))} / ${fmt.format(number(pipeline.rollup?.taxonomy_materialization?.total_buckets))} historical buckets classified locally | ${fmt.format(number(pipeline.rollup?.taxonomy_materialization?.pending_buckets))} pending</dd>
     <dt>Historical backfill</dt><dd>${backfill.enabled ? (backfill.complete ? "complete" : esc(backfill.mode || "throttled")) : "disabled"} | ${fmt.format(number(rollupGaps.coverage_percent))}% coverage, ${fmt.format(number(rollupGaps.missing))} gaps | ${fmt.format(number(backfill.current_chunk_minutes))} min adaptive chunk, ${esc(backfillEta)} | ${fmt.format(number(backfill.chunks))} committed chunks ${backfill.error ? `| cooldown: ${esc(backfill.error)}` : `| last query ${fmt.format(number(backfill.last_query_took_ms))} ms`}</dd>
+    <dt>Forti security history</dt><dd>${fortiBackfill.enabled ? (fortiBackfill.complete ? "complete" : "waiting for primary rollup") : "disabled"} | ${fmt.format(number(fortiBackfill.chunks))} bounded chunks, ${fmt.format(number(fortiBackfill.events))} Forti events | ${esc(fortiBackfill.scope || "IPS and malware counters only")}${fortiBackfill.error ? ` | cooldown: ${esc(fortiBackfill.error)}` : (fortiBackfill.last_query_took_ms ? ` | last query ${fmt.format(number(fortiBackfill.last_query_took_ms))} ms` : "")}</dd>
     <dt>Historical scan</dt><dd>${pipeline.historical_scope_complete ? "complete" : "live stream protected; historical coverage progresses only while caught up"}</dd>
+  `);
+  const sourceRows = telemetry.sources || [];
+  const readiness = telemetry.summary || {};
+  const defender = external.defender_xdr || {};
+  const entityGraph = defender.entity_graph || defender.correlations?.graph || {};
+  const research = external.cyfirma_research || {};
+  const taxii = external.cyfirma_taxii || {};
+  const orgVulnerability = external.cyfirma_org_vulnerability || {};
+  const collectorProgress = (collector) => {
+    const detail = collector.detail || {};
+    const cursor = collector.cursor || {};
+    if (!collector.enabled) return "disabled";
+    if (!collector.configured) return "configuration required";
+    const pages = number(detail.pages);
+    const loaded = number(detail.loaded);
+    const state = collector.status || cursor.status || "not started";
+    const next = cursor.next ? "cursor saved" : (detail.pagination_complete ? "sweep complete" : "waiting for first collection");
+    const freshness = collector.freshness || {};
+    const age = freshness.age_seconds === null || freshness.age_seconds === undefined ? "no stored observation" : evidenceAge(freshness.age_seconds);
+    return `${state} | ${pages ? `${pages} page${pages === 1 ? "" : "s"}, ` : ""}${loaded} stored | ${next} | ${age}`;
+  };
+  const renderTelemetrySource = (row) => {
+    const coverage = Object.entries(row.field_coverage || {})
+      .map(([field, value]) => `${field} ${Math.round(number(value) * 100)}%`).join(" · ");
+    const undercovered = row.undercovered_fields || [];
+    return `<article class="telemetrySource ${esc(row.status || "not_observed")}" data-source="${esc(row.key || "unknown")}">
+      <div><strong>${esc(row.label)}</strong><span>${esc((row.status || "not_observed").replaceAll("_", " "))}</span></div>
+      <b>${fmt.format(number(row.observed_events))}</b>
+      <small>${esc(row.status_reason || "Readiness has not been evaluated.")}</small>
+      <small>${esc((row.detection_families || []).join(" · ") || "No family mapping")}</small>
+      <details><summary>Field coverage and freshness</summary>
+        <p><b>Available:</b> ${esc((row.available_fields || []).join(", ") || "none")}</p>
+        <p><b>Missing:</b> ${esc((row.missing_fields || []).join(", ") || "none")}</p>
+        <p><b>Under-covered:</b> ${esc(undercovered.join(", ") || "none")}</p>
+        <p><b>Coverage:</b> ${esc(coverage || "not measured")} · minimum ${Math.round(number(row.minimum_field_coverage) * 100)}%</p>
+        <p><b>Last seen:</b> ${esc(row.last_seen || "not established")}${row.age_seconds == null ? "" : ` · ${esc(evidenceAge(row.age_seconds))}`}</p>
+        <p>${esc(row.field_profile || "")}</p>
+      </details>
+    </article>`;
+  };
+  setHtml("#telemetryReadiness", `
+    <div class="telemetrySummary"><strong>${fmt.format(number(readiness.ready_sources))} / ${fmt.format(number(readiness.expected_sources))}</strong><span>sources ready for field-level detection</span><small>${fmt.format(number(readiness.observed_sources))} observed · ${fmt.format(number(readiness.observed_incomplete_sources))} incomplete · ${fmt.format(number(readiness.degraded_sources))} degraded · ${fmt.format(number(readiness.stale_sources))} stale. ${esc(telemetry.note || "Load a dashboard snapshot to inspect local telemetry readiness.")}</small></div>
+    <div class="telemetrySourceGrid">${sourceRows.map(renderTelemetrySource).join("") || '<div class="emptyState">Telemetry contract loads with the selected dashboard window.</div>'}</div>
+    <div class="telemetryExternal"><article><strong>CYFIRMA research</strong><span>${research.enabled ? esc(research.status || "not started") : "disabled"}</span><b>${fmt.format(number(research.items))}</b><small>Stored separately from STIX IOC feeds</small></article><article><strong>CYFIRMA TAXII</strong><span>${esc(collectorProgress(taxii))}</span><b>${taxii.configured ? "checkpointed collection" : "configuration required"}</b><small>${esc(taxii.collection || "Collection URL not configured")} · valid until ${esc(taxii.freshness?.earliest_valid_until || "not reported")}</small></article><article><strong>CYFIRMA Org CVE</strong><span>${esc(collectorProgress(orgVulnerability))}</span><b>${orgVulnerability.configured ? "checkpointed collection" : "configuration required"}</b><small>Bounded Vulnerability V2 pagination · valid until ${esc(orgVulnerability.freshness?.earliest_valid_until || "not reported")}</small></article><article><strong>Microsoft Defender XDR</strong><span>${defender.enabled ? esc(defender.status || "not started") : "disabled"}</span><b>${fmt.format(number(defender.observations))}</b><small>${defender.configured ? `${fmt.format(number(entityGraph.entities))} canonical entities · ${fmt.format(number(entityGraph.clusters))} correlated clusters · graph ${fmt.format(number(entityGraph.latest_batch?.stored))} stored / ${fmt.format(number(entityGraph.latest_batch?.queued))} queued · ${fmt.format(number(entityGraph.queue?.pending))} pending${number(entityGraph.latest_batch?.dropped) ? ` · ${fmt.format(number(entityGraph.latest_batch?.dropped))} dropped in last batch` : ""}${number(entityGraph.batch_history?.dropped) ? ` · ${fmt.format(number(entityGraph.batch_history.dropped))} historical candidates unrepresented` : ""}` : "requires separate app permission"}</small></article></div>
   `);
 }
 
@@ -3303,16 +3533,20 @@ function renderNetworkIdentityEvidence(data) {
   if (!root) return;
   const evidence = data.operational_evidence || {};
   const network = evidence.network?.events || [];
+  const networkProfiles = evidence.network?.profiles || [];
   const identity = evidence.identity?.events || [];
   const networkRows = network.map((row) => `
-    <tr><td>${esc(evidenceValue(row.timestamp, "-"))}</td><td>${esc(evidenceValue(row.source, "-"))}</td><td>${esc(evidenceValue(row.destination, "-"))}:${esc(evidenceValue(row.port, "-"))}</td><td>${esc(evidenceValue(row.application, "-"))}</td><td>${esc(evidenceValue(row.policy, "-"))}</td><td>${esc(evidenceValue(row.direction, row.action || "-"))}</td></tr>
+    <tr><td>${esc(evidenceValue(row.timestamp, "-"))}</td><td>${esc(evidenceValue(row.source, "-"))}</td><td>${esc(evidenceValue(row.destination, "-"))}:${esc(evidenceValue(row.port, "-"))}</td><td>${esc(evidenceValue(row.application, "-"))}</td><td>${esc(evidenceValue(row.policy, "-"))}</td><td>${esc(evidenceValue(row.action, "-"))}</td><td>${esc(evidenceValue(row.direction, "-"))}</td></tr>
   `).join("");
   const identityRows = identity.map((row) => `
     <tr><td>${esc(evidenceValue(row.timestamp, "-"))}</td><td>${esc(evidenceValue(row.user, "-"))}</td><td>${esc(evidenceValue(row.mailbox, "-"))}</td><td>${esc(evidenceValue(row.operation, "-"))}</td><td>${esc(evidenceValue(row.privilege, "-"))}</td><td>${esc(evidenceValue(row.session, row.authentication || "-"))}</td></tr>
   `).join("");
+  const profileRows = networkProfiles.map((row) => `
+    <div class="evidenceMetric"><span>${esc(evidenceValue(row.name, "FortiGate security signal"))}</span><strong>${fmt.format(number(row.count))}</strong><small>${row.historical ? "materialized historical count" : "selected-window count"}</small></div>
+  `).join("");
   root.innerHTML = `
     <div class="evidenceSplit">
-      <section><div class="evidenceSubhead"><h3>Network flow</h3><span>${network.length} bounded samples</span></div><div class="evidenceTableWrap"><table class="evidenceTable"><thead><tr><th>Time</th><th>Source</th><th>Destination</th><th>App</th><th>Policy</th><th>Direction</th></tr></thead><tbody>${networkRows || '<tr><td colspan="6">No network fields were observed in this window.</td></tr>'}</tbody></table></div></section>
+      <section><div class="evidenceSubhead"><h3>Network flow</h3><span>${network.length} bounded samples</span></div><div class="evidenceTableWrap"><table class="evidenceTable"><thead><tr><th>Time</th><th>Source</th><th>Destination</th><th>App</th><th>Policy</th><th>Action</th><th>Direction</th></tr></thead><tbody>${networkRows || '<tr><td colspan="7">Individual network samples are not retained for this historical rollup.</td></tr>'}</tbody></table></div>${profileRows ? `<div class="evidenceMetrics">${profileRows}</div>` : ''}</section>
       <section><div class="evidenceSubhead"><h3>Identity chain</h3><span>${identity.length} bounded samples</span></div><div class="evidenceTableWrap"><table class="evidenceTable"><thead><tr><th>Time</th><th>User</th><th>Mailbox</th><th>Operation</th><th>Privilege</th><th>Session / auth</th></tr></thead><tbody>${identityRows || '<tr><td colspan="6">No identity fields were observed in this window.</td></tr>'}</tbody></table></div></section>
     </div>
   `;
@@ -3395,8 +3629,8 @@ function renderAssetContextEvidence(data) {
   const coverage = agents.context_coverage || {};
   root.innerHTML = `
     <div class="evidenceMetrics evidenceMetricsCompact">
-      <div class="evidenceMetric"><span>CMDB</span><strong>${status.available ? "Loaded" : "Not loaded"}</strong><small>${esc(evidenceValue(status.file, "No file"))}${status.error ? ` · ${esc(status.error)}` : ""}</small></div>
-      <div class="evidenceMetric"><span>CMDB assets</span><strong>${fmt.format(number(status.assets))}</strong><small>${status.cached ? "cached by file version" : "fresh file read"}</small></div>
+      <div class="evidenceMetric"><span>CMDB</span><strong>${number(status.authoritative_assets) > 0 ? "Verified identity" : status.available ? "Template only" : "Not loaded"}</strong><small>${esc(evidenceValue(status.file, "No file"))}${status.error ? ` · ${esc(status.error)}` : ""}</small></div>
+      <div class="evidenceMetric"><span>Authoritative assets</span><strong>${fmt.format(number(status.authoritative_assets))} / ${fmt.format(number(status.assets))}</strong><small>${fmt.format(number(status.sample_assets))} sample and ${fmt.format(number(status.unverified_assets))} unverified ignored</small></div>
       <div class="evidenceMetric"><span>Matched agents</span><strong>${fmt.format(number(status.matched_agents))}</strong><small>${fmt.format(number(status.unmatched_agents))} without CMDB match</small></div>
       <div class="evidenceMetric"><span>CMDB only</span><strong>${fmt.format(number(status.unmanaged_assets))}</strong><small>not currently matched to a Wazuh agent</small></div>
     </div>
@@ -3438,42 +3672,72 @@ function renderDataQuality(data) {
   if (note) note.innerHTML = `<span class="statusMark ${tone}">${esc(status)}</span> ${esc(quality.note || funnel.ai_note || "Data is served from the selected window and persisted summaries.")}`;
 }
 
+function renderView(view, data) {
+  if (!data) return;
+  if (view === "command") {
+    renderPosture(data);
+    renderLanes(data);
+    renderMetrics(data);
+    renderInsights(data);
+    renderSeverity(data);
+    renderHourlySpark(data);
+    renderAttackTimeline(data);
+    renderDataQuality(data);
+    renderTelemetryEvidence(data);
+    return;
+  }
+  if (view === "workbench") {
+    renderSocWorkbench(data);
+    return;
+  }
+  if (view === "l1") {
+    renderL1Queue(data);
+    renderDecisions(data);
+    return;
+  }
+  if (view === "l2") {
+    renderCorrelation(data);
+    renderAiRecon(data);
+    renderInvestigationFlow(data);
+    renderNetworkIdentityEvidence(data);
+    renderCloudM365(data);
+    return;
+  }
+  if (view === "incidents") {
+    renderIncidentBoard(data);
+    return;
+  }
+  if (view === "l3") {
+    renderMitreEvidence(data);
+    renderDecoderEvidence(data);
+    renderProviderFreshness(data);
+    renderAttackMap(data);
+    renderSourceIps(data);
+    renderAttackPath(data);
+    renderCrowdSecIntel();
+    return;
+  }
+  if (view === "vuln") {
+    renderVulnerabilities(data);
+    renderCveEvidenceCoverage(data);
+    return;
+  }
+  if (view === "assets") {
+    renderAgents(data);
+    renderAssetContextEvidence(data);
+    renderDonut("#platformDonut", "#platformLegend", data.agents?.platforms || {});
+    return;
+  }
+  if (view === "settings") {
+    renderSettings();
+    renderDetectionLayers(data);
+    renderSocCoverage(data);
+  }
+}
+
 function renderOverview(data) {
   document.dispatchEvent(new CustomEvent("soc:overview", { detail: data }));
-  renderPosture(data);
-  renderLanes(data);
-  renderMetrics(data);
-  renderInsights(data);
-  renderSeverity(data);
-  renderHourlySpark(data);
-  renderAttackTimeline(data);
-  renderAttackMap(data);
-  renderDetectionLayers(data);
-  renderDataQuality(data);
-  renderTelemetryEvidence(data);
-  renderNetworkIdentityEvidence(data);
-  renderMitreEvidence(data);
-  renderDecoderEvidence(data);
-  renderProviderFreshness(data);
-  renderCloudM365(data);
-  renderSocCoverage(data);
-  renderAttackPath(data);
-  renderIncidentBoard(data);
-  renderSocWorkbench(data);
-  renderThreatTable("#overviewThreats", data.threats || []);
-  renderL1Queue(data);
-  renderSourceIps(data);
-  renderCorrelation(data);
-  renderAiRecon(data);
-  renderVulnerabilities(data);
-  renderCveEvidenceCoverage(data);
-  renderAgents(data);
-  renderAssetContextEvidence(data);
-  renderDonut("#platformDonut", "#platformLegend", data.agents?.platforms || {});
-  renderDecisions(data);
-  renderInvestigationFlow(data);
-  renderProviderIntel();
-  renderCrowdSecIntel();
+  renderView(state.view, data);
 }
 
 async function postJson(path, body = {}) {
@@ -3484,7 +3748,10 @@ async function postJson(path, body = {}) {
   });
   const data = await resp.json();
   if (!resp.ok) {
-    throw new Error(data.error || (data.errors || []).join(", ") || `${resp.status} ${resp.statusText}`);
+    const error = new Error(data.detail || data.error || (data.errors || []).join(", ") || `${resp.status} ${resp.statusText}`);
+    error.payload = data;
+    error.status = resp.status;
+    throw error;
   }
   return data;
 }
@@ -3526,8 +3793,8 @@ async function loadDashboard(force = false) {
       els.status.textContent = `Showing local snapshot | ${currentRangeLabel(clientSnapshot)} | refreshing telemetry...`;
     }
     if (force) windowPayload.force = true;
-    const settingsPromise = postJson("/api/settings").then(settings => { state.settings = settings; renderSettings(); });
-    const toolsPromise = postJson("/api/tools").then(toolsData => {
+    const settingsPromise = state.settings ? Promise.resolve() : postJson("/api/settings").then(settings => { state.settings = settings; renderSettings(); });
+    const toolsPromise = state.tools.length ? Promise.resolve() : postJson("/api/tools").then(toolsData => {
         state.tools = toolsData.tools || [];
         state.toolSummary = toolsData.summary || {};
         state.categories = toolsData.categories || {};
@@ -3542,7 +3809,7 @@ async function loadDashboard(force = false) {
     state.crowdSecLoading = false;
     state.crowdSecIntel = null;
     const errors = Object.keys(overview.errors || {});
-    const cache = overview.cache ? ` | cache ${overview.cache.status}${overview.cache.age_seconds ? ` ${overview.cache.age_seconds}s` : ""}` : "";
+    const cache = overview.cache ? ` | cache ${overview.cache.status}${overview.cache.age_seconds ? ` ${overview.cache.age_seconds}s` : ""}${overview.cache.refresh_error ? " | refresh failed; showing last valid snapshot" : ""}` : "";
     const toolTotal = number(overview.tools?.total) || state.tools.length;
     const materialization = overview.materialization?.status === "building" ? " | exact snapshot building in background" : "";
     els.status.textContent = `Updated ${overview.generated_at || "now"} | ${currentRangeLabel(overview)} | ${fmt.format(toolTotal)} tools${cache}${materialization}${errors.length ? " | degraded: " + errors.join(", ") : ""}`;
@@ -3551,8 +3818,8 @@ async function loadDashboard(force = false) {
     els.sideMeta.textContent = `${fmt.format(number(overview.tools?.gensecai))} GenSecAI + ${fmt.format(number(overview.tools?.infokom))} INFOKOM tools`;
     renderOverview(overview);
     if (state.view === "vuln") void loadCveExposureGraph();
-    void loadPersistentCases();
-    if (["stale-refreshing", "building"].includes(overview.cache?.status) && !state.overviewRefreshTimer) {
+    if (["incidents", "l1"].includes(state.view)) void loadPersistentCases();
+    if (["stale-refreshing", "stale-error", "building"].includes(overview.cache?.status) && !state.overviewRefreshTimer) {
       state.overviewRefreshTimer = setTimeout(() => {
         state.overviewRefreshTimer = null;
         loadDashboard().catch(showLoadError);
@@ -3641,7 +3908,7 @@ async function scoreCve() {
   }
 }
 
-function setView(view) {
+function setView(view, { updateRoute = true } = {}) {
   if (!viewTitles[view]) return;
   state.view = view;
   document.querySelectorAll(".view").forEach((el) => el.classList.remove("active"));
@@ -3649,8 +3916,11 @@ function setView(view) {
   q(`#${view}View`)?.classList.add("active");
   q(`.nav button[data-view="${view}"]`)?.classList.add("active");
   els.title.textContent = viewTitles[view];
+  if (state.overview) renderView(view, state.overview);
   if (view === "vuln") void loadCveExposureGraph();
+  if (["incidents", "l1"].includes(view)) void loadPersistentCases();
   document.dispatchEvent(new CustomEvent("soc:view", { detail: { view } }));
+  if (updateRoute) writeRoute();
 }
 
 function showLoadError(err) {
@@ -3691,6 +3961,19 @@ document.addEventListener("click", async (event) => {
   if (incidentTrigger) {
     state.selectedIncident = number(incidentTrigger.dataset.incidentIndex);
     renderIncidentBoard(state.overview || {});
+    const incident = state.incidents[state.selectedIncident];
+    if (incident?.persisted) void loadCaseDetail(incident);
+    return;
+  }
+  const casePage = event.target.closest("[data-case-page]");
+  if (casePage) {
+    const next = casePage.dataset.casePage === "next"
+      ? state.casePagination.next_offset
+      : Math.max(0, state.casePagination.offset - state.casePagination.limit);
+    if (next !== null) {
+      state.selectedIncident = 0;
+      void loadPersistentCases(next);
+    }
     return;
   }
   const saveIncident = event.target.closest("[data-save-incident]");
@@ -3706,6 +3989,7 @@ document.addEventListener("click", async (event) => {
     createL1Case.disabled = true;
     createL1Case.textContent = "Saving...";
     try {
+      const evidenceRef = row.event_id || `rule:${row.rule_id || "unknown"}:${row.timestamp || "unknown"}`;
       const result = await postJson("/api/incidents/create", {
         title: row.title || "L1 alert investigation",
         srcips: [row.source_ip].filter(Boolean),
@@ -3713,6 +3997,15 @@ document.addEventListener("click", async (event) => {
         owner: row.assignment === "unassigned" ? "" : row.assignment,
         sla_due: row.sla_due || (row.timestamp ? new Date(new Date(row.timestamp).getTime() + number(row.sla_minutes) * 60000).toISOString() : ""),
         status: "open",
+        initial_evidence: [{
+          evidence_type: "event", title: row.title || "L1 alert investigation",
+          summary: `Rule ${row.rule_id || "unknown"}; asset ${row.agent || "unknown"}; destination ${row.destination_ip || "unknown"}:${row.destination_port || "unknown"}.`,
+          source: "wazuh_l1_queue", source_ref: evidenceRef,
+          observed_at: row.timestamp || null,
+          payload: {rule_id: row.rule_id, source_ip: row.source_ip, destination_ip: row.destination_ip, destination_port: row.destination_port, asset: row.agent},
+          provenance: {window: state.overview?.requested_range || els.range?.value || "24h", capture_mode: "bounded_alert_queue"},
+          idempotency_key: `l1:${evidenceRef}`,
+        }],
       });
       if (!result.ok) throw new Error(result.error || "Case could not be saved");
       await loadPersistentCases();
@@ -3744,6 +4037,13 @@ document.addEventListener("click", async (event) => {
   const link = event.target.closest("[data-view-link]");
   if (!link) return;
   setView(link.dataset.viewLink);
+});
+
+document.addEventListener("submit", (event) => {
+  const form = event.target.closest?.("[data-case-action]");
+  if (!form) return;
+  event.preventDefault();
+  void mutateIncidentCase(form);
 });
 
 document.addEventListener("keydown", (event) => {
@@ -3780,12 +4080,22 @@ els.run?.addEventListener("click", runTool);
 els.refresh?.addEventListener("click", () => loadDashboard(true).catch(showLoadError));
 els.range?.addEventListener("change", () => {
   syncDateRangeVisibility();
+  writeRoute();
   loadDashboard().catch(showLoadError);
 });
-els.globalStart?.addEventListener("change", () => loadDashboard().catch(showLoadError));
-els.globalEnd?.addEventListener("change", () => loadDashboard().catch(showLoadError));
+els.globalStart?.addEventListener("change", () => {
+  writeRoute();
+  loadDashboard().catch(showLoadError);
+});
+els.globalEnd?.addEventListener("change", () => {
+  writeRoute();
+  loadDashboard().catch(showLoadError);
+});
 els.settingsForm?.addEventListener("submit", saveSettings);
-els.resetSettings?.addEventListener("click", () => loadDashboard().catch(showLoadError));
+els.resetSettings?.addEventListener("click", () => {
+  state.settings = null;
+  loadDashboard().catch(showLoadError);
+});
 els.testM365?.addEventListener("click", testM365);
 els.startM365?.addEventListener("click", startM365Feed);
 els.testIntel?.addEventListener("click", () => testThreatIntel(false, true));
@@ -3802,4 +4112,11 @@ document.addEventListener("soc:automation", () => {
   }
 });
 
+initDateRange();
+if (window.location.hash) {
+  applyRoute();
+} else {
+  writeRoute({ replace: true });
+}
+window.addEventListener("hashchange", () => applyRoute({ load: true }));
 loadDashboard().catch(showLoadError);

@@ -5,6 +5,8 @@ import time
 from datetime import datetime, timedelta, timezone
 
 from soc_analysis import IOC_FIELDS, explain_rule, observable_kind, public_indicator
+from detection_taxonomy import classify as classify_detection, telemetry_fields, telemetry_source
+import entity_resolver
 
 
 def stamp(value):
@@ -77,12 +79,21 @@ def rollup_dimensions(event):
         'application': (first('data.app', 'data.application', 'data.appcat', 'data.service'), None),
         'firewall_policy': (first('data.policyid', 'data.policy_id', 'data.policyname', 'data.rule_name'), None),
         'direction': (first('data.direction', 'data.flow_direction'), None),
+        'network_action': (first('data.action', 'data.event.action', 'data.status'), None),
+        'forti_type': (first('data.type'), None),
+        'forti_subtype': (first('data.subtype'), None),
         'severity': (str(rule.get('level')) if rule.get('level') is not None else None, None),
     }
     for dimension, (value, label) in scalar.items():
         if isinstance(value, (str, int, float)) and str(value).strip():
             text = str(value).strip()[:240]
             rows.append((dimension, text, str(label or text).strip()[:300]))
+    if "fortigate" in str(decoder.get('name') or '').lower():
+        profile = "/".join(str(value).strip().lower()[:80] for value in (
+            first('data.type') or 'unknown', first('data.subtype') or 'unknown',
+            first('data.action', 'data.event.action', 'data.status') or 'unknown',
+        ))
+        rows.append(('forti_profile', profile, profile))
     mitre = rule.get('mitre') if isinstance(rule.get('mitre'), dict) else {}
     technique_ids = mitre.get('id') or []
     if isinstance(technique_ids, str):
@@ -90,6 +101,22 @@ def rollup_dimensions(event):
     for technique in technique_ids[:12] if isinstance(technique_ids, list) else []:
         if str(technique).strip():
             rows.append(('mitre', str(technique).strip()[:64], str(technique).strip()[:64]))
+    # These are compact labels, not copies of the raw log. They allow the UI to
+    # show what telemetry can support without replaying an alert archive.
+    classification = classify_detection(event)
+    rows.append(('detection_family', classification['family'], classification['family']))
+    rows.append(('detection_confidence', classification['confidence'], classification['confidence']))
+    # A taxonomy mapping fills legitimate rule-tag gaps but never replaces an
+    # explicit Wazuh ATT&CK mapping.
+    explicit_mitre = {str(item).strip() for item in technique_ids if str(item).strip()} if isinstance(technique_ids, list) else set()
+    for technique in classification['mitre']:
+        if technique not in explicit_mitre:
+            rows.append(('mitre', technique, technique))
+    source = telemetry_source(event)
+    rows.append(('telemetry_source', source, source))
+    field_source, available_fields = telemetry_fields(event)
+    for field in available_fields:
+        rows.append(('telemetry_field', field_source + '|' + field, field))
     return rows
 
 
@@ -104,21 +131,65 @@ BACKFILL_FIELDS = {
     'identity': ('data.office365.UserId', 100), 'asset': ('agent.name', 50),
     'destination_port': ('data.dstport', 50), 'application': ('data.app', 50),
     'firewall_policy': ('data.policyid', 50), 'direction': ('data.direction', 20),
+    'network_action': ('data.action', 20), 'forti_type': ('data.type', 20),
+    'forti_subtype': ('data.subtype', 20),
     'mitre': ('rule.mitre.id', 50), 'severity': ('rule.level', 20),
+}
+
+# These filters run only in the dedicated Forti historical worker. They
+# deliberately cover high-signal FortiGate security events, not ordinary
+# accepted/closed traffic or policy/application-control volume.
+FORTI_SECURITY_FILTERS = {
+    'ips_blocked': {
+        'bool': {'filter': [
+            {'term': {'decoder.name': 'fortigate-firewall-v5'}},
+            {'term': {'data.subtype': 'ips'}},
+            {'terms': {'data.action': ['block', 'blocked', 'deny', 'denied', 'drop', 'dropped']}},
+        ]},
+    },
+    'ips_detected': {
+        'bool': {'filter': [
+            {'term': {'decoder.name': 'fortigate-firewall-v5'}},
+            {'term': {'data.subtype': 'ips'}},
+            {'terms': {'data.action': ['detect', 'detected', 'alert', 'monitor']}},
+        ]},
+    },
+    'malware': {
+        'bool': {'filter': [{'term': {'decoder.name': 'fortigate-firewall-v5'}}], 'should': [
+            {'terms': {'data.subtype': ['virus', 'antivirus']}},
+            {'match_phrase': {'rule.description': 'virus detected'}},
+        ], 'minimum_should_match': 1},
+    },
+}
+
+FORTI_SECURITY_LABELS = {
+    'ips_blocked': 'FortiGate IPS blocked',
+    'ips_detected': 'FortiGate IPS detected',
+    'malware': 'FortiGate malware signal',
 }
 
 # Keep this projection in sync with rollup_dimensions; never fetch full raw logs.
 ROLLUP_SOURCE_FIELDS = [
     '@timestamp', 'rule.id', 'rule.level', 'rule.description', 'rule.mitre.id',
-    'agent.id', 'agent.name', 'decoder.name',
+    'agent.id', 'agent.name', 'agent.ip', 'host.id', 'host.name', 'decoder.name',
     'data.srcip', 'data.src_ip', 'data.source.ip', 'data.office365.ClientIP',
     'data.dstip', 'data.dst_ip', 'data.destination.ip',
     'data.dstport', 'data.dst_port', 'data.destination.port',
     'data.office365.UserId', 'data.dstuser', 'data.srcuser',
-    'data.win.eventdata.targetUserName', 'data.user',
+    'data.win.eventdata.targetUserName', 'data.user', 'data.action', 'data.event.action', 'data.status',
+    'data.url', 'data.http.url', 'data.full_url', 'data.request',
     'data.app', 'data.application', 'data.appcat', 'data.service',
     'data.policyid', 'data.policy_id', 'data.policyname', 'data.rule_name',
-    'data.direction', 'data.flow_direction',
+    'data.direction', 'data.flow_direction', 'data.proto', 'data.protocol', 'data.network.protocol',
+    'data.type', 'data.subtype', 'data.attack', 'data.attackid', 'data.msg', 'data.logdesc',
+    'data.hostname', 'data.host', 'data.process.name', 'data.process', 'data.parent_process',
+    'data.hash', 'data.file_hash', 'data.win.eventdata.image', 'data.win.eventdata.parentImage',
+    'data.win.eventdata.hashes', 'data.office365.Workload', 'data.office365.Operation',
+    'data.office365.ObjectId', 'data.office365.SessionId', 'data.session', 'data.logon_id',
+    'data.audit.exe', 'data.exe', 'data.audit.command', 'data.command', 'data.cmd',
+    'data.audit.uid', 'data.uid',
+    'data.docker.container.id', 'data.docker.container.name', 'data.docker.image',
+    'data.container.id', 'data.container.name', 'data.container.image', 'data.container_name', 'data.image',
 ]
 
 
@@ -175,7 +246,11 @@ class Pipeline:
         self.last_live = time.time()
         self.last_rollup_cleanup = 0.0
         self.last_backfill = 0.0
+        self.last_forti_security_backfill = 0.0
+        self.last_taxonomy_materialization = 0.0
+        self.entity_queue_error = None
         with automation.db() as db:
+            entity_resolver.ensure_schema(db)
             db.execute('CREATE TABLE IF NOT EXISTS stream_state (id INTEGER PRIMARY KEY, start TEXT, checkpoint TEXT, scanned INTEGER DEFAULT 0)')
             if 'live_checkpoint' not in {r[1] for r in db.execute('PRAGMA table_info(stream_state)')}:
                 db.execute('ALTER TABLE stream_state ADD COLUMN live_checkpoint TEXT')
@@ -195,6 +270,9 @@ class Pipeline:
                 last_seen TEXT, label TEXT, PRIMARY KEY(bucket,dimension,value))''')
             db.execute('CREATE INDEX IF NOT EXISTS detection_rollups_dimension_time ON detection_rollups(dimension,bucket)')
             db.execute('CREATE INDEX IF NOT EXISTS detection_rollups_time ON detection_rollups(bucket)')
+            db.execute('''CREATE TABLE IF NOT EXISTS taxonomy_rollup_buckets (
+                bucket TEXT PRIMARY KEY, materialized_at REAL NOT NULL, source TEXT NOT NULL)''')
+            db.execute('CREATE INDEX IF NOT EXISTS taxonomy_rollup_buckets_time ON taxonomy_rollup_buckets(materialized_at)')
             db.execute('''CREATE TABLE IF NOT EXISTS scan_batches (
                 batch_key TEXT PRIMARY KEY, stream TEXT NOT NULL, window_start TEXT NOT NULL,
                 window_end TEXT NOT NULL, event_count INTEGER NOT NULL DEFAULT 0,
@@ -229,6 +307,13 @@ class Pipeline:
             }.items():
                 if name not in backfill_columns:
                     db.execute(f'ALTER TABLE rollup_backfill_state ADD COLUMN {name} {definition}')
+            # Forti security metrics have their own cursor. This keeps a new
+            # historical dimension from replaying the broad alert rollup.
+            db.execute('''CREATE TABLE IF NOT EXISTS forti_security_backfill_state (
+                id INTEGER PRIMARY KEY, cursor TEXT, target TEXT, completed INTEGER DEFAULT 0,
+                chunks INTEGER DEFAULT 0, events INTEGER DEFAULT 0, last_run REAL,
+                last_duration_ms INTEGER DEFAULT 0, last_query_took_ms INTEGER DEFAULT 0,
+                error TEXT, next_run REAL DEFAULT 0)''')
 
     def status(self):
         with self.automation.db() as db:
@@ -238,7 +323,13 @@ class Pipeline:
             backfill = db.execute('''SELECT cursor,target,completed,chunks,events,last_run,
                 last_duration_ms,last_query_took_ms,error,current_chunk_minutes,success_streak,
                 failures,next_run,mode FROM rollup_backfill_state WHERE id=1''').fetchone()
+            forti_backfill = db.execute('''SELECT cursor,target,completed,chunks,events,last_run,
+                last_duration_ms,last_query_took_ms,error,next_run
+                FROM forti_security_backfill_state WHERE id=1''').fetchone()
             committed_batches = int(db.execute('SELECT COUNT(*) FROM scan_batches').fetchone()[0] or 0)
+            taxonomy_done = int(db.execute('SELECT COUNT(*) FROM taxonomy_rollup_buckets').fetchone()[0] or 0)
+            taxonomy_total = int(db.execute("SELECT COUNT(DISTINCT bucket) FROM detection_rollups WHERE dimension='total'").fetchone()[0] or 0)
+            entity_graph = entity_resolver.status(db)
         checkpoint = row[1] if row else None
         lag_seconds = None
         if checkpoint:
@@ -270,6 +361,20 @@ class Pipeline:
             'estimated_cycles': estimated_cycles,
             'estimated_completion_seconds': estimated_cycles * interval if estimated_cycles is not None else None,
         }
+        forti_backfill_status = {
+            'enabled': self.automation.config().get('SOC_FORTI_SECURITY_BACKFILL_ENABLED', 'true') == 'true',
+            'cursor': forti_backfill[0] if forti_backfill else None,
+            'target': forti_backfill[1] if forti_backfill else None,
+            'complete': bool(forti_backfill[2]) if forti_backfill else False,
+            'chunks': int(forti_backfill[3] or 0) if forti_backfill else 0,
+            'events': int(forti_backfill[4] or 0) if forti_backfill else 0,
+            'last_run': forti_backfill[5] if forti_backfill else None,
+            'last_duration_ms': int(forti_backfill[6] or 0) if forti_backfill else 0,
+            'last_query_took_ms': int(forti_backfill[7] or 0) if forti_backfill else 0,
+            'error': forti_backfill[8] if forti_backfill else None,
+            'next_run': forti_backfill[9] if forti_backfill else None,
+            'scope': 'fortigate-firewall-v5 only; IPS blocked/detected and malware signals',
+        }
         return {'enabled': self.automation.config().get('SOC_STREAM_ENABLED') == 'true',
                 'active': self.active, 'error': self.error, 'started_at': row[0] if row else None,
                 'checkpoint': checkpoint, 'legacy_scanned_including_replay': row[2] if row else 0,
@@ -289,7 +394,12 @@ class Pipeline:
                            'bucket_minutes': 5,
                            'retention_days': int(self.automation.config().get('SOC_ROLLUP_RETENTION_DAYS', 180)),
                            'committed_batches': committed_batches,
-                           'gaps': gaps, 'backfill': backfill_status},
+                           'taxonomy_materialization': {'completed_buckets': taxonomy_done,
+                                                       'total_buckets': taxonomy_total,
+                                                       'pending_buckets': max(0, taxonomy_total - taxonomy_done)},
+                           'gaps': gaps, 'backfill': backfill_status,
+                           'forti_security_backfill': forti_backfill_status},
+                'entity_graph': {**entity_graph, 'drain_error': self.entity_queue_error},
                 'queued_indicators': total, 'due_indicators': pending,
                 'scope': 'wazuh-alerts-* only; initial 24h, 5-minute checkpoints, 2-minute ingest delay; periodic late-event replay; older logs require backfill'}
 
@@ -479,18 +589,132 @@ class Pipeline:
                      next_failures, time.time() + retry_delay))
             raise
 
+    def forti_security_backfill_once(self):
+        """Materialize bounded Forti IPS/malware counters for older rollups.
+
+        This deliberately does not use the generic rollup query, raw archives,
+        scrolls, or stored event documents. The worker owns only the
+        ``forti_security`` dimension and is scheduled after the main rollup is
+        caught up, so its replacement rows cannot race live ingestion.
+        """
+        config = self.automation.config()
+        if (config.get('SOC_ROLLUP_ENABLED', 'true') != 'true'
+                or config.get('SOC_FORTI_SECURITY_BACKFILL_ENABLED', 'true') != 'true'):
+            return False
+        now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        lookback_days = max(7, min(180, int(config.get('SOC_ROLLUP_BACKFILL_DAYS', 30))))
+        # The dedicated query touches one decoder and returns only three
+        # counters. It can safely use a larger fixed chunk than the generic
+        # rollup when the stream is caught up; a slow query gets a cooldown.
+        chunk_minutes = max(5, min(120, int(config.get('SOC_FORTI_SECURITY_BACKFILL_CHUNK_MINUTES', 120))))
+        interval = max(60, int(config.get('SOC_FORTI_SECURITY_BACKFILL_INTERVAL_SECONDS', 60)))
+        target = (now - timedelta(days=lookback_days)).replace(minute=0)
+        cursor = now - timedelta(minutes=2)
+        with self.automation.db() as db:
+            state = db.execute('''SELECT cursor,target,completed,chunks,events,next_run
+                FROM forti_security_backfill_state WHERE id=1''').fetchone()
+            if not state:
+                db.execute('''INSERT INTO forti_security_backfill_state
+                    (id,cursor,target,completed,next_run) VALUES (1,?,?,0,0)''',
+                           (stamp(cursor), stamp(target)))
+                chunks, events, next_run = 0, 0, 0.0
+            else:
+                cursor = datetime.fromisoformat(str(state[0]).replace('Z', '+00:00')) if state[0] else cursor
+                chunks, events, next_run = int(state[3] or 0), int(state[4] or 0), float(state[5] or 0)
+                # The configured window moves daily. Preserve the old cursor
+                # so only the newly requested older period is added.
+                db.execute('UPDATE forti_security_backfill_state SET target=?,completed=0 WHERE id=1',
+                           (stamp(target),))
+        if next_run > time.time():
+            return False
+        if cursor <= target:
+            with self.automation.db() as db:
+                db.execute('''UPDATE forti_security_backfill_state
+                    SET completed=1,error=NULL,next_run=0 WHERE id=1''')
+            return False
+
+        end = cursor
+        start = max(target, end - timedelta(minutes=chunk_minutes))
+        request = {
+            'size': 0,
+            'track_total_hits': False,
+            'timeout': '12s',
+            'query': {'bool': {'filter': [
+                {'range': {'@timestamp': {'gte': stamp(start), 'lt': stamp(end)}}},
+                {'term': {'decoder.name': 'fortigate-firewall-v5'}},
+            ]}},
+            'aggs': {'rollup': {'date_histogram': {
+                'field': '@timestamp', 'fixed_interval': '5m', 'min_doc_count': 0,
+                'extended_bounds': {'min': stamp(start), 'max': stamp(end - timedelta(milliseconds=1))},
+            }, 'aggs': {'forti_security': {
+                'filters': {'filters': FORTI_SECURITY_FILTERS},
+                'aggs': {'max_level': {'max': {'field': 'rule.level'}}},
+            }}}},
+        }
+        started = time.monotonic()
+        try:
+            data = self.request('/wazuh-alerts-*/_search', request)
+            if not isinstance(data, dict) or data.get('timed_out') or data.get('_shards', {}).get('failed'):
+                raise RuntimeError('Partial Forti security aggregation; cursor not advanced')
+            buckets = ((data.get('aggregations') or {}).get('rollup') or {}).get('buckets')
+            if not isinstance(buckets, list):
+                raise RuntimeError('Forti security aggregation missing rollup buckets')
+            rows, observed_events = [], 0
+            for bucket in buckets:
+                bucket_key = bucket.get('key_as_string')
+                if not bucket_key:
+                    continue
+                observed_events += int(bucket.get('doc_count') or 0)
+                for signal, aggregate in ((bucket.get('forti_security') or {}).get('buckets') or {}).items():
+                    count = int((aggregate or {}).get('doc_count') or 0)
+                    if not count:
+                        continue
+                    level = int(((aggregate or {}).get('max_level') or {}).get('value') or 0)
+                    rows.append((bucket_key, 'forti_security', signal, count, level, bucket_key,
+                                 FORTI_SECURITY_LABELS.get(signal, signal)))
+            duration_ms = int((time.monotonic() - started) * 1000)
+            with self.automation.db() as db:
+                # The dimension is exclusively owned by this worker. Replacing
+                # the chunk makes retries and upgrades idempotent.
+                db.execute('''DELETE FROM detection_rollups
+                    WHERE dimension='forti_security' AND bucket>=? AND bucket<?''',
+                           (stamp(start), stamp(end)))
+                if rows:
+                    db.executemany('''INSERT INTO detection_rollups
+                        (bucket,dimension,value,count,max_level,last_seen,label) VALUES (?,?,?,?,?,?,?)''', rows)
+                query_took = int(data.get('took') or duration_ms)
+                cooldown = interval if query_took <= 1500 and duration_ms <= 3000 else max(300, interval * 5)
+                db.execute('''UPDATE forti_security_backfill_state SET cursor=?,completed=0,
+                    chunks=?,events=?,last_run=?,last_duration_ms=?,last_query_took_ms=?,
+                    error=NULL,next_run=? WHERE id=1''',
+                           (stamp(start), chunks + 1, events + observed_events, time.time(), duration_ms,
+                            query_took, time.time() + cooldown))
+            return True
+        except Exception as exc:
+            duration_ms = int((time.monotonic() - started) * 1000)
+            with self.automation.db() as db:
+                db.execute('''UPDATE forti_security_backfill_state SET last_run=?,last_duration_ms=?,
+                    error=?,next_run=? WHERE id=1''',
+                           (time.time(), duration_ms, str(exc)[:500], time.time() + min(3600, interval * 2)))
+            raise
+
     def rollup_summary(self, start, end, limit=20):
         start, end = bounds({'start': start, 'end': end})
         query_start = rollup_bucket(datetime.fromisoformat(start))
         dimensions = ('rule', 'decoder', 'source_ip', 'destination_ip', 'identity', 'asset',
-                      'destination_port', 'application', 'firewall_policy', 'direction', 'mitre', 'severity')
+                      'destination_port', 'application', 'firewall_policy', 'direction', 'mitre', 'severity',
+                      'network_action', 'forti_type', 'forti_subtype', 'forti_profile', 'forti_security',
+                      'detection_family', 'detection_confidence', 'telemetry_source', 'telemetry_field')
         result = {}
         with self.automation.db() as db:
             for dimension in dimensions:
+                # Readiness needs every source/field contract bucket, not only
+                # the 20 highest-volume values used for ordinary dashboard lists.
+                dimension_limit = 250 if dimension == 'telemetry_field' else 50 if dimension == 'telemetry_source' else int(limit)
                 rows = db.execute('''SELECT value,SUM(count),MAX(max_level),MAX(last_seen),MAX(label)
                     FROM detection_rollups WHERE dimension=? AND bucket>=? AND bucket<?
                     GROUP BY value ORDER BY SUM(count) DESC,value LIMIT ?''',
-                    (dimension, query_start, end, int(limit))).fetchall()
+                    (dimension, query_start, end, dimension_limit)).fetchall()
                 result[dimension] = [{'value': value, 'count': int(count or 0),
                                       'max_level': int(level or 0), 'last_seen': seen, 'label': label}
                                      for value, count, level, seen, label in rows]
@@ -528,6 +752,49 @@ class Pipeline:
                              'complete': start_covered and end_covered and gaps['missing'] == 0,
                              'gaps': gaps}}
 
+    def materialize_taxonomy_once(self, limit=120):
+        """Backfill compact attack labels from existing local rule rollups.
+
+        Historical five-minute rollups intentionally omit raw event fields. This
+        local-only pass can safely recover family and ATT&CK labels from the
+        stored rule descriptions, but retains ``rule_matched`` confidence rather
+        than pretending required network or identity fields were present.
+        """
+        limit = max(1, min(int(limit), 500))
+        with self.automation.db() as db:
+            buckets = db.execute('''SELECT DISTINCT r.bucket
+                FROM detection_rollups r LEFT JOIN taxonomy_rollup_buckets t ON t.bucket=r.bucket
+                WHERE r.dimension='total' AND t.bucket IS NULL ORDER BY r.bucket LIMIT ?''', (limit,)).fetchall()
+            if not buckets:
+                return 0
+            completed, additions = [], []
+            for (bucket,) in buckets:
+                # Live stream rows already contain taxonomy dimensions. Mark the
+                # bucket complete rather than adding duplicate aggregate counts.
+                present = db.execute('''SELECT 1 FROM detection_rollups
+                    WHERE bucket=? AND dimension='detection_family' LIMIT 1''', (bucket,)).fetchone()
+                if not present:
+                    rule_rows = db.execute('''SELECT value,count,max_level,last_seen,label FROM detection_rollups
+                        WHERE bucket=? AND dimension='rule' ''', (bucket,)).fetchall()
+                    for value, count, level, last_seen, label in rule_rows:
+                        rule_id = str(value).split(' | ', 1)[0]
+                        result = classify_detection({'rule': {'id': rule_id, 'description': label or value}})
+                        dimensions = [('detection_family', result['family']),
+                                      ('detection_confidence', result['confidence'])]
+                        dimensions.extend(('mitre', technique) for technique in result['mitre'])
+                        for dimension, item in dimensions:
+                            additions.append((bucket, dimension, item, int(count or 0), int(level or 0), last_seen, item))
+                completed.append((bucket, time.time(), 'local_rule_rollup'))
+            if additions:
+                db.executemany('''INSERT INTO detection_rollups(bucket,dimension,value,count,max_level,last_seen,label)
+                    VALUES (?,?,?,?,?,?,?) ON CONFLICT(bucket,dimension,value) DO UPDATE SET
+                    count=detection_rollups.count+excluded.count,
+                    max_level=MAX(detection_rollups.max_level,excluded.max_level),
+                    last_seen=MAX(detection_rollups.last_seen,excluded.last_seen)''', additions)
+            db.executemany('''INSERT OR REPLACE INTO taxonomy_rollup_buckets(bucket,materialized_at,source)
+                VALUES (?,?,?)''', completed)
+        return len(completed)
+
     def candidates(self, limit=100):
         with self.automation.db() as db:
             rows = db.execute("SELECT kind,indicator,level,last_seen,count FROM ioc_queue WHERE next_attempt<=? ORDER BY level DESC,count DESC,last_seen DESC,next_attempt,first_seen LIMIT ?", (time.time(),limit)).fetchall()
@@ -538,7 +805,8 @@ class Pipeline:
             db.execute('UPDATE ioc_queue SET next_attempt=?,attempts=attempts+1 WHERE kind=? AND indicator=?',
                 (time.time()+(3600 if retry else 21600), candidate['kind'], candidate['indicator']))
 
-    def _commit_scan_window(self, recent, checkpoint, end, batch, rollups, scanned, rollup_enabled):
+    def _commit_scan_window(self, recent, checkpoint, end, batch, rollups, scanned, rollup_enabled,
+                            entity_records=None, entity_candidates=0, entity_queued=0):
         """Atomically persist one completed discovery window exactly once."""
         stream = 'replay' if recent else 'checkpoint'
         window_start, window_end = stamp(checkpoint), stamp(end)
@@ -550,6 +818,15 @@ class Pipeline:
                 (batch_key, stream, window_start, window_end, int(scanned), len(batch), time.time())).rowcount
             if not inserted:
                 return False
+            if entity_records:
+                entity_resolver.ingest_prepared(db, entity_records)
+                entity_resolver.remove_queued(db, (record['evidence_id'] for record in entity_records))
+            represented = len(entity_records or []) + int(entity_queued)
+            coalesced = max(0, int(entity_candidates) - represented)
+            db.execute('''INSERT OR REPLACE INTO entity_graph_batches
+                (batch_key,candidate_count,stored_count,queued_count,coalesced_count,dropped_count,committed_at)
+                VALUES (?,?,?,?,?,?,?)''', (batch_key, int(entity_candidates), len(entity_records or []),
+                    int(entity_queued), coalesced, 0, time.time()))
             if recent:
                 db.executemany('''INSERT INTO ioc_queue
                     (kind,indicator,first_seen,last_seen,level,count) VALUES (?,?,?,?,?,0)
@@ -595,6 +872,7 @@ class Pipeline:
                 db.execute('DELETE FROM detection_rollups WHERE bucket<?', (stamp(cutoff_dt),))
                 db.execute('DELETE FROM rollup_windows WHERE bucket_epoch<?', (int(cutoff_dt.timestamp()),))
                 db.execute('DELETE FROM scan_batches WHERE committed_at<?', (cutoff_dt.timestamp(),))
+                entity_resolver.cleanup(db, int(self.automation.config().get('SOC_ENTITY_RETENTION_DAYS', 30)))
                 self.last_rollup_cleanup = time.time()
             field = 'live_checkpoint' if recent else 'checkpoint'
             counter = 'replay_scanned' if recent else 'checkpoint_scanned'
@@ -608,8 +886,18 @@ class Pipeline:
                 raise RuntimeError('Stale discovery window; transaction rolled back')
         return True
 
+    def drain_entity_queue_once(self, config=None):
+        """Drain durable local evidence without depending on the Wazuh stream switch."""
+        config = config or self.automation.config()
+        batch_size = max(10, min(1000, int(config.get('SOC_ENTITY_DRAIN_BATCH_SIZE', 100))))
+        with self.automation.db() as db:
+            return entity_resolver.drain_queue(db, batch_size)
+
     def scan_window(self, recent=False):
         now = datetime.now(timezone.utc)
+        config = self.automation.config()
+        window_seconds = max(60, min(900, int(config.get('SOC_STREAM_WINDOW_SECONDS', 300))))
+        page_size = max(100, min(1000, int(config.get('SOC_STREAM_PAGE_SIZE', 500))))
         with self.automation.db() as db:
             row = db.execute('SELECT start,checkpoint FROM stream_state WHERE id=1').fetchone()
             if not row:
@@ -617,18 +905,31 @@ class Pipeline:
                 db.execute('INSERT INTO stream_state(id,start,checkpoint,scanned) VALUES (1,?,?,0)', (start,start))
                 row = (start,start)
         checkpoint = datetime.fromisoformat(row[1])
-        end = min(checkpoint+timedelta(minutes=5), now-timedelta(minutes=2))
+        end = min(checkpoint + timedelta(seconds=window_seconds), now-timedelta(minutes=2))
         if end <= checkpoint or (not recent and (end-checkpoint).total_seconds()<60):
             return False
-        start = max(datetime.fromisoformat(row[0]), checkpoint-timedelta(minutes=5))
+        start = max(datetime.fromisoformat(row[0]), checkpoint-timedelta(seconds=window_seconds))
         if recent:
             end = now-timedelta(minutes=2)
             start = end-timedelta(minutes=10)
         scroll_id, scanned, committed_scanned = None, 0, 0
-        rollups, batch = {}, {}
+        rollups, batch, entity_records, entity_overflow, entity_candidates, entity_queued = {}, {}, {}, {}, 0, 0
+        entity_limit = max(50, min(10000, int(config.get('SOC_ENTITY_MAX_EVIDENCE_PER_WINDOW', 500))))
+        entity_queue_batch = min(500, entity_limit)
+        entity_batch_key = f"{'replay' if recent else 'checkpoint'}:{stamp(checkpoint)}:{stamp(end)}"
+
+        def flush_entity_overflow():
+            nonlocal entity_queued
+            if not entity_overflow:
+                return
+            with self.automation.db() as db:
+                entity_queued += entity_resolver.enqueue_prepared(
+                    db, entity_batch_key, entity_overflow.values())
+            entity_overflow.clear()
+
         rollup_enabled = not recent and self.automation.config().get('SOC_ROLLUP_ENABLED', 'true') == 'true'
         try:
-            data = self.request('/wazuh-alerts-*/_search?scroll=2m', {'size': 1000, 'sort': ['_doc'],
+            data = self.request('/wazuh-alerts-*/_search?scroll=2m', {'size': page_size, 'sort': ['_doc'],
                 'timeout': '15s', 'query': {'range': {'@timestamp': {'gte': stamp(start), 'lt': stamp(end)}}},
                 '_source': sorted(set(ROLLUP_SOURCE_FIELDS + list(IOC_FIELDS.values())))})
             while True:
@@ -670,10 +971,31 @@ class Pipeline:
                         old = batch.get(key, (seen,seen,level,0))
                         increment = 0 if recent or seen_time < checkpoint else 1
                         batch[key] = (min(old[0],seen),max(old[1],seen),max(old[2],level),old[3]+increment)
+                    prepared = entity_resolver.prepare_wazuh_evidence(
+                        event, str(hit.get('_id') or ''), str(hit.get('_index') or ''))
+                    if prepared:
+                        entity_candidates += 1
+                        current = entity_records.get(prepared['evidence_id'])
+                        if current:
+                            current['occurrence_count'] += 1
+                            current['last_seen'] = max(current['last_seen'], prepared['observed_at'])
+                        elif len(entity_records) < entity_limit:
+                            entity_records[prepared['evidence_id']] = prepared
+                        else:
+                            current = entity_overflow.get(prepared['evidence_id'])
+                            if current:
+                                current['occurrence_count'] += 1
+                                current['last_seen'] = max(current['last_seen'], prepared['observed_at'])
+                            else:
+                                entity_overflow[prepared['evidence_id']] = prepared
+                            if len(entity_overflow) >= entity_queue_batch:
+                                flush_entity_overflow()
                 scanned += len(hits)
                 data = self.request('/_search/scroll', {'scroll': '2m', 'scroll_id': scroll_id})
+            flush_entity_overflow()
             self._commit_scan_window(recent, checkpoint, end, batch, rollups,
-                                     committed_scanned, rollup_enabled)
+                                     committed_scanned, rollup_enabled, list(entity_records.values()),
+                                     entity_candidates, entity_queued)
             return True
         finally:
             if scroll_id:
@@ -684,11 +1006,17 @@ class Pipeline:
 
     def loop(self):
         while not self.stop.wait(2):
-            if self.automation.config().get('SOC_STREAM_ENABLED') != 'true':
-                continue
-            self.active = True
             try:
                 config = self.automation.config()
+                # Local queue work remains available when Wazuh polling is paused.
+                try:
+                    self.drain_entity_queue_once(config)
+                    self.entity_queue_error = None
+                except Exception as exc:
+                    self.entity_queue_error = self.automation.clean_error(exc)
+                if config.get('SOC_STREAM_ENABLED') != 'true':
+                    continue
+                self.active = True
                 replay_interval = int(config.get('SOC_STREAM_REPLAY_INTERVAL_SECONDS', 1800))
                 scan_pause = int(config.get('SOC_STREAM_SCAN_PAUSE_SECONDS', 10))
                 if time.time()-self.last_live >= replay_interval:
@@ -707,6 +1035,23 @@ class Pipeline:
                         # make the live discovery stream appear failed.
                         pass
                     self.last_backfill = time.time()
+                rollup_state = self.status().get('rollup', {}) if not advanced else {}
+                forti_interval = max(60, int(config.get('SOC_FORTI_SECURITY_BACKFILL_INTERVAL_SECONDS', 60)))
+                if (not advanced and self.status().get('caught_up')
+                        and rollup_state.get('backfill', {}).get('complete')
+                        and time.time() - self.last_forti_security_backfill >= forti_interval):
+                    try:
+                        self.forti_security_backfill_once()
+                    except Exception:
+                        # This optional historical enrichment owns no live
+                        # checkpoint and must never impair alert discovery.
+                        pass
+                    self.last_forti_security_backfill = time.time()
+                if (not advanced and self.status().get('caught_up')
+                        and time.time() - self.last_taxonomy_materialization >= 30):
+                    # SQLite-only historical enrichment has no Indexer cost.
+                    self.materialize_taxonomy_once()
+                    self.last_taxonomy_materialization = time.time()
                 self.error = None
                 self.stop.wait(scan_pause if advanced else max(15, scan_pause))
             except Exception as exc:

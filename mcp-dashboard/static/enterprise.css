@@ -70,7 +70,6 @@
 #commandView .mapDetectionGrid { align-items: start; grid-template-columns: minmax(0,1.08fr) minmax(0,.92fr); }
 #commandView .mapLayout { grid-template-columns: minmax(0,1fr) minmax(120px,.4fr); }
 #commandView .glassPanel { min-height: 0; }
-#commandView .coveragePanel { display: none; }
 .topbar .actions { flex-wrap: wrap; }
 .sidebar, .nav, .app { min-width: 0; }
 .nav button { min-width: 0; grid-template-columns: 28px minmax(0,1fr); overflow-wrap: anywhere; }

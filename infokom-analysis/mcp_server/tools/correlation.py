@@ -544,7 +544,7 @@ async def three_sum_correlation(params: ThreeSumCorrelationInput) -> str:
             trigger_ips = [t["ip"] for t in triggers if t.get("ip")]
             case = case_store.create_case(
                 title=f"3-Sum APT — {len(triggers)} trigger(s)", srcips=trigger_ips)
-            case_store.add_iocs(case["case_id"], trigger_ips)
+            case_store.add_iocs(case["case_id"], trigger_ips, case["revision"], "three_sum_correlation")
             stats["case_id"] = case["case_id"]
         if engine_a_warnings:
             stats["warnings"] = engine_a_warnings  # surfaced, never silent

@@ -17,9 +17,13 @@ services:
     environment:
       DASHBOARD_CONFIG_FILE: /app/dashboard.env
       SOC_CMDB_FILE: "${SOC_CMDB_FILE:-/app/cmdb/assets.json}"
+      # Rollups run in the dedicated materializer below. The web process only
+      # serves cached/SQLite snapshots and bounded interactive queries.
+      SOC_PIPELINE_WORKER_ENABLED: "false"
     volumes:
       - ./dashboard.env:/app/dashboard.env
-      - "${DASHBOARD_CMDB_FILE:-../infokom-analysis/resource/assets.json}:${SOC_CMDB_FILE:-/app/cmdb/assets.json}:ro"
+      # Mount the directory because atomic CMDB replacement changes the file inode.
+      - "${DASHBOARD_CMDB_DIR:-../infokom-analysis/resource}:/app/cmdb:ro"
       - soc-automation:/app/runtime
     ports:
       - "${DASHBOARD_HOST_PORT:-8088}:8088"
@@ -29,6 +33,37 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+
+  mcp-materializer:
+    image: wazuh-mcp-dashboard:latest
+    container_name: wazuh-mcp-materializer
+    restart: unless-stopped
+    command: ["python", "materializer.py"]
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    env_file:
+      - ./dashboard.env
+    environment:
+      DASHBOARD_CONFIG_FILE: /app/dashboard.env
+      SOC_CMDB_FILE: "${SOC_CMDB_FILE:-/app/cmdb/assets.json}"
+      SOC_PIPELINE_WORKER_ENABLED: "true"
+    volumes:
+      - ./dashboard.env:/app/dashboard.env:ro
+      - "${DASHBOARD_CMDB_DIR:-../infokom-analysis/resource}:/app/cmdb:ro"
+      - soc-automation:/app/runtime
+    networks:
+      - wazuh-shared
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # Deliberately conservative defaults. Tune only after the staged
+    # 1M/3M/10M replay benchmark has met latency and lag objectives.
+    cpus: "${SOC_MATERIALIZER_CPUS:-1.0}"
+    mem_limit: "${SOC_MATERIALIZER_MEMORY_LIMIT:-768m}"
 
 networks:
   wazuh-shared:

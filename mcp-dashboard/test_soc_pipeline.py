@@ -6,6 +6,7 @@ from unittest.mock import Mock
 from datetime import datetime, timezone, timedelta
 import soc_automation as soc
 from soc_pipeline import Pipeline, bounds, history, observables
+import entity_resolver
 
 
 class PipelineTests(unittest.TestCase):
@@ -26,6 +27,8 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(initial['checkpoint'],initial['started_at'])
         self.assertEqual(initial['queued_indicators'],0)
         self.assertEqual(initial['rollup']['events'],0)
+        with self.worker.db() as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM entity_evidence').fetchone()[0], 0)
         self.request.side_effect=[first,{'_scroll_id':'cursor','hits':{'hits':[]}},{}]
         self.assertTrue(self.pipeline.scan_window())
         latest=self.pipeline.status()
@@ -34,6 +37,8 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(latest['checkpoint_events_scanned'],1)
         self.assertEqual(latest['rollup']['events'],1)
         self.assertEqual(self.pipeline.candidates()[0]['occurrences'],1)
+        with self.worker.db() as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM entity_evidence').fetchone()[0], 1)
         start = datetime.fromisoformat(initial['checkpoint'])
         end = datetime.fromisoformat(latest['checkpoint'])
         self.assertFalse(self.pipeline._commit_scan_window(
@@ -41,6 +46,8 @@ class PipelineTests(unittest.TestCase):
             {}, 1, True))
         self.assertEqual(self.pipeline.candidates()[0]['occurrences'],1)
         self.assertEqual(self.pipeline.status()['checkpoint_events_scanned'],1)
+        with self.worker.db() as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM entity_evidence').fetchone()[0], 1)
         self.assertEqual(latest['unique_scan_counter'],'checkpoint_events_scanned')
         self.assertFalse(latest['historical_scope_complete'])
         self.assertFalse(latest['raw_archives_scanned'])
@@ -65,6 +72,62 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(latest['checkpoint'], initial['checkpoint'])
         self.assertEqual(latest['queued_indicators'], 0)
         self.assertEqual(latest['rollup']['events'], 0)
+
+    def test_entity_graph_window_budget_is_bounded_and_reported(self):
+        self.config['SOC_ENTITY_MAX_EVIDENCE_PER_WINDOW'] = '50'
+        status = self.pipeline.status()
+        if not status['checkpoint']:
+            self.request.side_effect = [{'hits': {'hits': []}}]
+            self.pipeline.scan_window()
+            status = self.pipeline.status()
+        start = datetime.fromisoformat(status['checkpoint'])
+        hits = []
+        for index in range(60):
+            event = {
+                '@timestamp': (start + timedelta(minutes=1)).isoformat(),
+                'rule': {'id': '9001', 'level': 12, 'description': 'High-signal network alert'},
+                'agent': {'id': '001', 'name': 'edge-fw'},
+                'data': {'srcip': f'198.51.100.{index + 1}', 'dstip': '10.0.0.8'},
+            }
+            hits.append({'_id': f'event-{index}', '_index': 'wazuh-alerts-test', '_source': event})
+        self.request.side_effect = [
+            {'_scroll_id': 'cursor', 'hits': {'hits': hits}},
+            {'_scroll_id': 'cursor', 'hits': {'hits': []}}, {},
+        ]
+        self.assertTrue(self.pipeline.scan_window())
+        with self.worker.db() as db:
+            row = db.execute('''SELECT candidate_count,stored_count,queued_count,coalesced_count,dropped_count
+                FROM entity_graph_batches ORDER BY committed_at DESC LIMIT 1''').fetchone()
+            queue_count = db.execute("SELECT COUNT(*) FROM entity_graph_queue").fetchone()[0]
+            stored = db.execute("SELECT COUNT(*) FROM entity_evidence WHERE source='wazuh'").fetchone()[0]
+        self.assertEqual(row, (60, 50, 10, 0, 0))
+        self.assertEqual(queue_count, 10)
+        self.assertEqual(stored, 50)
+
+        restarted = Pipeline(self.worker, self.request)
+        self.assertEqual(restarted.status()["entity_graph"]["queue"]["pending"], 10)
+        with self.worker.db() as db:
+            drained = entity_resolver.drain_queue(db, 10)
+            self.assertEqual(drained["processed"], 10)
+        with self.worker.db() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM entity_graph_queue").fetchone()[0], 0)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM entity_evidence WHERE source='wazuh'").fetchone()[0], 60)
+
+    def test_entity_queue_drains_from_local_store_when_wazuh_stream_is_paused(self):
+        prepared = entity_resolver.prepare_evidence(
+            "wazuh", "paused-stream-event", "2026-09-24T10:00:00Z",
+            {"srcip": "198.51.100.20"}, "Network alert", "high", 90)
+        with self.worker.db() as db:
+            self.assertEqual(entity_resolver.enqueue_prepared(db, "paused-window", [prepared]), 1)
+        self.config["SOC_STREAM_ENABLED"] = "false"
+
+        drained = self.pipeline.drain_entity_queue_once(self.config)
+
+        self.assertEqual(drained["processed"], 1)
+        self.request.assert_not_called()
+        with self.worker.db() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM entity_graph_queue").fetchone()[0], 0)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM entity_evidence").fetchone()[0], 1)
 
     def test_rollup_gap_detection_distinguishes_empty_and_missing_windows(self):
         self.request.side_effect = [{'hits': {'hits': []}}]
@@ -138,6 +201,47 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(rule[0], 20)
         self.assertEqual(other[0], 5)
         self.assertEqual(completed[0], 25)
+
+    def test_forti_security_backfill_is_decoder_scoped_and_idempotent(self):
+        self.config.update({
+            'SOC_FORTI_SECURITY_BACKFILL_ENABLED': 'true',
+            'SOC_FORTI_SECURITY_BACKFILL_CHUNK_MINUTES': '120',
+            'SOC_FORTI_SECURITY_BACKFILL_INTERVAL_SECONDS': '300',
+            'SOC_ROLLUP_BACKFILL_DAYS': '7',
+            'SOC_ROLLUP_BACKFILL_CHUNK_MINUTES': '30',
+        })
+
+        def response(path, payload):
+            bucket = payload['query']['bool']['filter'][0]['range']['@timestamp']['gte']
+            return {'took': 6, '_shards': {'failed': 0}, 'aggregations': {'rollup': {'buckets': [{
+                'key_as_string': bucket, 'doc_count': 4,
+                'forti_security': {'buckets': {
+                    'ips_blocked': {'doc_count': 3, 'max_level': {'value': 12}},
+                    'ips_detected': {'doc_count': 0, 'max_level': {'value': None}},
+                    'malware': {'doc_count': 1, 'max_level': {'value': 10}},
+                }},
+            }]}}}
+
+        self.request.side_effect = response
+        self.assertTrue(self.pipeline.forti_security_backfill_once())
+        request = self.request.call_args.args[1]
+        self.assertEqual(request['size'], 0)
+        self.assertFalse(request['track_total_hits'])
+        self.assertNotIn('_source', request)
+        self.assertNotIn('scroll', str(request))
+        self.assertEqual(request['query']['bool']['filter'][1],
+                         {'term': {'decoder.name': 'fortigate-firewall-v5'}})
+        start = datetime.fromisoformat(request['query']['bool']['filter'][0]['range']['@timestamp']['gte'])
+        end = datetime.fromisoformat(request['query']['bool']['filter'][0]['range']['@timestamp']['lt'])
+        self.assertEqual(int((end - start).total_seconds() // 60), 120)
+        with self.worker.db() as db:
+            ips_blocked = db.execute("SELECT count,label FROM detection_rollups WHERE dimension='forti_security' AND value='ips_blocked'").fetchone()
+            malware = db.execute("SELECT count,label FROM detection_rollups WHERE dimension='forti_security' AND value='malware'").fetchone()
+        self.assertEqual(ips_blocked, (3, 'FortiGate IPS blocked'))
+        self.assertEqual(malware, (1, 'FortiGate malware signal'))
+        status = self.pipeline.status()['rollup']['forti_security_backfill']
+        self.assertEqual(status['chunks'], 1)
+        self.assertEqual(status['events'], 4)
 
     def test_partial_backfill_does_not_advance_cursor(self):
         self.request.return_value = {'timed_out': True, '_shards': {'failed': 1}}
