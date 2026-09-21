@@ -2502,6 +2502,8 @@ def _source_value(source: dict[str, Any], *paths: str) -> Any:
 
 def _operational_evidence(data: dict[str, Any], elapsed_ms: int) -> dict[str, Any]:
     aggs = data.get("aggregations", {}) if isinstance(data, dict) else {}
+    total_raw = ((data.get("hits") or {}).get("total") or {}) if isinstance(data, dict) else {}
+    total_events = int(total_raw.get("value", 0) if isinstance(total_raw, dict) else total_raw or 0)
 
     def samples(name: str, mapper) -> list[dict[str, Any]]:
         hits = (((aggs.get(name) or {}).get("sample") or {}).get("hits") or {}).get("hits") or []
@@ -2563,12 +2565,29 @@ def _operational_evidence(data: dict[str, Any], elapsed_ms: int) -> dict[str, An
         "health": "degraded" if data.get("timed_out") or shards.get("failed") else "healthy",
         "scope": "Current bounded dashboard query; cluster-wide health endpoint is not queried.",
     }
+    decoder_named = int((aggs.get("decoder_named_events") or {}).get("doc_count") or 0)
+    decoder_unmatched = int((aggs.get("unmatched_decoder") or {}).get("doc_count") or 0)
+    decoder_coverage = round(decoder_named / total_events * 100, 2) if total_events else None
     return {
+        "data_quality": {
+            "indexed_events": total_events,
+            "decoder_named_events": decoder_named,
+            "decoder_unmatched_events": decoder_unmatched,
+            "decoder_coverage_percent": decoder_coverage,
+            "sampled_network_events": len(network),
+            "sampled_identity_events": len(identity),
+            "sampled_limit_per_surface": 12,
+            "bounded": True,
+            "partial": bool(data.get("timed_out")) or bool(shards.get("failed")),
+            "source": "Wazuh Indexer alert aggregation",
+            "note": "Counts are exact for the selected alert window; detail tables are bounded samples.",
+        },
         "network": {"events": network, "observed": len(network), "sample_limit": 12},
         "identity": {"events": identity, "observed": len(identity), "sample_limit": 12},
         "mitre": {"techniques": mitre, "timeline": mitre_timeline, "observed": len(mitre), "bucket_limit": 20},
         "decoders": {"items": decoders, "observed": len(decoders), "bucket_limit": 20,
-                     "unmatched_events": int((aggs.get("unmatched_decoder") or {}).get("doc_count") or 0),
+                     "named_events": decoder_named, "coverage_percent": decoder_coverage,
+                     "unmatched_events": decoder_unmatched,
                      "failed_events": None,
                      "note": "Decoder failures require Wazuh manager/archive metrics; unmatched counts only mean decoder.name was absent."},
         "telemetry": telemetry,
@@ -2618,6 +2637,7 @@ def _local_alert_window(window: dict[str, Any]) -> dict[str, Any]:
             "decoders": {"terms": {"field": "decoder.name", "size": 20}, "aggs": {
                 "max_level": {"max": {"field": "rule.level"}}, "sample": {"top_hits": {"size": 1,
                     "sort": [{"@timestamp": {"order": "desc"}}], "_source": ["@timestamp", "rule.description"]}}}},
+            "decoder_named_events": {"filter": {"exists": {"field": "decoder.name"}}},
             "unmatched_decoder": {"filter": {"bool": {"must_not": [{"exists": {"field": "decoder.name"}}]}}},
             "dropped_events": {"filter": {"bool": {"should": [
                 {"term": {"rule.groups": "event_dropped"}}, {"match_phrase": {"rule.description": "event dropped"}},

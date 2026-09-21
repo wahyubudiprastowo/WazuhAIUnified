@@ -221,6 +221,7 @@ class FindingTests(unittest.TestCase):
 
     def test_operational_evidence_contract(self):
         data = {
+            "hits": {"total": {"value": 15, "relation": "eq"}},
             "took": 17,
             "timed_out": False,
             "_shards": {"total": 3, "successful": 3, "failed": 0},
@@ -240,7 +241,8 @@ class FindingTests(unittest.TestCase):
                 "decoders": {"buckets": [{"key": "fortigate", "doc_count": 12,
                     "max_level": {"value": 10}, "sample": {"hits": {"hits": [{"_source": {
                         "@timestamp": "2026-09-15T10:00:00Z", "rule": {"description": "Firewall deny"},
-                    }}]}}}]},
+                        }}]}}}]},
+                "decoder_named_events": {"doc_count": 13},
                 "unmatched_decoder": {"doc_count": 2},
                 "mitre_techniques": {"buckets": [{"key": "T1110", "doc_count": 7}]},
                 "mitre_timeline": {"buckets": [{"key_as_string": "2026-09-15T10:00:00Z",
@@ -254,6 +256,9 @@ class FindingTests(unittest.TestCase):
         self.assertEqual(evidence["network"]["events"][0]["destination"], "10.0.0.5")
         self.assertEqual(evidence["identity"]["events"][0]["user"], "analyst@example.com")
         self.assertEqual(evidence["decoders"]["items"][0]["name"], "fortigate")
+        self.assertEqual(evidence["data_quality"]["indexed_events"], 15)
+        self.assertEqual(evidence["data_quality"]["decoder_coverage_percent"], 86.67)
+        self.assertEqual(evidence["decoders"]["named_events"], 13)
         self.assertEqual(evidence["mitre"]["timeline"][0]["techniques"][0]["technique"], "T1110")
         self.assertEqual(evidence["telemetry"]["manager_queue"], 3)
         self.assertEqual(evidence["telemetry"]["indexer"]["health"], "healthy")
@@ -339,6 +344,7 @@ class FindingTests(unittest.TestCase):
         self.assertTrue(query["track_total_hits"])
         self.assertEqual(query["aggs"]["network_events"]["aggs"]["sample"]["top_hits"]["size"], 12)
         self.assertEqual(query["aggs"]["identity_events"]["aggs"]["sample"]["top_hits"]["size"], 12)
+        self.assertIn("decoder_named_events", query["aggs"])
         self.assertIn("operational_evidence", result)
         self.assertEqual(result["l1_queue"][0]["event_id"], "event-1")
         self.assertEqual(result["l1_queue"][0]["sla_minutes"], 30)
