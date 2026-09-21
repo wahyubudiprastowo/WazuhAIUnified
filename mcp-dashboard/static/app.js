@@ -21,8 +21,6 @@ const state = {
   crowdSecLoading: false,
   crowdSecRequestId: 0,
   overviewRefreshTimer: null,
-  platformRefreshTimer: null,
-  platformLoading: false,
   cveExposure: null,
   cveExposureLoading: false,
 };
@@ -3441,6 +3439,39 @@ function renderAssetContextEvidence(data) {
   `;
 }
 
+function renderDataQuality(data) {
+  const root = q("#dataQualitySummary");
+  if (!root) return;
+  const quality = data.operational_evidence?.data_quality || {};
+  const funnel = data.analysis_funnel || {};
+  const materialization = data.materialization || {};
+  const providers = data.provider_freshness?.providers || [];
+  const availableProviders = providers.filter((row) => row.status === "available").length;
+  const providerErrors = providers.filter((row) => row.status === "error").length;
+  const decoderCoverage = quality.decoder_coverage_percent === null || quality.decoder_coverage_percent === undefined
+    ? "-" : `${number(quality.decoder_coverage_percent).toFixed(2)}%`;
+  const rollupCoverage = quality.rollup_coverage_percent === null || quality.rollup_coverage_percent === undefined
+    ? (materialization.exact ? "100%" : "building") : `${number(quality.rollup_coverage_percent).toFixed(2)}%`;
+  const lag = funnel.pipeline_lag_seconds === null || funnel.pipeline_lag_seconds === undefined
+    ? "-" : `${fmt.format(number(funnel.pipeline_lag_seconds))}s`;
+  const window = data.window?.label || data.requested_range || "selected window";
+  const status = materialization.exact ? "complete" : (materialization.status || "building");
+  const tone = materialization.exact && !quality.partial ? "available" : "skipped";
+  const metrics = [
+    ["Indexed events", fmt.format(number(quality.indexed_events ?? funnel.indexed_events)), quality.partial ? "partial response" : "exact window count"],
+    ["Decoder coverage", decoderCoverage, quality.decoder_unmatched_events == null ? "exact coverage unavailable" : `${fmt.format(number(quality.decoder_unmatched_events))} without decoder`],
+    ["Rollup coverage", rollupCoverage, `${status} · 5-minute summaries`],
+    ["Pipeline lag", lag, funnel.pipeline_status || "unavailable"],
+    ["IOC queue", fmt.format(number(funnel.queued_unique_indicators)), "deduplicated indicators"],
+    ["Provider history", `${fmt.format(availableProviders)}/${fmt.format(providers.length)}`, providerErrors ? `${fmt.format(providerErrors)} cached errors` : "persisted snapshots"],
+  ];
+  root.innerHTML = metrics.map(([label, value, note]) => `<div class="evidenceMetric"><span>${esc(label)}</span><strong>${esc(value)}</strong><small>${esc(note)}</small></div>`).join("");
+  const meta = q("#dataQualityMeta");
+  if (meta) meta.textContent = `${window} · ${quality.source || materialization.source || "local evidence"}`;
+  const note = q("#dataQualityNote");
+  if (note) note.innerHTML = `<span class="statusMark ${tone}">${esc(status)}</span> ${esc(quality.note || funnel.ai_note || "Data is served from the selected window and persisted summaries.")}`;
+}
+
 function renderOverview(data) {
   document.dispatchEvent(new CustomEvent("soc:overview", { detail: data }));
   renderPosture(data);
@@ -3452,6 +3483,7 @@ function renderOverview(data) {
   renderAttackTimeline(data);
   renderAttackMap(data);
   renderDetectionLayers(data);
+  renderDataQuality(data);
   renderTelemetryEvidence(data);
   renderNetworkIdentityEvidence(data);
   renderMitreEvidence(data);
@@ -3476,86 +3508,6 @@ function renderOverview(data) {
   renderInvestigationFlow(data);
   renderProviderIntel();
   renderCrowdSecIntel();
-}
-
-async function loadPlatformStatus() {
-  const grid = q("#platformStatusGrid");
-  if (!grid) return;
-  if (!state.platformLoading) {
-    grid.innerHTML = '<div class="platformConnecting">Loading platform status...</div>';
-  }
-  state.platformLoading = true;
-  try {
-    const data = await postJsonWithTimeout("/api/platform/status", {}, 20000);
-    renderPlatformStatus(data);
-  } catch (err) {
-    if (!state.platformLoading) return;
-    grid.innerHTML = `<div class="platformConnecting">Platform status unavailable: ${esc(err.message)}</div>`;
-  } finally {
-    state.platformLoading = false;
-  }
-}
-
-// Lightweight periodic refresh, active only on the Command view, so the status
-// widget stays live without a full dashboard reload. Uses a chained timer to
-// avoid overlapping requests.
-const PLATFORM_REFRESH_MS = 60000;
-async function platformRefreshLoop() {
-  const timer = () => { state.platformRefreshTimer = setTimeout(platformRefreshLoop, PLATFORM_REFRESH_MS); };
-  if (state.view === "command") {
-    try {
-      await loadPlatformStatus();
-    } catch (err) {
-      /* status widget is best-effort; a failure must not stop the loop */
-    }
-  }
-  timer();
-}
-function ensurePlatformRefresh() {
-  if (!state.platformRefreshTimer) {
-    state.platformRefreshTimer = setTimeout(platformRefreshLoop, PLATFORM_REFRESH_MS);
-  }
-}
-
-function renderPlatformStatus(data) {
-  const grid = q("#platformStatusGrid");
-  if (!grid) return;
-  const meta = q("#platformStatusMeta");
-  if (meta && data?.generated_at) meta.textContent = `Updated ${data.generated_at} · ${fmt.format(number(data.total_tools))} tools`;
-  const platforms = data?.platforms || {};
-  const card = (key, p) => {
-    if (!p) return "";
-    const dot = p.ok ? "ok" : "err";
-    const stateLabel = p.ok ? "Operational" : "Attention";
-    const body = [];
-    if (p.tools !== undefined) {
-      body.push(`<div class="platformStat"><span>Tools</span><b>${fmt.format(number(p.tools))}</b></div>`);
-    }
-    if (p.model) {
-      body.push(`<div class="platformStat"><span>Model</span><b>${esc(p.model)}</b></div>`);
-    }
-    if (p.contract_version) {
-      body.push(`<div class="platformStat"><span>AI contract</span><b>senior-soc-ai v${esc(p.contract_version)}</b></div>`);
-    }
-    if (p.counts) {
-      body.push(`<div class="platformStat"><span>Completed</span><b>${fmt.format(number(p.counts.completed))}</b></div>`);
-      body.push(`<div class="platformStat"><span>Avg duration</span><b>${number(p.average_completed_seconds) ? fmt.format(number(p.average_completed_seconds)) + "s" : "-"}</b></div>`);
-      const recent = (p.recent_jobs || []).slice(0, 3);
-      if (recent.length) {
-        body.push(`<div class="platformJobs">${recent.map(job => `<div class="platformJob"><b>${esc(job.status)}</b><span>${fmt.format(number(job.duration_seconds))}s</span></div>`).join("")}</div>`);
-      }
-    }
-    if (p.error) {
-      body.push(`<div class="platformError">${esc(p.error)}</div>`);
-    }
-    return `<article class="platformCard">
-      <div class="platformCardHead"><strong>${esc(p.label)}</strong><span class="platformDot ${dot}" title="${stateLabel}"></span></div>
-      <div class="platformStat"><span>Status</span><b>${stateLabel}</b></div>
-      ${body.join("")}
-    </article>`;
-  };
-  grid.innerHTML = `${card("gensecai", platforms.gensecai)}${card("infokom", platforms.infokom)}${card("ai_analyst", platforms.ai_analyst)}`;
-  if (!grid.innerHTML.trim()) grid.innerHTML = '<div class="platformConnecting">No platform data available.</div>';
 }
 
 async function postJson(path, body = {}) {
@@ -3633,7 +3585,6 @@ async function loadDashboard(force = false) {
     els.sideMeta.textContent = `${fmt.format(number(overview.tools?.gensecai))} GenSecAI + ${fmt.format(number(overview.tools?.infokom))} INFOKOM tools`;
     renderOverview(overview);
     if (state.view === "vuln") void loadCveExposureGraph();
-    void loadPlatformStatus();
     void loadPersistentCases();
     if (["stale-refreshing", "building"].includes(overview.cache?.status) && !state.overviewRefreshTimer) {
       state.overviewRefreshTimer = setTimeout(() => {
@@ -3732,7 +3683,6 @@ function setView(view) {
   q(`#${view}View`)?.classList.add("active");
   q(`.nav button[data-view="${view}"]`)?.classList.add("active");
   els.title.textContent = viewTitles[view];
-  if (view === "command") ensurePlatformRefresh();
   if (view === "vuln") void loadCveExposureGraph();
   document.dispatchEvent(new CustomEvent("soc:view", { detail: { view } }));
 }
@@ -3887,4 +3837,3 @@ document.addEventListener("soc:automation", () => {
 });
 
 loadDashboard().catch(showLoadError);
-ensurePlatformRefresh();

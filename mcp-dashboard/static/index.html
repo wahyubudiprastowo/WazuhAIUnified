@@ -7,7 +7,7 @@
     <link rel="stylesheet" href="/static/styles.css?v=20260915-2">
     <link rel="stylesheet" href="/static/findings.css?v=20260920-2">
     <link rel="stylesheet" href="/static/analysis.css?v=20260909-14">
-    <link rel="stylesheet" href="/static/enterprise.css?v=20260920-1">
+    <link rel="stylesheet" href="/static/enterprise.css?v=20260921-2">
     <link rel="stylesheet" href="/static/automation.css?v=20260914-1">
     <link rel="stylesheet" href="/static/history.css?v=20260915-3">
     <link rel="stylesheet" href="/static/workflows.css?v=20260920-2">
@@ -146,14 +146,13 @@
 
         <div class="insightStrip" id="insightStrip"></div>
 
-        <section class="glassPanel crossPlatformPanel">
+        <section class="glassPanel dataQualityPanel">
           <div class="panelHead">
-            <h2>Connected Platforms</h2>
-            <span id="platformStatusMeta">GenSecAI / INFOKOM / AI Analyst</span>
+            <h2>Detection Data Quality</h2>
+            <span id="dataQualityMeta">Selected window</span>
           </div>
-          <div id="platformStatusGrid" class="platformStatusGrid">
-            <div class="platformConnecting">Loading platform status...</div>
-          </div>
+          <div id="dataQualitySummary" class="evidenceMetrics dataQualityGrid"></div>
+          <p id="dataQualityNote" class="evidenceNote">Waiting for the selected window.</p>
         </section>
 
         <section class="glassPanel aiDeckPanel">
@@ -557,7 +556,7 @@
         </form>
       </section>
     </main>
-    <script src="/static/app.js?v=20260921-2"></script>
+    <script src="/static/app.js?v=20260921-3"></script>
     <script src="/static/findings.js?v=20260921-2"></script>
     <script src="/static/vendor/chart.umd.js"></script>
     <script src="/static/locale.js?v=20260911-1"></script>
