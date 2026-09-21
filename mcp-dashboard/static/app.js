@@ -1337,11 +1337,14 @@ function renderL1Queue(data) {
     event_id: item.case_id, title: item.title || "Persistent SOC case", level: 0,
     source_ip: (item.srcips || [])[0], destination_ip: "case evidence", agent: "persistent store",
     assignment: item.owner || "unassigned", status: item.status || "open", sla_due: item.sla_due,
-    case: item, persisted: true,
+    case: item, persisted: true, all_time: item.all_time,
   }));
   const rows = [...caseRows, ...liveRows].slice(0, 30);
+  const historicalNotice = data.historical_detail?.l1 && data.historical_detail.l1.status !== "available"
+    ? `<div class="emptyState">${esc(data.historical_detail.l1.message)}</div>` : "";
   state.l1Queue = rows;
   root.innerHTML = `
+    ${historicalNotice}
     <div class="l1QueueHeader"><span>Detection / entity</span><span>Asset</span><span>Priority</span><span>Owner / SLA</span><span>Case</span></div>
     ${rows.map((row, index) => {
       const level = number(row.level);
@@ -1351,12 +1354,12 @@ function renderL1Queue(data) {
       const linkedCase = row.case;
       return `<article class="l1QueueRow ${overdue ? "overdue" : ""}">
         <div><strong>${esc(row.title || "Wazuh alert")}</strong><small>${esc(evidenceValue(row.timestamp, "Stored case"))}</small><span>${esc(evidenceValue(row.source_ip, "unknown"))} -> ${esc(evidenceValue(row.destination_ip, "unknown"))}${row.destination_port ? `:${esc(row.destination_port)}` : ""}</span></div>
-        <div><strong>${esc(evidenceValue(row.agent, "Unknown asset"))}</strong><small>${esc(evidenceValue(row.decoder, row.identity || "No decoder/entity"))}</small></div>
+        <div><strong>${esc(evidenceValue(row.agent, "Unknown asset"))}</strong><small>${esc(evidenceValue(row.decoder, row.identity || "No decoder/entity"))}${row.all_time ? " | all-time case" : ""}</small></div>
         <div><span class="pill ${severityClass(level)}">${row.persisted ? esc(row.status) : `${severityLabel(level)} ${level}`}</span><small>${esc(evidenceValue(row.rule_id, row.event_id || "-"))}</small></div>
         <div><strong>${esc(evidenceValue(linkedCase?.owner || row.assignment, "Unassigned"))}</strong><small class="${overdue ? "slaOverdue" : ""}">${validDue ? `${overdue ? "Overdue" : "Due"} ${esc(due.toLocaleString())}` : "SLA not set"}</small></div>
         <div>${linkedCase ? `<button type="button" data-view-link="incidents">${esc(linkedCase.case_id)}</button>` : `<button type="button" data-create-l1-case="${index}">Create case</button>`}</div>
       </article>`;
-    }).join("") || `<div class="emptyState">${data.materialization?.status === "building" ? "Historical L1 queue is materializing; retained summaries remain available in Event History." : "No individual L1 alerts matched this window."}</div>`}
+    }).join("") || `<div class="emptyState">${esc(data.historical_detail?.l1?.message || (data.materialization?.status === "building" ? "Historical L1 queue is materializing; retained summaries remain available in Event History." : "No individual L1 alerts matched this window."))}</div>`}
   `;
 }
 
@@ -1380,34 +1383,38 @@ function renderSourceIps(data) {
 
 function renderCorrelation(data) {
   const cats = data.three_sum?.categories || [];
+  const historicalStatus = data.historical_detail?.l2;
   const config = data.three_sum?.configuration || {};
   const windowLabel = data.requested_range || "24h";
   const lookback = number(config.lookback_minutes || data.three_sum?.lookback_minutes || 60);
   const threshold = number(config.threshold_score || data.three_sum?.threshold_score || 35);
   setText("#correlationMeta", `${windowLabel} view | ${lookback}m lookback`);
-  setText("#correlationIntro", ui(`Kandidat memenuhi threshold skor ${threshold}+. Hitungan di bawah adalah source IP unik per kategori sinyal.`, `Candidates meet the ${threshold}+ score threshold. Counts below are unique source IPs by signal category.`));
+  setText("#correlationIntro", historicalStatus && historicalStatus.status !== "available"
+    ? historicalStatus.message
+    : ui(`Kandidat memenuhi threshold skor ${threshold}+. Hitungan di bawah adalah source IP unik per kategori sinyal.`, `Candidates meet the ${threshold}+ score threshold. Counts below are unique source IPs by signal category.`));
   const fallback = [
     { name: "Recon", ip_count: 0, entries: 0 },
     { name: "Exploit", ip_count: 0, entries: 0 },
     { name: "Impact", ip_count: 0, entries: 0 },
   ];
-  const rows = (cats.length ? cats : fallback).slice(0, 6);
+  const rows = (historicalStatus && historicalStatus.status !== "available") ? [] : (cats.length ? cats : fallback).slice(0, 6);
   setHtml("#correlationGrid", rows.map((cat) => `
     <div class="corrCell">
       <span class="muted">${esc(cat.name || cat.category || "signal")}</span>
       <strong>${fmt.format(number(cat.ip_count || cat.entries || cat.count))}</strong>
       <small>${ui("source IP terdeteksi", "source IPs detected")}</small>
     </div>
-  `).join(""));
+  `).join("") || `<div class="emptyState">${esc(historicalStatus?.message || "No correlation candidates returned.")}</div>`);
 }
 
 function renderAiRecon(data) {
   const sources = data.ai_recon?.sources || [];
+  const historicalStatus = data.historical_detail?.l2;
   const windowLabel = data.ai_recon?.window?.since || data.requested_range || "selected window";
   const sourceCount = number(data.ai_recon?.ai_agent_sources || sources.length);
   setText("#aiReconMeta", `${windowLabel} | ${fmt.format(sourceCount)} sources`);
   setText("#aiReconIntro", ui("Pola request menyerupai probe otomatis terhadap file sensitif. Ini belum membuktikan penggunaan AI atau keberhasilan eksploitasi.", "Request patterns resemble automated probing of sensitive files. This does not prove AI usage or successful exploitation."));
-  setHtml("#aiReconList", sources.map((source) => `
+  setHtml("#aiReconList", historicalStatus && historicalStatus.status !== "available" ? `<div class="emptyState">${esc(historicalStatus.message)}</div>` : sources.map((source) => `
     <div class="intelItem">
       <div>
         <strong>${esc(source.srcip || source.source_ip || "-")}</strong>
@@ -1795,7 +1802,7 @@ function renderIncidentBoard(data) {
 
 async function loadPersistentCases() {
   try {
-    const result = await postJson("/api/incidents/list", {});
+    const result = await postJson("/api/incidents/list", currentWindowPayload());
     state.persistentCases = result.ok ? result.cases || [] : [];
   } catch (_) {
     state.persistentCases = [];
@@ -1820,23 +1827,6 @@ async function saveIncidentCase(incident, button) {
     button.disabled = false;
     button.textContent = `Retry: ${error.message}`;
   }
-}
-
-function renderHuntMatrix(data) {
-  const caps = data.tools?.capabilities || {};
-  const rows = [
-    ["Recon", "AI bot recon, path probes, suspicious scanners", number(data.ai_recon?.ai_agent_sources)],
-    ["IOC Intel", "ThreatFox, OTX, GreyNoise, CrowdSec pivots", capCount(caps, "threat_intel")],
-    ["Exposure", "CVE, EPSS, KEV, PoC, dependency scan", capCount(caps, "vulnerability") + capCount(caps, "dependency")],
-    ["Response", "Block, isolate, firewall, active response", capCount(caps, "response")],
-  ];
-  setHtml("#huntMatrix", rows.map(([name, body, value]) => `
-    <div class="huntCell">
-      <em>${fmt.format(number(value))} signals/tools</em>
-      <strong>${esc(name)}</strong>
-      <small>${esc(body)}</small>
-    </div>
-  `).join(""));
 }
 
 function fallbackProviderRows(data) {
@@ -2772,24 +2762,6 @@ function capabilityCard(name, value, desc) {
       </div>
     </div>
   `;
-}
-
-function renderCapabilities(data) {
-  const caps = data.tools?.capabilities || {};
-  const huntRows = [
-    ["Threat Hunting", capCount(caps, "hunt"), "INFOKOM/Wazuh hunt and IOC pivots"],
-    ["Threat Intel", capCount(caps, "threat_intel"), "OTX, GreyNoise, ThreatFox, CrowdSec checks"],
-    ["AI Recon", data.ai_recon?.ai_agent_sources, "Bot and suspicious path recon findings"],
-    ["Correlation", data.three_sum?.candidate_count, "Three-sum multi-signal candidates"],
-  ];
-  const responseRows = [
-    ["Response/SOAR", capCount(caps, "response"), "Containment and response helper tools"],
-    ["Compliance", capCount(caps, "compliance"), "PCI/GDPR/HIPAA/NIST evidence helpers"],
-    ["Dependency Scan", capCount(caps, "dependency"), "Package and software dependency triage"],
-    ["CVE Enrichment", capCount(caps, "vulnerability"), "EPSS, KEV, PoC, advisory, SSVC scoring"],
-  ];
-  setHtml("#huntCapabilities", huntRows.map(([name, value, desc]) => capabilityCard(name, value, desc)).join(""));
-  setHtml("#responseCapabilities", responseRows.map(([name, value, desc]) => capabilityCard(name, value, desc)).join(""));
 }
 
 function inputTypeForSetting(field) {

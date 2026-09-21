@@ -401,7 +401,7 @@
     } catch (error) { showStatus(error.message); }
     finally { actionBusy = false; button.disabled = false; }
   }
-  document.querySelector('#runAutomation').onclick = e => action(e.currentTarget, '/api/automation/run');
+  document.querySelector('#runAutomation').onclick = e => action(e.currentTarget, '/api/automation/run', window.SocWindow?.payload?.() || {range: '24h'});
   document.querySelector('#testAnalyst').onclick = e => action(e.currentTarget, '/api/automation/ai-ping');
   document.querySelector('#testSmtp').onclick = e => action(e.currentTarget, '/api/automation/smtp-test');
   document.querySelector('#sendReportEmail').onclick = e => action(e.currentTarget, '/api/automation/send', {channel:'email'});

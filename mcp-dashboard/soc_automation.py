@@ -1573,6 +1573,7 @@ class Automation:
         self.error = None
         self.next_run = time.time() + 30
         self.stop = threading.Event()
+        self.requested_window = {"range": "24h"}
 
     @contextmanager
     def db(self):
@@ -2595,18 +2596,24 @@ class Automation:
         finally:
             self.ai_lock.release()
 
-    def trigger(self):
+    def trigger(self, window=None):
+        if isinstance(window, str):
+            window = {"range": window}
+        window = dict(window or {"range": "24h"})
+        if window.get("range") not in {"24h", "7d", "30d", "custom"}:
+            window = {"range": "24h"}
         with self.lock:
             if self.running:
                 return {"started": False, "reason": "Analysis already running"}
+            self.requested_window = window
             self.running = True
             self.phase = "coverage"
-        threading.Thread(target=self.run, daemon=True).start()
-        return {"started": True}
+        threading.Thread(target=self.run, args=(window,), daemon=True).start()
+        return {"started": True, "range": window.get("range", "24h")}
 
-    def run(self):
+    def run(self, window=None):
         try:
-            report = self.build()
+            report = self.build(window or self.requested_window)
             created = time.time()
             with self.db() as db:
                 cursor = db.execute("INSERT INTO reports(created,data) VALUES (?,?)", (created, json.dumps(report)))
@@ -2661,10 +2668,25 @@ class Automation:
             db.execute("INSERT OR REPLACE INTO deliveries VALUES (?,?,?,?)", (channel, report["id"], time.time(), json.dumps(result)))
         return result
 
-    def build(self):
+    def build(self, window=None):
         cfg = self.config()
         self.phase = "coverage"
-        coverage = self.coverage()
+        window = window or {"range": "24h"}
+        coverage_window = window
+        if isinstance(window, dict):
+            coverage_window = dict(window)
+            range_name = str(window.get("range") or "24h")
+            if window.get("start") and window.get("end"):
+                coverage_window["bounds"] = {"gte": window["start"], "lt": window["end"]}
+            elif range_name in {"24h", "7d", "30d"}:
+                coverage_window["bounds"] = {"gte": "now-" + range_name}
+            coverage_window.setdefault("label", range_name)
+        try:
+            coverage = self.coverage(coverage_window)
+        except TypeError:
+            # Keep third-party/test coverage adapters that still expose the old zero-arg contract.
+            coverage = self.coverage()
+        requested_range = window.get("range", "24h") if isinstance(window, dict) else str(window)
         if not coverage.get("ok"):
             raise RuntimeError("Wazuh query incomplete; analysis cycle not published")
         candidates = [r for r in coverage.get("observables", []) if public_indicator(r)]
@@ -2823,7 +2845,7 @@ class Automation:
                 "reference": vuln.get("reference"), "intelligence": intel, "evidence_basis": "Wazuh package inventory",
                 "recommendation": "Validasi versi dan advisory vendor; prioritaskan patch bila KEV atau layanan terekspos. Jadwalkan bersama pemilik aset, lalu scan ulang.",
                 "recommendation_en": "Verify installed version and vendor advisory; prioritize patches for KEV or exposed services. Coordinate with the asset owner and rescan."})
-        report = {"generated_at": now(), 'queue_attempts': queue_attempts, "coverage": {"index": coverage.get("index"), "range": "24h",
+        report = {"generated_at": now(), 'queue_attempts': queue_attempts, "coverage": {"index": coverage.get("index"), "range": requested_range,
             "indexed_events": coverage.get("total_events"), "events_with_observable": coverage.get("events_with_observable"),
             "loaded_candidates": len(coverage.get("observables", [])), "eligible_candidates": len(candidates),
             "analyzed_candidates": len(findings), "deferred_candidates": deferred, "new_external_lookups": used,
@@ -2838,7 +2860,7 @@ class Automation:
             "critical_inventory_records": inventories[0].get("total"),
             "high_inventory_records": inventories[1].get("total"), "cve_records_loaded": len(vulnerabilities)},
             "findings": findings, "vulnerabilities": vulnerabilities, "rules": coverage.get("rules", [])[:20],
-            "limitations": ["24-hour indexed alerts including decoded syslog; raw archives outside the alert index are not included.",
+            "limitations": [f"{requested_range} indexed alerts including decoded syslog; raw archives outside the alert index are not included.",
                 "IOC candidates are deduplicated and processed by priority queue; external provider calls are budgeted and cached with backoff to protect API quota.",
                 f"CYFIRMA matches use exact observables from bounded feeds (up to {feed_pages * 20} records per scope and {feed_budget} seconds per cycle).",
                 "Source reputation does not prove a device is infected. A reporting agent may be a log collector.",

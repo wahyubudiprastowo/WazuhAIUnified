@@ -79,6 +79,9 @@ _overview_cache_lock = threading.Lock()
 _overview_db_init_lock = threading.Lock()
 _overview_db_initialized = False
 _overview_refreshing: set[str] = set()
+_incident_cache_lock = threading.Lock()
+_incident_cache: dict[str, dict[str, Any]] = {}
+_incident_refreshing: set[str] = set()
 _infokom_session_lock = threading.Lock()
 _infokom_session: dict[str, Any] = {"expires": 0, "id": None}
 INDEXER_MAX_CONCURRENT_QUERIES = max(1, min(8, int(os.environ.get("SOC_INDEXER_MAX_CONCURRENT_QUERIES", "2") or "2")))
@@ -1212,12 +1215,85 @@ def _normalized_call(source: str, name: str, arguments: dict[str, Any]) -> dict[
     }
 
 
-def _incident_cases() -> dict[str, Any]:
+def _incident_cases_sync(payload: dict[str, Any] | None = None) -> dict[str, Any]:
     result = _normalized_call("infokom", "blueteam_case_list", {"response_format": "json"})
     data = result.get("json")
     if not result.get("ok") or not isinstance(data, list):
         return {"ok": False, "cases": [], "error": result.get("text") or "Case store unavailable"}
-    return {"ok": True, "cases": data[:100], "duration_ms": result.get("duration_ms", 0)}
+    payload = payload or {}
+    start_ts = end_ts = None
+    if payload.get("range") or payload.get("start") or payload.get("end"):
+        try:
+            start, end = soc_pipeline.bounds(_history_payload(payload))
+            start_ts, end_ts = datetime.fromisoformat(start).timestamp(), datetime.fromisoformat(end).timestamp()
+        except (TypeError, ValueError):
+            start_ts = end_ts = None
+    filtered = []
+    all_time = 0
+    for case in data[:200]:
+        if not isinstance(case, dict):
+            continue
+        raw_time = next((case.get(key) for key in ("created_at", "created", "opened_at", "updated_at", "updated") if case.get(key)), None)
+        case_ts = None
+        if raw_time is not None:
+            try:
+                if isinstance(raw_time, (int, float)):
+                    case_ts = float(raw_time)
+                else:
+                    case_ts = datetime.fromisoformat(str(raw_time).replace("Z", "+00:00")).timestamp()
+            except (TypeError, ValueError, OverflowError):
+                case_ts = None
+        row = dict(case)
+        row["all_time"] = case_ts is None
+        if row["all_time"]:
+            all_time += 1
+        if start_ts is not None and end_ts is not None and case_ts is not None and not (start_ts <= case_ts < end_ts):
+            continue
+        filtered.append(row)
+    return {"ok": True, "cases": filtered[:100], "all_time_count": all_time,
+            "window": {"start": start_ts, "end": end_ts} if start_ts is not None else {"scope": "all-time"},
+            "duration_ms": result.get("duration_ms", 0)}
+
+
+def _incident_cases(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Serve incident scope quickly; refresh the remote case store outside the request path."""
+    if payload is None:
+        return _incident_cases_sync()
+    key = hashlib.sha256(json.dumps({k: payload.get(k) for k in ("range", "start", "end")},
+                                    sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    now = time.time()
+    with _incident_cache_lock:
+        cached = _incident_cache.get(key)
+        refreshing = key in _incident_refreshing
+        if cached and now - cached["stored_at"] < 60:
+            return {**cached["data"], "cache": {"status": "hit", "age_seconds": int(now - cached["stored_at"])}}
+        should_start = not refreshing
+        if should_start:
+            _incident_refreshing.add(key)
+    result: dict[str, Any] = {}
+    completed = threading.Event()
+    def refresh() -> None:
+        try:
+            result["data"] = _incident_cases_sync(payload)
+            with _incident_cache_lock:
+                _incident_cache[key] = {"data": result["data"], "stored_at": time.time()}
+        except Exception as exc:
+            result["data"] = {"ok": False, "cases": [], "error": str(exc)}
+        finally:
+            with _incident_cache_lock:
+                _incident_refreshing.discard(key)
+            completed.set()
+    if should_start:
+        threading.Thread(target=refresh, daemon=True).start()
+    completed.wait(1.0)
+    if result.get("data"):
+        return {**result["data"], "cache": {"status": "miss", "age_seconds": 0}}
+    with _incident_cache_lock:
+        cached = _incident_cache.get(key)
+    if cached:
+        return {**cached["data"], "cache": {"status": "stale-refreshing", "age_seconds": int(now - cached["stored_at"]),
+                                              "note": "Case store refresh continues in background."}}
+    return {"ok": False, "cases": [], "status": "materializing", "error": "Persistent case detail is still loading; retry shortly."}
 
 
 def _incident_create(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1831,6 +1907,45 @@ def _overview_cache_init() -> None:
             """)
             db.execute("CREATE INDEX IF NOT EXISTS idx_provider_fact_time ON provider_history_provider(observed_at,provider)")
             db.execute("""
+                CREATE TABLE IF NOT EXISTS provider_health (
+                    provider TEXT PRIMARY KEY,
+                    state TEXT NOT NULL,
+                    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                    next_retry_at REAL,
+                    last_success_at REAL,
+                    last_failure_at REAL,
+                    last_error TEXT,
+                    updated_at REAL NOT NULL
+                )
+            """)
+            db.execute("CREATE INDEX IF NOT EXISTS idx_provider_health_retry ON provider_health(next_retry_at)")
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS cve_exposure_summary (
+                    snapshot_key TEXT NOT NULL,
+                    path_key TEXT NOT NULL,
+                    observed_at REAL NOT NULL,
+                    requested_range TEXT NOT NULL,
+                    cve TEXT NOT NULL,
+                    asset TEXT,
+                    agent_id TEXT,
+                    component TEXT,
+                    version TEXT,
+                    cpe TEXT,
+                    cpe_status TEXT,
+                    epss REAL,
+                    kev INTEGER,
+                    poc INTEGER,
+                    internet_exposure INTEGER,
+                    patch_state TEXT,
+                    case_id TEXT,
+                    risk_score REAL,
+                    priority TEXT,
+                    PRIMARY KEY(snapshot_key, path_key)
+                )
+            """)
+            db.execute("CREATE INDEX IF NOT EXISTS idx_cve_exposure_snapshot ON cve_exposure_summary(snapshot_key)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_cve_exposure_time ON cve_exposure_summary(observed_at)")
+            db.execute("""
                 CREATE TABLE IF NOT EXISTS provider_history_cve (
                     history_id INTEGER NOT NULL,
                     cve TEXT NOT NULL,
@@ -1840,6 +1955,117 @@ def _overview_cache_init() -> None:
             """)
             db.execute("CREATE INDEX IF NOT EXISTS idx_provider_cve_time ON provider_history_cve(observed_at,cve)")
         _overview_db_initialized = True
+
+
+def _provider_health(provider: str) -> dict[str, Any]:
+    provider = str(provider or "unknown").strip() or "unknown"
+    try:
+        _overview_cache_init()
+        with _sqlite_db(OVERVIEW_CACHE_DB) as db:
+            row = db.execute(
+                "SELECT state,consecutive_failures,next_retry_at,last_success_at,last_failure_at,last_error,updated_at "
+                "FROM provider_health WHERE provider=?", (provider,)
+            ).fetchone()
+        if not row:
+            return {"provider": provider, "state": "unknown", "consecutive_failures": 0, "retry_at": None}
+        retry_at = float(row[2]) if row[2] else None
+        state = str(row[0] or "unknown")
+        if state == "backoff" and retry_at and retry_at <= time.time():
+            state = "recovering"
+        return {"provider": provider, "state": state, "consecutive_failures": int(row[1] or 0),
+                "retry_at": datetime.fromtimestamp(retry_at, timezone.utc).isoformat() if retry_at else None,
+                "last_success_at": datetime.fromtimestamp(float(row[3]), timezone.utc).isoformat() if row[3] else None,
+                "last_failure_at": datetime.fromtimestamp(float(row[4]), timezone.utc).isoformat() if row[4] else None,
+                "last_error": row[5], "updated_at": datetime.fromtimestamp(float(row[6]), timezone.utc).isoformat() if row[6] else None}
+    except (sqlite3.Error, OSError, ValueError, TypeError):
+        return {"provider": provider, "state": "unavailable", "consecutive_failures": 0, "retry_at": None}
+
+
+def _provider_health_record(provider: str, ok: bool, error: Any = None) -> dict[str, Any]:
+    provider = str(provider or "unknown").strip() or "unknown"
+    now = time.time()
+    try:
+        _overview_cache_init()
+        with _sqlite_db(OVERVIEW_CACHE_DB) as db:
+            row = db.execute("SELECT consecutive_failures FROM provider_health WHERE provider=?", (provider,)).fetchone()
+            failures = int(row[0] or 0) if row else 0
+            if ok:
+                values = (provider, "healthy", 0, None, now, None, None, now)
+            else:
+                failures += 1
+                base = max(30, _runtime_int("SOC_PROVIDER_ERROR_BACKOFF_SECONDS", 14400))
+                retry_at = now + min(base * (2 ** min(failures - 1, 5)), 86400)
+                values = (provider, "backoff", failures, retry_at, None, now, str(error or "provider error")[:400], now)
+            db.execute("""REPLACE INTO provider_health
+                (provider,state,consecutive_failures,next_retry_at,last_success_at,last_failure_at,last_error,updated_at)
+                VALUES (?,?,?,?,?,?,?,?)""", values)
+    except (sqlite3.Error, OSError):
+        pass
+    return _provider_health(provider)
+
+
+def _provider_health_rows() -> dict[str, dict[str, Any]]:
+    try:
+        _overview_cache_init()
+        with _sqlite_db(OVERVIEW_CACHE_DB) as db:
+            names = [row[0] for row in db.execute("SELECT provider FROM provider_health ORDER BY provider")]
+        return {name: _provider_health(name) for name in names}
+    except (sqlite3.Error, OSError):
+        return {}
+
+
+def _materialize_cve_exposure(graph: dict[str, Any], request: dict[str, Any]) -> dict[str, Any]:
+    """Persist bounded CVE exposure paths so historical views never need a provider call."""
+    request_key = json.dumps({key: request.get(key) for key in ("severity", "search", "sort", "limit", "historical", "start", "end")},
+                             sort_keys=True, separators=(",", ":"))
+    snapshot_key = hashlib.sha256(request_key.encode("utf-8")).hexdigest()
+    observed_at = time.time()
+    paths = graph.get("paths") if isinstance(graph.get("paths"), list) else []
+    rows = []
+    for index, path in enumerate(paths):
+        if not isinstance(path, dict) or not path.get("cve"):
+            continue
+        identity = "|".join(str(path.get(key) or "") for key in ("cve", "asset", "agent_id", "component", "version"))
+        path_key = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+        def numeric(value):
+            try:
+                return float(value) if value is not None else None
+            except (TypeError, ValueError):
+                return None
+        rows.append((snapshot_key, path_key, observed_at, str(request.get("range") or "current"),
+                     str(path.get("cve")), path.get("asset"), path.get("agent_id"), path.get("component"),
+                     path.get("version"), path.get("cpe"), path.get("cpe_status"), numeric(path.get("epss")),
+                     None if path.get("kev") is None else int(bool(path.get("kev"))),
+                     None if path.get("poc") is None else int(bool(path.get("poc"))),
+                     None if path.get("internet_exposed") is None else int(bool(path.get("internet_exposed"))),
+                     path.get("patch_state"), path.get("case_id"), numeric(path.get("risk_score")), path.get("priority")))
+    try:
+        _overview_cache_init()
+        with _sqlite_db(OVERVIEW_CACHE_DB) as db:
+            db.execute("DELETE FROM cve_exposure_summary WHERE snapshot_key=?", (snapshot_key,))
+            db.executemany("""INSERT OR REPLACE INTO cve_exposure_summary
+                (snapshot_key,path_key,observed_at,requested_range,cve,asset,agent_id,component,version,cpe,cpe_status,epss,kev,poc,internet_exposure,patch_state,case_id,risk_score,priority)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", rows)
+            db.execute("DELETE FROM cve_exposure_summary WHERE observed_at < ?",
+                       (time.time() - OVERVIEW_HISTORY_RETENTION_DAYS * 86400,))
+            counts = db.execute("""SELECT COUNT(*),COUNT(DISTINCT cve),
+                SUM(CASE WHEN cpe_status='valid' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN epss IS NOT NULL THEN 1 ELSE 0 END),
+                SUM(CASE WHEN kev IS NOT NULL THEN 1 ELSE 0 END),
+                SUM(CASE WHEN poc IS NOT NULL THEN 1 ELSE 0 END),
+                SUM(CASE WHEN internet_exposure IS NOT NULL THEN 1 ELSE 0 END),
+                SUM(CASE WHEN patch_state IS NOT NULL AND patch_state!='unknown' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN case_id IS NOT NULL AND case_id!='' THEN 1 ELSE 0 END)
+                FROM cve_exposure_summary WHERE snapshot_key=?""", (snapshot_key,)).fetchone()
+        graph["materialized_summary"] = {
+            "snapshot_key": snapshot_key, "source": "sqlite cve_exposure_summary", "paths": int(counts[0] or 0),
+            "cves": int(counts[1] or 0), "cpe": int(counts[2] or 0), "epss": int(counts[3] or 0),
+            "kev": int(counts[4] or 0), "poc": int(counts[5] or 0), "internet_exposure": int(counts[6] or 0),
+            "patch_state": int(counts[7] or 0), "case": int(counts[8] or 0),
+        }
+    except (sqlite3.Error, OSError):
+        graph["materialized_summary"] = {"source": "unavailable", "paths": len(rows), "error": "summary persistence unavailable"}
+    return graph
 
 
 def _api_cache_key(payload: Any) -> str:
@@ -2172,7 +2398,14 @@ def _provider_freshness() -> dict[str, Any]:
                 "quota_remaining": quota,
                 "reason_not_used": reason,
                 "source": "materialized provider history",
+                "health": _provider_health(provider),
             })
+        for provider, health in _provider_health_rows().items():
+            if not any(row.get("provider") == provider for row in providers):
+                providers.append({"provider": provider, "observed_at": None, "age_seconds": None,
+                                  "status": "health_only", "quota_remaining": None,
+                                  "reason_not_used": health.get("last_error"),
+                                  "source": "provider circuit state", "health": health})
     except (sqlite3.Error, OSError, ValueError, TypeError):
         return {"providers": [], "status": "unavailable"}
     return {"providers": providers, "status": "available" if providers else "empty",
@@ -2359,6 +2592,15 @@ def _materialized_overview(window: dict[str, Any], payload: Any) -> dict[str, An
             "note": ("The selected range is fully served from durable rollups."
                      if rollup_complete else "An exact Indexer snapshot is building in the background; available rollups and summaries remain visible meanwhile."),
         },
+        "historical_detail": {
+            "status": "available" if rollup_complete else "materializing",
+            "l1": {"status": "unavailable" if rollup_complete else "materializing",
+                    "message": ("Individual historical L1 alerts are not retained in the rollup." if rollup_complete
+                                 else "Historical L1 detail is materializing in the background.")},
+            "l2": {"status": "unavailable" if rollup_complete else "materializing",
+                    "message": ("Historical L2 replay is not available from the bounded rollup." if rollup_complete
+                                 else "Historical L2 correlation is materializing in the background.")},
+        },
         "tools": {
             "total": len(cached_tools), "gensecai": sum(1 for row in cached_tools if row.get("source") == "gensecai"),
             "infokom": sum(1 for row in cached_tools if row.get("source") == "infokom"), "capabilities": tool_caps,
@@ -2420,6 +2662,67 @@ def _materialized_overview(window: dict[str, Any], payload: Any) -> dict[str, An
     }
 
 
+def _historical_snapshot_placeholder(window: dict[str, Any]) -> dict[str, Any]:
+    """Return a truthful, bounded response while the first long-range snapshot builds."""
+    cached_tools = list(_tools_cache.get("tools") or [])
+    return {
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "requested_range": window.get("requested"),
+        "window": {"label": window.get("label"), "range": window.get("requested"), "bounds": window.get("bounds")},
+        "materialization": {"status": "building", "exact": False, "source": "background historical materializer",
+                             "coverage": {}, "note": "Historical detail is materializing asynchronously; no live Indexer query is held open."},
+        "historical_detail": {
+            "status": "materializing",
+            "l1": {"status": "materializing", "message": "Historical L1 detail is materializing in the background."},
+            "l2": {"status": "materializing", "message": "Historical L2 correlation is materializing in the background."},
+        },
+        "tools": {"total": len(cached_tools), "gensecai": sum(1 for row in cached_tools if row.get("source") == "gensecai"),
+                  "infokom": sum(1 for row in cached_tools if row.get("source") == "infokom"),
+                  "capabilities": _tool_capabilities(cached_tools)},
+        "analysis_funnel": {"indexed_events": None, "pipeline_status": "materializing", "ai_strategy": "case_and_rollup"},
+        "alerts": {"time_range": window.get("label"), "total_alerts": None, "sampled": 0, "truncated": False,
+                   "groups": {}, "severity": {}, "hourly": []},
+        "threats": [], "source_ips": [], "l1_queue": [],
+        "timeline": {"ok": False, "bucket_interval": "pending", "total_alerts": None, "buckets": []},
+        "cloud_m365": {"ok": False, "status": "materializing", "total": None, "workloads": [], "operations": [], "client_ips": [], "events": []},
+        "detection_layers": [],
+        "operational_evidence": {"data_quality": {"indexed_events": None, "partial": True, "source": "background historical materializer",
+                                                   "note": "Exact decoder and telemetry detail is not available until materialization completes."},
+                                 "network": {"events": [], "observed": 0}, "identity": {"events": [], "observed": 0},
+                                 "mitre": {"techniques": [], "timeline": [], "observed": 0},
+                                 "decoders": {"items": [], "observed": 0, "named_events": None, "coverage_percent": None, "unmatched_events": None},
+                                 "telemetry": {"indexer": {"health": "materializing", "scope": "Background historical aggregation is running."}}},
+        "provider_freshness": _provider_freshness(), "fim": {"total": 0, "top_paths": [], "top_agents": []},
+        "auth": {"ok": False, "status": "materializing", "events": None}, "web": {"ok": False, "status": "materializing", "events": None},
+        "attack_surface": {"sources": [], "web_recon": [], "targets": [], "destinations": [], "cities": []},
+        "agents": {"total": None, "counts": {}, "platforms": {}, "items": [], "context": [], "context_coverage": {}},
+        "three_sum": {"ok": False, "status": "materializing", "categories": [], "candidate_count": 0},
+        "ai_recon": {"ok": False, "status": "materializing", "ai_agent_sources": 0, "sources": []},
+        "vulnerabilities": {"total": None, "affected_agents": None, "critical": None, "high": None, "medium": None, "low": None,
+                            "by_severity": {}, "critical_items": [], "evidence_coverage": {"wazuh_inventory": False}},
+        "soc_lanes": {"l1": {"open_alerts": None, "active_agents": None, "queue": []},
+                      "l2": {"ai_recon_sources": None, "critical_vulnerabilities": None, "correlation_categories": []},
+                      "l3": {"hunting_tools": {}, "response_tools": {}, "compliance_tools": {}}},
+        "errors": {},
+    }
+
+
+def _ensure_historical_detail(data: dict[str, Any], window: dict[str, Any]) -> dict[str, Any]:
+    """Backfill explicit L1/L2 availability on snapshots created before the status contract."""
+    if window.get("requested") not in {"7d", "30d", "custom"} or data.get("historical_detail"):
+        return data
+    exact = bool((data.get("materialization") or {}).get("exact"))
+    status = "partial" if exact else "materializing"
+    message = ("Historical detail is not replayed by the bounded overview snapshot."
+               if exact else "Historical detail is materializing in the background.")
+    data["historical_detail"] = {
+        "status": status,
+        "l1": {"status": "unavailable" if exact else "materializing", "message": message},
+        "l2": {"status": "unavailable" if exact else "materializing", "message": message},
+    }
+    return data
+
+
 def _overview_cached(payload: Any = "24h") -> dict[str, Any]:
     force_refresh = isinstance(payload, dict) and bool(payload.get("force"))
     window = _window_from_payload(payload)
@@ -2429,6 +2732,7 @@ def _overview_cached(payload: Any = "24h") -> dict[str, Any]:
     now = time.time()
     if cached and cached["expires_at"] > now and not force_refresh:
         data = dict(cached["data"])
+        _ensure_historical_detail(data, window)
         data["cache"] = {
             **(data.get("cache") or {}),
             "status": "hit",
@@ -2438,6 +2742,7 @@ def _overview_cached(payload: Any = "24h") -> dict[str, Any]:
         return data
     if cached and not force_refresh:
         data = dict(cached["data"])
+        _ensure_historical_detail(data, window)
         data["cache"] = {
             **(data.get("cache") or {}),
             "status": "stale-refreshing",
@@ -2447,7 +2752,16 @@ def _overview_cached(payload: Any = "24h") -> dict[str, Any]:
         _overview_refresh_async(cache_key, window, payload, ttl)
         return data
     if not cached and not force_refresh and window.get("requested") in {"7d", "30d", "custom"}:
-        data = _materialized_overview(window, payload)
+        result: dict[str, Any] = {}
+        completed = threading.Event()
+        def materialize_fast() -> None:
+            try:
+                result["data"] = _materialized_overview(window, payload)
+            finally:
+                completed.set()
+        threading.Thread(target=materialize_fast, daemon=True).start()
+        completed.wait(0.05)
+        data = result.get("data") or _historical_snapshot_placeholder(window)
         if data.get("materialization", {}).get("exact"):
             data["cache"] = {"status": "rollup", "age_seconds": 0, "ttl_seconds": ttl}
             return data
@@ -3149,6 +3463,15 @@ def _overview(payload: Any = "24h") -> dict[str, Any]:
             "source": "bounded Indexer aggregation with retained dashboard snapshot",
             "historical_retention_days": OVERVIEW_HISTORY_RETENTION_DAYS,
         },
+        "historical_detail": {
+            "status": "available" if not historical_window else "partial",
+            "l1": {"status": "available" if not historical_window else "unavailable",
+                    "message": ("Live L1 alert detail is available." if not historical_window else
+                                 "Historical individual L1 alerts are not replayed by the bounded overview query.")},
+            "l2": {"status": "available" if not historical_window else "unavailable",
+                    "message": ("Live L2 correlation and AI recon are available." if not historical_window else
+                                 "Historical L2 correlation and AI recon are not replayed by the bounded overview query.")},
+        },
         "window": {
             "label": window["label"],
             "range": window["requested"],
@@ -3340,6 +3663,12 @@ def _finding_intel(kind: str, indicator: str = "", observed_at: Any = None) -> d
         "kev": ("blueteam_cve_kev", {"cve_id": indicator}),
         "poc": ("blueteam_cve_poc", {"cve_id": indicator}),
     }
+    provider_for_kind = {
+        "cyfirma": "CYFIRMA", "threatfox": "ThreatFox", "urlhaus": "URLHaus",
+        "urlhaus_hash": "URLHaus", "crowdsec": "CrowdSec", "otx": "AlienVault OTX",
+        "greynoise": "GreyNoise", "cve": "CVE enrichment", "nvd": "NVD",
+        "kev": "CISA KEV", "poc": "PoC enrichment",
+    }
     if kind not in requests or (kind not in {"feed", "feed_global"} and not indicator):
         raise ValueError("Unsupported enrichment request")
     if kind in {"feed", "feed_global"}:
@@ -3371,6 +3700,12 @@ def _finding_intel(kind: str, indicator: str = "", observed_at: Any = None) -> d
     cache_payload = {"kind": kind, "indicator": indicator}
     disk_cached = _api_cache_read("finding_intel", cache_payload, _runtime_int("SOC_PROVIDER_OK_CACHE_SECONDS", 21600))
     if disk_cached:
+        provider = provider_for_kind.get(kind)
+        health = _provider_health(provider) if provider else None
+        retryable_error = bool(provider and not disk_cached.get("ok") and health and health.get("state") in {"recovering", "unknown"})
+        if retryable_error:
+            disk_cached = None
+    if disk_cached:
         disk_cached["cached"] = True
         disk_cached = _merge_finding_history(kind, indicator, disk_cached)
         _provider_history_write("finding_intel", cache_payload, disk_cached, observed_at)
@@ -3388,6 +3723,19 @@ def _finding_intel(kind: str, indicator: str = "", observed_at: Any = None) -> d
         if slot["expires"] > time.time():
             return dict(slot["result"], cached=True)
         name, arguments = requests[kind]
+        provider = provider_for_kind.get(kind)
+        if provider:
+            health = _provider_health(provider)
+            retry_at = health.get("retry_at")
+            if health.get("state") == "backoff" and retry_at:
+                result = {"ok": False, "name": name, "source": "infokom", "data": None,
+                          "error": f"{provider} provider is in backoff; retry after {retry_at}",
+                          "provider": provider, "health": health, "cached": False}
+                result = _api_cache_write("finding_intel", cache_payload, result,
+                                          _runtime_int("SOC_PROVIDER_ERROR_BACKOFF_SECONDS", 14400))
+                _provider_history_write("finding_intel", cache_payload, result, observed_at)
+                slot.update(result=result, expires=time.time() + 60)
+                return result
         result = _safe_call("infokom", name, dict(arguments, response_format="json"))
         data = result.get("data")
         if kind == "aggregate" and isinstance(data, dict) and isinstance(data.get("results"), list):
@@ -3408,6 +3756,15 @@ def _finding_intel(kind: str, indicator: str = "", observed_at: Any = None) -> d
         if data is None:
             result["ok"] = False
             result["error"] = result.get("error") or result.get("text") or "No structured response"
+        if provider:
+            result["provider"] = provider
+            result["health"] = _provider_health_record(provider, bool(result.get("ok")), result.get("error"))
+        elif kind == "aggregate" and isinstance(data, dict):
+            for row in data.get("results") or []:
+                if not isinstance(row, dict):
+                    continue
+                provider_name = str(row.get("provider") or "unknown")
+                _provider_health_record(provider_name, not bool(row.get("error")), row.get("error"))
         result.update(generated_at=datetime.now(timezone.utc).isoformat(), cached=False)
         result = _merge_finding_history(kind, indicator, result)
         ttl = _runtime_int("SOC_PROVIDER_OK_CACHE_SECONDS", 21600) if result.get("ok") and not result.get("partial") else _runtime_int("SOC_PROVIDER_ERROR_BACKOFF_SECONDS", 14400)
@@ -3641,7 +3998,7 @@ class Handler(SimpleHTTPRequestHandler):
                 _json_response(self, 200, automation.status(payload.get('known_revision')))
                 return
             if self.path == "/api/automation/run":
-                _json_response(self, 202, automation.trigger())
+                _json_response(self, 202, automation.trigger(payload))
                 return
             if self.path == "/api/automation/ai-test":
                 _json_response(self, 200, automation.test_ai())
@@ -3666,7 +4023,7 @@ class Handler(SimpleHTTPRequestHandler):
                 _json_response(self, 200, _tools_response())
                 return
             if self.path == "/api/incidents/list":
-                _json_response(self, 200, _incident_cases())
+                _json_response(self, 200, _incident_cases(payload))
                 return
             if self.path == "/api/incidents/create":
                 _json_response(self, 200, _incident_create(payload))
@@ -3736,13 +4093,15 @@ class Handler(SimpleHTTPRequestHandler):
                 request = {
                     "severity": payload.get("severity", "all"), "search": payload.get("search", ""),
                     "sort": payload.get("sort", "cve"), "limit": min(int(payload.get("limit", 100)), 100),
-                    "include_summary": False,
+                    "include_summary": False, "range": payload.get("range", "24h"),
                 }
                 if historical:
                     start, end = soc_pipeline.bounds(_history_payload(payload))
                     request.update({"historical": True, "start": start, "end": end})
                 cached = _api_cache_read("cve_exposure", request, 900)
                 if cached:
+                    if not cached.get("materialized_summary"):
+                        cached = _materialize_cve_exposure(cached, request)
                     _json_response(self, 200, cached)
                     return
                 if historical:
@@ -3771,6 +4130,7 @@ class Handler(SimpleHTTPRequestHandler):
                     "cached_cve_enrichment": len(cached_intelligence),
                     "history": history,
                 })
+                graph = _materialize_cve_exposure(graph, request)
                 _json_response(self, 200, _api_cache_write("cve_exposure", request, graph, 900))
                 return
             if self.path == "/api/findings/evidence":
@@ -3882,7 +4242,7 @@ class BoundedThreadingHTTPServer(ThreadingHTTPServer):
 
 
 automation = soc_automation.Automation(_runtime_config_values,
-    lambda: analysis_coverage(_indexer_search, "24h"), _finding_intel, _finding_evidence,
+    lambda window: analysis_coverage(_indexer_search, window), _finding_intel, _finding_evidence,
     lambda payload: vulnerability_inventory(_indexer_search, payload), _safe_call,
     AUTOMATION_DB, _provider_history_write)
 pipeline = soc_pipeline.Pipeline(automation, _indexer_request)
