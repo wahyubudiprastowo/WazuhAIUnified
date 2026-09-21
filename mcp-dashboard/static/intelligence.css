@@ -1,0 +1,45 @@
+.intelligenceLedger { min-width: 0; padding: 14px 16px 18px; }
+.intelMetrics { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); border: 1px solid var(--line); background: rgba(8,20,31,.32); }
+.intelMetric { min-width: 0; padding: 13px 15px; border-right: 1px solid var(--line); }
+.intelMetric:last-child { border-right: 0; }
+.intelMetric span, .intelMetric small { display: block; color: var(--muted); font-size: 11px; line-height: 1.45; }
+.intelMetric strong { display: block; margin: 5px 0 2px; font-size: 21px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.intelProvenance { display: flex; flex-wrap: wrap; gap: 8px 18px; padding: 12px 0; color: var(--muted); font-size: 11px; line-height: 1.55; }
+.intelProvenance strong { color: var(--text); }
+.intelLayout { display: grid; grid-template-columns: minmax(0,1.45fr) minmax(320px,.75fr); gap: 16px; align-items: start; }
+.intelLayout > section, .intelLayout > aside { min-width: 0; border: 1px solid var(--line); background: rgba(8,20,31,.2); }
+.intelSectionHead { min-height: 48px; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 11px 13px; border-bottom: 1px solid var(--line); }
+.intelSectionHead h3 { margin: 0; font-size: 13px; }
+.intelSectionHead span { color: var(--muted); font-size: 11px; text-align: right; }
+.intelUpdates { max-height: 560px; overflow: auto; }
+.intelUpdate { padding: 13px; border-bottom: 1px solid var(--line); }
+.intelUpdate:last-child { border-bottom: 0; }
+.intelUpdate header { display: flex; justify-content: space-between; gap: 14px; align-items: start; }
+.intelUpdate h3 { margin: 3px 0 0; font-size: 13px; line-height: 1.5; overflow-wrap: anywhere; }
+.intelUpdate header > strong { color: var(--cyan); font-size: 18px; text-align: right; font-variant-numeric: tabular-nums; }
+.intelUpdate header > strong small { display: block; color: var(--muted); font-size: 9px; font-weight: 500; }
+.intelSource { color: var(--green); font-size: 10px; font-weight: 700; text-transform: uppercase; }
+.intelUpdate p { margin: 8px 0; color: var(--muted); font-size: 11px; line-height: 1.6; }
+.intelUpdate footer { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 9px; color: var(--muted); font-size: 10px; }
+.intelBadges { display: flex; flex-wrap: wrap; gap: 5px; }
+.intelBadge { display: inline-flex; align-items: center; min-height: 22px; padding: 2px 6px; border: 1px solid #425762; border-radius: 3px; color: #c8dbe2; font-size: 9px; }
+.intelBadge.good { border-color: #31856d; color: #82e3c4; }
+.intelBadge.warn, .intelBadge.cve { border-color: #9a7437; color: #f1ca82; }
+.intelBadge.bad { border-color: #a84f60; color: #ff98aa; }
+.intelTableWrap { overflow: auto; }
+.intelTableWrap table { width: 100%; min-width: 460px; border-collapse: collapse; font-size: 10px; }
+.intelTableWrap th, .intelTableWrap td { padding: 9px; text-align: left; border-bottom: 1px solid var(--line); vertical-align: top; }
+.intelTableWrap th { color: var(--muted); }
+.intelCveNotice { margin: 12px; padding: 12px; border-left: 3px solid var(--amber); background: rgba(179,125,39,.08); }
+.intelCveNotice strong { font-size: 11px; }
+.intelCveNotice p, .intelEmpty { color: var(--muted); font-size: 11px; line-height: 1.6; }
+.intelCveList { border-top: 1px solid var(--line); }
+.intelCveList > h3 { margin: 0; padding: 12px; font-size: 11px; }
+.intelCveItem { padding: 10px 12px; border-top: 1px solid var(--line); }
+.intelCveItem strong, .intelCveItem small { display: block; overflow-wrap: anywhere; }
+.intelCveItem strong { margin-bottom: 7px; font-size: 11px; line-height: 1.45; }
+.intelCveItem small { margin-top: 6px; color: var(--muted); font-size: 9px; }
+.intelEmpty { padding: 18px; }
+@media (max-width: 1050px) { .intelLayout { grid-template-columns: minmax(0,1fr); } }
+@media (max-width: 720px) { .intelMetrics { grid-template-columns: repeat(2,minmax(0,1fr)); } .intelMetric:nth-child(2) { border-right: 0; } .intelMetric:nth-child(-n+2) { border-bottom: 1px solid var(--line); } }
+@media (max-width: 440px) { .intelMetrics { grid-template-columns: minmax(0,1fr); } .intelMetric { border-right: 0; border-bottom: 1px solid var(--line); } .intelMetric:last-child { border-bottom: 0; } }

@@ -1,14 +1,13 @@
 # SOC Platform Audit Priorities
 
-Audit baseline: 2026-09-20. The catalog contains 194 tools (58 GenSecAI and
+Audit baseline: 2026-09-21. The catalog contains 194 tools (58 GenSecAI and
 136 INFOKOM). Every tool now has one primary dashboard menu, an execution
 policy, and a dependency classification. A menu load never executes a tool.
 
 The source audit resolves to 194 menu-mapped tools, 154 cached reads, 40
 approval-required operations, and 21 contextual Security Findings recipes.
-The process currently listening on port 8088 still reports the previous
-14-dashboard/180-on-demand model, so these source changes require a
-dashboard-only rebuild/restart before they are visible in production.
+Only the bounded hot-path workflows are automatic. The remaining capabilities
+are intentionally analyst-triggered and read their retained result on reuse.
 
 ## Implemented in this change
 
@@ -33,6 +32,12 @@ dashboard-only rebuild/restart before they are visible in production.
 - Security Findings exposes 21 context-aware, analyst-triggered recipes. Its
   intelligence tab uses one cached consensus aggregate rather than repeating
   direct provider calls, and hidden tabs load only when selected.
+- CYFIRMA feed snapshots are materialized into an idempotent daily SQLite
+  ledger. Vulnerability and Security Findings views read the ledger and stored
+  exact matches; changing 24h/7d/30d/custom ranges performs zero provider calls.
+- Tool inventory/count panels were removed from operational menus. Tool catalog
+  data belongs to Tool Console; operational menus now prioritize findings,
+  evidence, exposure, cases, and service health.
 - Historical backfill no longer sends the unsupported `request_cache` body key.
 - Static-file path traversal, unbounded request bodies, cross-origin writes,
   accidental high-risk tool calls, duplicate initial dashboard load, and an
@@ -87,8 +92,10 @@ dashboard-only rebuild/restart before they are visible in production.
 - **Threat Hunting - partial:** broad provider coverage exists; a durable hunt
   hypothesis, scope, approval, and conclusion workflow is still missing.
 - **Vulnerabilities - partial:** the exposure graph and EPSS/KEV/PoC enrichment
-  exist, while confirmed exposure quality still depends on populated asset CPE,
-  package version, internet exposure, and patch-state inputs.
+  and the stored CYFIRMA update ledger exist, while confirmed exposure quality
+  still depends on populated asset CPE, package version, internet exposure, and
+  patch-state inputs. Current CYFIRMA STIX feeds contain indicators, not a
+  complete CVE advisory/news catalog; only explicit CVE references are linked.
 - **Assets/CMDB - schema ready, deployment dependent:** owner, criticality,
   environment, zone, vendor/version, CPE, and patch fields are normalized. Real
   completeness cannot exceed the configured CMDB and Wazuh inventory quality.

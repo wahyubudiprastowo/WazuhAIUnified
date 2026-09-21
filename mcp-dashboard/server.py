@@ -2204,13 +2204,14 @@ def _cache_stats() -> dict[str, Any]:
 
 def _automation_db_stats() -> dict[str, Any]:
     stats = {"reports": 0, "report_summaries": 0, "ai_runs": 0, "finding_ai": 0,
-             "ioc_queue": 0, "scan_batches": 0, "rollup_windows": 0, "db_bytes": 0}
+             "ioc_queue": 0, "scan_batches": 0, "rollup_windows": 0,
+             "cyfirma_observations": 0, "cyfirma_feed_runs": 0, "db_bytes": 0}
     try:
         if AUTOMATION_DB.exists():
             stats["db_bytes"] = AUTOMATION_DB.stat().st_size
         with _sqlite_db(AUTOMATION_DB) as db:
             for table in ("reports", "report_summaries", "ai_runs", "finding_ai", "ioc_queue",
-                          "scan_batches", "rollup_windows"):
+                          "scan_batches", "rollup_windows", "cyfirma_observations", "cyfirma_feed_runs"):
                 try:
                     stats[table] = int(db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] or 0)
                 except sqlite3.OperationalError:
@@ -3539,6 +3540,20 @@ class Handler(SimpleHTTPRequestHandler):
                 if cached is None:
                     cached = _api_cache_write('workflow_evidence', window,
                         pipeline.rollup_summary(window['start'], window['end']), 60)
+                _json_response(self, 200, cached)
+                return
+            if self.path == '/api/intelligence/cyfirma':
+                window = _history_payload(payload)
+                start, end = soc_pipeline.bounds(window)
+                try:
+                    limit = min(max(int(payload.get('limit', 30)), 1), 100)
+                except (TypeError, ValueError):
+                    raise ValueError('Invalid intelligence result limit') from None
+                cache_payload = {**window, 'limit': limit}
+                cached = _api_cache_read('cyfirma_updates', cache_payload, 60)
+                if cached is None:
+                    cached = _api_cache_write('cyfirma_updates', cache_payload,
+                        automation.cyfirma_updates(start, end, limit), 60)
                 _json_response(self, 200, cached)
                 return
             if self.path == '/api/history/events':

@@ -556,8 +556,6 @@ function renderMetrics(data) {
   setText("#metricCriticalCves", fmt.format(number(data.vulnerabilities?.critical)));
   setText("#metricVulnTotal", `${fmt.format(number(data.vulnerabilities?.total))} ${ui("total", "total")}`);
   setText("#metricAiSources", fmt.format(number(data.ai_recon?.ai_agent_sources)));
-  setText("#metricTools", fmt.format(number(data.tools?.total)));
-  setText("#metricToolSplit", `${number(data.tools?.gensecai)} GenSecAI | ${number(data.tools?.infokom)} INFOKOM`);
 }
 
 function chartPoints(series, width = 620, height = 180, pad = 20) {
@@ -1288,36 +1286,6 @@ function renderSocWorkbench(data) {
     [ui("Buat Case", "Create Case"), ui("Buka objek investigasi untuk eskalasi.", "Open an investigation object for escalation."), ["blueteam_case_create", "blueteam_case_list"], "green"],
   ];
   setHtml("#socActionDeck", deck.map((item) => toolLaunchCard(...item)).join(""));
-  renderToolRail("#intelWorkbench", [
-    [ui("Skor Ancaman Terpadu", "Unified Threat Score"), ui("Gabungkan sinyal Wazuh dan skor intelijen.", "Blend Wazuh signal and intel scoring."), ["blueteam_unified_threat_score", "advanced_threat_intelligence"], "violet", { ip: hotIp }],
-    [ui("Konteks GreyNoise", "GreyNoise Context"), ui("Klasifikasi scanner dan trafik layanan bisnis.", "Classify scanner and business-service traffic."), ["greynoise_ip_context"], "blue", { ip: hotIp }],
-    ["OTX Lookup", "AlienVault OTX pulse and IOC lookup.", ["otx_lookup", "otx_lookup_bulk"], "green", { ip: hotIp }],
-    ["ThreatFox Search", "Malware and IOC database search.", ["threatfox_ioc_search"], "amber", { ip: hotIp }],
-    [ui("Ekstrak IOC", "Extract IOCs"), ui("Parse observable dari teks/log insiden.", "Parse observables from incident text/logs."), ["blueteam_extract_iocs"], "medium"],
-  ]);
-  renderToolRail("#responseWorkbench", [
-    [ui("Cek Blokir", "Check Block"), ui("Verifikasi apakah IP sumber sudah diblokir.", "Verify whether source IP is already blocked."), ["wazuh_check_blocked_ip"], "blue", { ip: hotIp }],
-    [ui("Blokir IP", "Block IP"), ui("Contain sumber mencurigakan via respons Wazuh.", "Contain suspicious source via Wazuh response."), ["wazuh_block_ip"], "critical", { ip: hotIp }],
-    [ui("Host Deny", "Host Deny"), ui("Tolak sumber pada control plane host.", "Deny source at host control plane."), ["wazuh_host_deny"], "high", { ip: hotIp }],
-    [ui("Isolasi Host", "Isolate Host"), ui("Kontrol isolasi endpoint.", "Endpoint isolation control."), ["wazuh_isolate_host"], "critical"],
-    [ui("Status Fail2ban", "Fail2ban Status"), ui("Cek jail lokal dan status ban.", "Check local jail and ban state."), ["blueteam_fail2ban_status", "blueteam_fail2ban_jail_status"], "medium"],
-  ]);
-  renderToolRail("#complianceWorkbench", [
-    [ui("Policy SCA", "SCA Policies"), ui("Hardening host dan assessment kontrol.", "Host hardening and control assessment."), ["blueteam_wazuh_list_sca_policies", "get_sca_policy_checks"], "green"],
-    [ui("Kepatuhan Wazuh", "Wazuh Compliance"), ui("Tampilan sinyal PCI/GDPR/HIPAA/NIST.", "PCI/GDPR/HIPAA/NIST signal view."), ["blueteam_wazuh_compliance", "run_compliance_check"], "blue"],
-    [ui("Gap ISO 27001", "ISO 27001 Gap"), ui("Analisis kontrol dan gap ISO.", "ISO control and gap analysis."), ["get_iso27001_gap_analysis", "get_iso27001_dashboard"], "violet"],
-    [ui("Ekspor Report", "Export Report"), ui("Paket bukti untuk insiden dan audit.", "Evidence pack for incident and audit."), ["blueteam_export_report", "generate_security_report"], "amber"],
-  ]);
-  setHtml("#cloudContainerWorkbench", (data.detection_layers || [])
-    .filter((layer) => ["container", "cloud", "web", "auth"].includes(layer.key))
-    .map((layer) => `
-      <button class="sourceTile ${esc(layer.status === "active" ? "active" : "ready")}" type="button" data-tool-name="${esc(layer.tool)}">
-        <span>${esc(layer.key)}</span>
-        <strong>${esc(layer.name)}</strong>
-        <small>${esc(layer.signal)}</small>
-        <b>${fmt.format(number(layer.count))}</b>
-      </button>
-    `).join("") || '<div class="emptyState">No source layer metadata.</div>');
 }
 
 function renderThreatTable(selector, threats) {
@@ -2904,6 +2872,7 @@ function renderSettings() {
     <dt>Cache snapshots</dt><dd>${fmt.format(number(cache.overview_snapshots))} overview, ${fmt.format(number(cache.api_snapshots))} API | ${fmtBytes(cache.db_bytes)}</dd>
     <dt>SOC history database</dt><dd>${esc(s.storage?.automation_db || "-")}</dd>
     <dt>Historical snapshots</dt><dd>${fmt.format(number(automationStore.report_summaries))} summaries, ${fmt.format(number(automationStore.reports))} reports, ${fmt.format(number(automationStore.ai_runs))} AI runs | ${fmtBytes(automationStore.db_bytes)}</dd>
+    <dt>CYFIRMA ledger</dt><dd>${fmt.format(number(automationStore.cyfirma_observations))} daily observations, ${fmt.format(number(automationStore.cyfirma_feed_runs))} feed runs</dd>
     <dt>Prewarm</dt><dd>${s.storage?.prewarm_enabled ? "enabled" : "disabled"} | ${(s.storage?.prewarm_ranges || []).join(", ")} | TTL ${fmt.format(number(s.storage?.overview_cache_ttl_seconds))}s</dd>
     <dt>IOC stream</dt><dd>${pipeline.enabled ? "enabled" : "disabled"} | ${esc(pipeline.scan_status || "unknown")} | ${fmt.format(number(pipeline.checkpoint_events_scanned))} checkpoint events | ${fmt.format(number(pipeline.queued_indicators))} unique indicators | lag ${fmt.format(number(pipeline.lag_seconds))}s</dd>
     <dt>Detection rollup</dt><dd>${pipeline.rollup?.enabled ? "enabled" : "disabled"} | ${fmt.format(number(pipeline.rollup?.events))} events in ${fmt.format(number(pipeline.rollup?.buckets))} five-minute buckets | ${fmt.format(number(pipeline.rollup?.retention_days))} day retention</dd>
@@ -3461,7 +3430,6 @@ function renderOverview(data) {
   renderSocCoverage(data);
   renderAttackPath(data);
   renderIncidentBoard(data);
-  renderCoverageGrid(data);
   renderSocWorkbench(data);
   renderThreatTable("#overviewThreats", data.threats || []);
   renderL1Queue(data);
@@ -3473,10 +3441,8 @@ function renderOverview(data) {
   renderAgents(data);
   renderAssetContextEvidence(data);
   renderDonut("#platformDonut", "#platformLegend", data.agents?.platforms || {});
-  renderCapabilities(data);
   renderDecisions(data);
   renderInvestigationFlow(data);
-  renderHuntMatrix(data);
   renderProviderIntel();
   renderCrowdSecIntel();
 }

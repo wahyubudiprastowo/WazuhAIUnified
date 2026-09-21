@@ -11,6 +11,7 @@
     <link rel="stylesheet" href="/static/automation.css?v=20260914-1">
     <link rel="stylesheet" href="/static/history.css?v=20260915-3">
     <link rel="stylesheet" href="/static/workflows.css?v=20260920-2">
+    <link rel="stylesheet" href="/static/intelligence.css?v=20260920-1">
   </head>
   <body>
     <aside class="sidebar">
@@ -188,11 +189,6 @@
             <strong id="metricAiSources">-</strong>
             <small>LLM and crawler probes</small>
           </article>
-          <article class="metric blueLine" data-view-link="tools">
-            <span>MCP Tools</span>
-            <strong id="metricTools">-</strong>
-            <small id="metricToolSplit">-</small>
-          </article>
         </div>
 
         <div class="gridThree">
@@ -209,13 +205,6 @@
               <span>Manager statistics</span>
             </div>
             <div class="sparkline" id="hourlySpark"></div>
-          </section>
-          <section class="glassPanel">
-            <div class="panelHead">
-              <h2>MCP Coverage</h2>
-              <span>Capability map</span>
-            </div>
-            <div class="coverageGrid" id="coverageGrid"></div>
           </section>
         </div>
 
@@ -313,38 +302,6 @@
           </div>
           <div id="workbenchProviderDeck" class="providerCoverageDeck"></div>
         </section>
-        <div class="gridTwo">
-          <section class="glassPanel">
-            <div class="panelHead">
-              <h2>Threat Intel Workbench</h2>
-              <span>IOC enrichment and reputation</span>
-            </div>
-            <div class="toolRail" id="intelWorkbench"></div>
-          </section>
-          <section class="glassPanel">
-            <div class="panelHead">
-              <h2>Response Guardrails</h2>
-              <span>Controlled containment</span>
-            </div>
-            <div class="toolRail" id="responseWorkbench"></div>
-          </section>
-        </div>
-        <div class="gridTwo">
-          <section class="glassPanel">
-            <div class="panelHead">
-              <h2>Cloud and Container</h2>
-              <span>Docker and Microsoft 365 readiness</span>
-            </div>
-            <div class="sourceBoard" id="cloudContainerWorkbench"></div>
-          </section>
-          <section class="glassPanel">
-            <div class="panelHead">
-              <h2>Compliance Evidence</h2>
-              <span>Audit and control tools</span>
-            </div>
-            <div class="toolRail" id="complianceWorkbench"></div>
-          </section>
-        </div>
       </section>
 
       <section class="view" id="l1View">
@@ -420,29 +377,6 @@
 
       <section class="view" id="l3View">
         <div class="gridTwo">
-          <section class="glassPanel">
-            <div class="panelHead">
-              <h2>Hunting Arsenal</h2>
-              <span>INFOKOM and GenSecAI tools</span>
-            </div>
-            <div class="capabilityList" id="huntCapabilities"></div>
-          </section>
-          <section class="glassPanel">
-            <div class="panelHead">
-              <h2>Response and Compliance</h2>
-              <span>Controlled action map</span>
-            </div>
-            <div class="capabilityList" id="responseCapabilities"></div>
-          </section>
-        </div>
-        <section class="glassPanel">
-          <div class="panelHead">
-            <h2>Hunt Matrix</h2>
-            <span>Coverage by mission</span>
-          </div>
-          <div class="huntMatrix" id="huntMatrix"></div>
-        </section>
-        <div class="gridTwo">
           <section class="glassPanel"><div class="panelHead"><h2>MITRE ATT&amp;CK Coverage</h2><span>Observed techniques</span></div><div id="mitreEvidence" class="evidenceWorkspace"></div></section>
           <section class="glassPanel"><div class="panelHead"><h2>Decoder Coverage</h2><span>Volume and unmatched events</span></div><div id="decoderEvidence" class="evidenceWorkspace"></div></section>
         </div>
@@ -481,6 +415,13 @@
             <span>Asset inventory, EPSS, KEV and PoC context</span>
           </div>
           <div id="vulnAiBrief" class="vulnBriefGrid"></div>
+        </section>
+        <section class="glassPanel intelligenceUpdatePanel">
+          <div class="panelHead">
+            <h2>CYFIRMA &amp; CVE Intelligence Updates</h2>
+            <span id="cyfirmaLedgerStatus" role="status" aria-live="polite">Loading stored provider intelligence</span>
+          </div>
+          <div id="cyfirmaLedger" class="intelligenceLedger"></div>
         </section>
         <section class="glassPanel">
           <div class="panelHead">
@@ -616,14 +557,15 @@
         </form>
       </section>
     </main>
-    <script src="/static/app.js?v=20260920-3"></script>
-    <script src="/static/findings.js?v=20260920-2"></script>
+    <script src="/static/app.js?v=20260921-2"></script>
+    <script src="/static/findings.js?v=20260921-2"></script>
     <script src="/static/vendor/chart.umd.js"></script>
     <script src="/static/locale.js?v=20260911-1"></script>
     <script src="/static/analysis-workspace.js?v=20260913-1"></script>
     <script src="/static/enterprise.js?v=20260915-3"></script>
     <script src="/static/automation.js?v=20260920-3"></script>
     <script src="/static/history.js?v=20260920-3"></script>
-    <script src="/static/workflows.js?v=20260920-2"></script>
+    <script src="/static/workflows.js?v=20260921-1"></script>
+    <script src="/static/intelligence.js?v=20260921-1"></script>
   </body>
 </html>

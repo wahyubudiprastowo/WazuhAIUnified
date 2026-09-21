@@ -1,16 +1,6 @@
 (() => {
   "use strict";
   const menus = ["l1", "l2", "l3", "vuln", "assets", "incidents", "workbench", "history", "settings"];
-  const dimensions = {
-    l1: ["rule", "decoder", "severity"],
-    l2: ["source_ip", "destination_ip", "destination_port", "application", "firewall_policy", "direction", "identity"],
-    l3: ["mitre", "source_ip"], assets: ["asset"],
-    settings: ["decoder"],
-  };
-  const labels = { rule: "Rule", decoder: "Decoder", severity: "Wazuh level", source_ip: "Source IP",
-    destination_ip: "Destination IP", destination_port: "Destination port", application: "Application",
-    firewall_policy: "Firewall policy", direction: "Connection direction", identity: "User / account",
-    asset: "Asset", mitre: "MITRE technique" };
   const stamp = value => value ? new Date(value * 1000).toLocaleString() : "-";
   const dialog = document.createElement("dialog");
   dialog.className = "workflowDialog";
@@ -85,11 +75,11 @@
         panel = document.createElement("section");
         panel.id = `workflow-${menu}`;
         panel.className = "workflowBand";
-        panel.innerHTML = `<details><summary><span>Analyst workflows</span><small data-workflow-summary>Saved evidence and on-demand actions</small></summary>
+        panel.innerHTML = `<details><summary><span>Advanced actions</span><small data-workflow-summary>Cached analyses and operator-approved tools</small></summary>
           <div class="workflowBody"><div class="workflowControls"><label>Tool<select aria-label="${esc(viewTitles[menu])} tools"></select></label>
           <button type="button" data-prepare>Prepare</button><button type="button" data-history>Refresh history</button></div>
           <p class="workflowStatus" role="status" aria-live="polite"></p>
-          <div class="workflowHistory"></div><div class="workflowEvidence"></div></div></details>`;
+          <div class="workflowHistory"></div></div></details>`;
         view.append(panel);
         panel.querySelector("[data-prepare]").addEventListener("click", () => {
           const key = panel.querySelector("select").value;
@@ -145,15 +135,6 @@
         `<table><thead><tr><th>Tool</th><th>Status</th><th>Collected</th></tr></thead><tbody>${history.jobs.map(job =>
           `<tr><td><button type="button" data-workflow-job="${esc(job.id)}">${esc(job.name)}</button></td><td>${esc(job.status)}</td><td>${esc(stamp(job.finished || job.created))}</td></tr>`).join("")}</tbody></table>` :
         `<p>No saved tool runs in this period.</p>`;
-      if (dimensions[menu]) {
-        const data = await postJson("/api/workflows/evidence", { ...windowPayload, start, end });
-        if (panel.dataset.request !== version) return;
-        panel.querySelector(".workflowEvidence").innerHTML = `<h3>Indexed Wazuh / decoded syslog</h3>
-          <p>Stored 5-minute aggregates | ${esc(data.coverage?.complete ? "complete selected range" : "available buckets; completeness not verified")}</p>
-          <div class="workflowDimensions">${dimensions[menu].map(dim => `<div><h4>${esc(labels[dim])}</h4>
-            ${(data.dimensions?.[dim] || []).length ? `<table><thead><tr><th>Value</th><th>Events</th></tr></thead><tbody>${data.dimensions[dim].map(row =>
-              `<tr><td>${esc(row.label || row.value)}</td><td>${fmt.format(row.count)}</td></tr>`).join("")}</tbody></table>` : `<p>No stored values</p>`}</div>`).join("")}</div>`;
-      }
     } catch (error) { if (panel.dataset.request === version) status.textContent = `Saved evidence unavailable: ${error.message}`; }
   }
   document.addEventListener("soc:tools", mount);

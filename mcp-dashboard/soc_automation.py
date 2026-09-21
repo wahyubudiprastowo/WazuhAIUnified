@@ -1565,6 +1565,7 @@ class Automation:
         self.finding_ai_gate = _ConcurrencyGate(config, "AI_FINDING_WORKERS", 2)
         self.db_init_lock = threading.Lock()
         self.db_initialized = False
+        self.cyfirma_cache_materialized = False
         self.pipeline = None
         self.running = False
         self.phase = "idle"
@@ -1597,6 +1598,21 @@ class Automation:
                             conn.execute("CREATE INDEX IF NOT EXISTS cve_observations_day ON cve_observations(bucket_day,cve)")
                             conn.execute("CREATE INDEX IF NOT EXISTS cve_observations_asset ON cve_observations(agent_id,cve)")
                             conn.execute("CREATE TABLE IF NOT EXISTS cve_observation_reports (report_id INTEGER PRIMARY KEY, materialized_at REAL NOT NULL)")
+                            conn.execute('''CREATE TABLE IF NOT EXISTS cyfirma_observations (
+                                observation_key TEXT PRIMARY KEY, observed_at REAL NOT NULL,
+                                bucket_day TEXT NOT NULL, item_key TEXT NOT NULL, scope TEXT NOT NULL,
+                                source_created TEXT, source_modified TEXT, valid_from TEXT, valid_until TEXT,
+                                name TEXT, description TEXT, confidence INTEGER, ioc_count INTEGER NOT NULL DEFAULT 0,
+                                cves TEXT NOT NULL, labels TEXT NOT NULL, data TEXT NOT NULL)''')
+                            conn.execute("CREATE INDEX IF NOT EXISTS cyfirma_observations_time ON cyfirma_observations(observed_at)")
+                            conn.execute("CREATE INDEX IF NOT EXISTS cyfirma_observations_item ON cyfirma_observations(item_key,observed_at DESC)")
+                            conn.execute("CREATE INDEX IF NOT EXISTS cyfirma_observations_cve ON cyfirma_observations(bucket_day,scope)")
+                            conn.execute('''CREATE TABLE IF NOT EXISTS cyfirma_feed_runs (
+                                run_key TEXT PRIMARY KEY, collected_at REAL NOT NULL, scope TEXT NOT NULL,
+                                status TEXT NOT NULL, loaded INTEGER NOT NULL DEFAULT 0,
+                                reported INTEGER NOT NULL DEFAULT 0, cached INTEGER NOT NULL DEFAULT 0,
+                                detail TEXT NOT NULL)''')
+                            conn.execute("CREATE INDEX IF NOT EXISTS cyfirma_feed_runs_time ON cyfirma_feed_runs(collected_at DESC)")
                             conn.execute("CREATE TABLE IF NOT EXISTS cache (key TEXT PRIMARY KEY, expires REAL, data TEXT)")
                             conn.execute("CREATE TABLE IF NOT EXISTS deliveries (channel TEXT, report_id INTEGER, sent REAL, status TEXT, PRIMARY KEY(channel,report_id))")
                             conn.execute('CREATE TABLE IF NOT EXISTS ai_runs (id INTEGER PRIMARY KEY, report_id INTEGER, created REAL, data TEXT)')
@@ -1645,6 +1661,179 @@ class Automation:
         with self.db() as db:
             db.execute("INSERT OR REPLACE INTO cache VALUES (?,?,?)", (key, time.time() + ttl, json.dumps(value)))
             db.execute("DELETE FROM cache WHERE expires<?", (time.time() - 604800,))
+
+    @staticmethod
+    def _cyfirma_observation(row, observed_at):
+        if not isinstance(row, dict):
+            return None
+        scope = str(row.get("scope") or "unknown")[:32]
+        item_key = str(row.get("id") or row.get("pattern") or row.get("name") or "").strip()
+        if not item_key:
+            return None
+        bucket_day = datetime.fromtimestamp(observed_at, timezone.utc).strftime("%Y-%m-%d")
+        searchable = json.dumps(row, ensure_ascii=True, sort_keys=True)
+        cves = sorted(set(re.findall(r"CVE-\d{4}-\d{4,}", searchable, re.I)))[:50]
+        labels = [str(value)[:120] for value in (row.get("labels") or []) if value][:30]
+        phases = []
+        for phase in row.get("kill_chain_phases") or []:
+            value = phase.get("phase_name") if isinstance(phase, dict) else phase
+            if value and str(value) not in phases:
+                phases.append(str(value)[:120])
+        references = [str(value)[:500] for value in (row.get("references") or []) if value][:10]
+        try:
+            confidence = int(float(row.get("confidence") or 0))
+        except (TypeError, ValueError):
+            confidence = 0
+        safe = {
+            "id": str(row.get("id") or "")[:300], "scope": scope,
+            "name": str(row.get("name") or "STIX indicator")[:500],
+            "description": str(row.get("description") or "")[:3000],
+            "confidence": max(0, min(confidence, 100)),
+            "created": row.get("created"), "modified": row.get("modified"),
+            "valid_from": row.get("valid_from"), "valid_until": row.get("valid_until"),
+            "labels": labels, "kill_chain_phases": phases, "references": references,
+            "cves": cves, "ioc_count": len(row.get("iocs") or []),
+        }
+        identity = "\x1f".join((bucket_day, scope, item_key))
+        return {
+            "observation_key": hashlib.sha256(identity.encode()).hexdigest(),
+            "observed_at": observed_at, "bucket_day": bucket_day,
+            "item_key": hashlib.sha256(item_key.encode()).hexdigest(), "scope": scope,
+            "source_created": row.get("created"), "source_modified": row.get("modified"),
+            "valid_from": row.get("valid_from"), "valid_until": row.get("valid_until"),
+            "name": safe["name"], "description": safe["description"],
+            "confidence": safe["confidence"], "ioc_count": safe["ioc_count"],
+            "cves": json.dumps(cves), "labels": json.dumps(labels), "data": json.dumps(safe),
+        }
+
+    def _store_cyfirma_observations(self, rows, feed_status, observed_at=None):
+        observed_at = float(observed_at or time.time())
+        observations = [item for item in
+                        (self._cyfirma_observation(row, observed_at) for row in (rows or [])) if item]
+        retention = int_config(self.config(), "SOC_PROVIDER_HISTORY_RETENTION_DAYS", 180) * 86400
+        with self.db() as db:
+            if observations:
+                db.executemany('''INSERT INTO cyfirma_observations
+                    (observation_key,observed_at,bucket_day,item_key,scope,source_created,source_modified,
+                     valid_from,valid_until,name,description,confidence,ioc_count,cves,labels,data)
+                    VALUES (:observation_key,:observed_at,:bucket_day,:item_key,:scope,:source_created,
+                     :source_modified,:valid_from,:valid_until,:name,:description,:confidence,:ioc_count,
+                     :cves,:labels,:data)
+                    ON CONFLICT(observation_key) DO UPDATE SET
+                     source_modified=excluded.source_modified,valid_until=excluded.valid_until,
+                     name=excluded.name,description=excluded.description,confidence=excluded.confidence,
+                     ioc_count=excluded.ioc_count,cves=excluded.cves,labels=excluded.labels,data=excluded.data''',
+                    observations)
+            for scope, status in (feed_status or {}).items():
+                fetched_at = status.get("fetched_at") or datetime.fromtimestamp(observed_at, timezone.utc).isoformat()
+                try:
+                    collected_at = datetime.fromisoformat(str(fetched_at).replace("Z", "+00:00")).timestamp()
+                except (TypeError, ValueError):
+                    collected_at = observed_at
+                run_key = hashlib.sha256(f"{scope}\x1f{fetched_at}".encode()).hexdigest()
+                detail = {key: status.get(key) for key in ("reason", "error", "cached_partial") if status.get(key) is not None}
+                db.execute('''INSERT OR IGNORE INTO cyfirma_feed_runs
+                    (run_key,collected_at,scope,status,loaded,reported,cached,detail)
+                    VALUES (?,?,?,?,?,?,?,?)''', (run_key, collected_at, str(scope)[:32],
+                    str(status.get("status") or "unknown")[:32], int(status.get("loaded") or 0),
+                    int(status.get("reported") or 0), int(bool(status.get("cached"))), json.dumps(detail)))
+            db.execute("DELETE FROM cyfirma_observations WHERE observed_at<?", (time.time() - retention,))
+            db.execute("DELETE FROM cyfirma_feed_runs WHERE collected_at<?", (time.time() - retention,))
+        return len(observations)
+
+    def _materialize_cached_cyfirma_feeds(self):
+        """Import existing feed snapshots into the durable ledger without provider I/O."""
+        if self.cyfirma_cache_materialized:
+            return 0
+        with self.db() as db:
+            snapshots = db.execute(
+                "SELECT key,data FROM cache WHERE key IN ('feed:tailored','feed:global')"
+            ).fetchall()
+        imported = 0
+        for key, raw in snapshots:
+            try:
+                snapshot = json.loads(raw)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if not isinstance(snapshot, dict):
+                continue
+            status = snapshot.get("status") if isinstance(snapshot.get("status"), dict) else {}
+            scope = key.split(":", 1)[-1]
+            fetched_at = status.get("fetched_at")
+            try:
+                observed_at = datetime.fromisoformat(str(fetched_at).replace("Z", "+00:00")).timestamp()
+            except (TypeError, ValueError):
+                observed_at = time.time()
+            rows = snapshot.get("rows") if isinstance(snapshot.get("rows"), list) else []
+            scoped_rows = [{**row, "scope": row.get("scope") or scope}
+                           for row in rows if isinstance(row, dict)]
+            imported += self._store_cyfirma_observations(scoped_rows, {scope: status}, observed_at)
+        self.cyfirma_cache_materialized = True
+        return imported
+
+    def cyfirma_updates(self, start, end, limit=30):
+        # This one-time/idempotent import makes snapshots collected before the
+        # ledger schema was deployed immediately available. It only reads the
+        # local SQLite cache and never contacts CYFIRMA or Wazuh.
+        self._materialize_cached_cyfirma_feeds()
+        start_ts, end_ts = datetime.fromisoformat(start).timestamp(), datetime.fromisoformat(end).timestamp()
+        limit = min(max(int(limit or 30), 1), 100)
+        with self.db() as db:
+            totals = db.execute('''SELECT COUNT(DISTINCT item_key),
+                COUNT(DISTINCT CASE WHEN scope='tailored' THEN item_key END),
+                COUNT(DISTINCT CASE WHEN scope='global' THEN item_key END),
+                COALESCE(SUM(ioc_count),0),MAX(observed_at),
+                COUNT(DISTINCT CASE WHEN cves<>'[]' THEN item_key END)
+                FROM cyfirma_observations WHERE observed_at>=? AND observed_at<?''',
+                (start_ts, end_ts)).fetchone()
+            rows = db.execute('''SELECT data,observed_at FROM (
+                SELECT data,observed_at,item_key,
+                    ROW_NUMBER() OVER (PARTITION BY item_key ORDER BY observed_at DESC) AS position
+                FROM cyfirma_observations WHERE observed_at>=? AND observed_at<?)
+                WHERE position=1 ORDER BY observed_at DESC LIMIT ?''', (start_ts, end_ts, limit)).fetchall()
+            cve_rows = db.execute('''SELECT data,observed_at FROM (
+                SELECT data,observed_at,item_key,
+                    ROW_NUMBER() OVER (PARTITION BY item_key ORDER BY observed_at DESC) AS position
+                FROM cyfirma_observations
+                WHERE observed_at>=? AND observed_at<? AND cves<>'[]')
+                WHERE position=1 ORDER BY observed_at DESC LIMIT ?''',
+                (start_ts, end_ts, min(limit, 20))).fetchall()
+            runs = db.execute('''SELECT scope,status,loaded,reported,cached,collected_at,detail
+                FROM cyfirma_feed_runs WHERE collected_at>=? AND collected_at<?
+                ORDER BY collected_at DESC LIMIT 12''', (start_ts, end_ts)).fetchall()
+        def decode_rows(records):
+            decoded = []
+            for raw, observed_at in records:
+                try:
+                    item = json.loads(raw)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                item["observed_at"] = datetime.fromtimestamp(observed_at, timezone.utc).isoformat()
+                decoded.append(item)
+            return decoded
+
+        items = decode_rows(rows)
+        cve_items = decode_rows(cve_rows)
+        statuses = []
+        seen_scopes = set()
+        for scope, status, loaded, reported, cached, collected_at, detail in runs:
+            if scope in seen_scopes:
+                continue
+            seen_scopes.add(scope)
+            statuses.append({"scope": scope, "status": status, "loaded": loaded,
+                "reported": reported, "cached": bool(cached),
+                "collected_at": datetime.fromtimestamp(collected_at, timezone.utc).isoformat(),
+                "detail": json.loads(detail or "{}")})
+        return {
+            "source": "CYFIRMA STIX 2.1 indicator feeds", "start": start, "end": end,
+            "summary": {"indicators": int(totals[0] or 0), "tailored": int(totals[1] or 0),
+                "global": int(totals[2] or 0), "ioc_values": int(totals[3] or 0),
+                "cve_linked": int(totals[5] or 0),
+                "last_observed_at": datetime.fromtimestamp(totals[4], timezone.utc).isoformat() if totals[4] else None},
+            "items": items, "cve_items": cve_items, "feed_status": statuses,
+            "provider_calls": 0, "storage": "soc-automation SQLite daily ledger",
+            "scope_note": "CYFIRMA endpoints currently provide STIX indicators. CVE linkage appears only when a feed record explicitly references a CVE; absence is not evidence that no relevant CVE exists.",
+        }
 
     @staticmethod
     def _cve_observation(row, observed_at):
@@ -2527,6 +2716,9 @@ class Automation:
                     continue
             for value in row.get("iocs", []):
                 feed_index.setdefault(normalized(value), []).append(row)
+        # Persist a daily, deduplicated provider ledger before local matching.
+        # Historical UI reads this SQLite ledger and never replays CYFIRMA feeds.
+        self._store_cyfirma_observations(feed_rows, feed_status)
         findings, used, queue_attempts, deferred = [], 0, [], 0
         enrichment_started = time.time()
         enrichment_cutoff = int_config(cfg, "SOC_ENRICHMENT_MAX_SECONDS", 420)

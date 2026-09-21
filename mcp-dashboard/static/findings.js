@@ -2,7 +2,7 @@
 (() => {
   const t = (id, en) => window.SocLocale?.t ? window.SocLocale.t(id, en) : en;
   const ax = (analysis, field) => window.SocLocale?.analysis ? window.SocLocale.analysis(analysis, field) : (analysis?.[field] || "");
-  const categories = {all: "All findings", wazuh: "Wazuh rules", decoder: "Decoder coverage", m365: "Microsoft 365", ip: "Source IP / Geo", observable: "Log indicators", recon: "AI bot recon", vuln: "CVE & Exposure", cyfirma: "CYFIRMA IOCs"};
+  const categories = {all: "All findings", wazuh: "Wazuh rules", decoder: "Decoder coverage", m365: "Microsoft 365", ip: "Source IP / Geo", observable: "Log indicators", recon: "AI bot recon", vuln: "CVE & Exposure"};
   const severityOrder = {critical: 5, high: 4, medium: 3, low: 2, unknown: 1};
   const evidenceLabels = {observed: "Wazuh observed", inventory: "Asset inventory", intel: "External intelligence", pending: "Local evidence not verified"};
   const f = {rows: [], category: "all", selected: null, page: 0, feeds: {}, pivots: new Map(), cache: new Map(), ai: new Map(), aiJobs: new Map(), feedback: new Map(), workflowResults: new Map(), tabLoads: new Set(), sequence: 0, cveSequence: 0, tab: "overview", data: null};
@@ -14,7 +14,6 @@
     observable: ["blueteam_threat_intel_aggregate", "blueteam_ioc_lifecycle", "blueteam_pivot_suggest"],
     recon: ["blueteam_investigate_ip", "wazuh_attack_velocity", "blueteam_attack_chain", "blueteam_campaign_watch"],
     vuln: ["blueteam_cve_epss", "blueteam_cve_kev", "blueteam_cve_poc", "blueteam_cve_ssvc", "blueteam_cve_attack_mapping", "blueteam_cve_advisory"],
-    cyfirma: ["blueteam_threat_intel_aggregate", "blueteam_ioc_lifecycle", "blueteam_campaign_watch"],
   };
   const recipePurpose = {
     analyze_alert_patterns: "Compare recurrence, severity and rule patterns in a bounded window.",
@@ -61,33 +60,6 @@
   const cveButtons = (ids) => ids.map(id => `<button type="button" class="findingCve" data-finding-cve="${esc(id)}">${esc(id)}</button>`).join("") || '<p class="findingMuted">No CVE references returned. This does not rule out a vulnerability.</p>';
   const isHash = (value) => /^[a-f\d]{32}$|^[a-f\d]{40}$|^[a-f\d]{64}$/i.test(value || "");
   const isFullUrl = (value) => /^https?:\/\/[^/\s]+/i.test(value || "");
-  function indicatorAliases(value) {
-    const raw = String(value || "").trim().toLowerCase();
-    if (!raw) return [];
-    const values = new Set([raw]);
-    try {
-      const url = new URL(raw.includes("://") ? raw : `http://${raw}`);
-      if (url.hostname) values.add(url.hostname.toLowerCase());
-      if (/^https?:\/\//i.test(raw)) values.add(`${url.protocol}//${url.hostname.toLowerCase()}${url.pathname || "/"}`);
-      if (url.hostname && url.pathname && url.pathname !== "/") values.add(`${url.hostname.toLowerCase()}${url.pathname}`);
-    } catch (_) {}
-    return [...values];
-  }
-  function observedMap() {
-    const map = new Map();
-    for (const item of f.coverage?.observables || []) for (const alias of indicatorAliases(item.indicator)) map.set(alias, item);
-    for (const item of f.data?.source_ips || []) for (const alias of indicatorAliases(item.ip)) if (!map.has(alias)) map.set(alias, {indicator: item.ip, kind: "ip", public: true, occurrences: item.hits, rules: item.rules, fields: ["top threat sample"], level: item.max_score || 0});
-    return map;
-  }
-  function localMatchesFor(iocs) {
-    const map = observedMap(), matches = [];
-    for (const ioc of labels(iocs)) {
-      const hit = indicatorAliases(ioc).map(alias => map.get(alias)).find(Boolean);
-      if (hit && !matches.some(item => item.indicator === hit.indicator)) matches.push(hit);
-    }
-    return matches;
-  }
-
   function buildRows() {
     const d = f.data;
     if (!d) return;
@@ -95,23 +67,20 @@
     for (const row of f.coverage?.rules || d.threats || []) rows.push({id: `rule:${row.rule_id}`, category: "wazuh", provider: "Wazuh", title: ax(row.analysis, "title") || row.description || `Rule ${row.rule_id}`, subject: `Rule ${row.rule_id} | ${row.description}`, severity: severityClass(Number(row.level)), evidence: "observed", count: row.count, countScope: row.count_scope, ip: (row.source_ips || [])[0], rule: row.rule_id, description: ax(row.analysis, "meaning") || `Rule level ${row.level}. ${row.count} event(s) in the returned threat sample.`, types: row.groups, assets: (row.affected_agents || []).map(a => a.name || a.id), timestamp: row.last_seen, raw: row});
     for (const row of f.coverage?.decoders || []) rows.push({id: `decoder:${row.name}`, category: "decoder", provider: "Wazuh index", title: row.name, subject: row.latest_rule ? `Latest rule ${row.latest_rule_id}: ${row.latest_rule}` : "Decoded Wazuh events", severity: severityClass(Number(row.max_level)), evidence: "observed", count: row.count, countScope: "index aggregation", rule: row.latest_rule_id, description: `${fmt.format(Number(row.count || 0))} indexed event(s) decoded in the selected window. Maximum observed rule level ${Number(row.max_level || 0)}.`, types: ["decoder", row.location].filter(Boolean), assets: [row.latest_agent?.name || row.latest_agent?.id].filter(Boolean), timestamp: row.last_seen, raw: row});
     for (const [i, row] of (d.cloud_m365?.events || []).entries()) rows.push({id: `m365:${row.timestamp}:${i}`, category: "m365", provider: "Wazuh / Microsoft 365", title: row.operation || row.description, subject: row.user || row.workload, severity: severityClass(Number(row.level)), evidence: "observed", ip: row.client_ip, operation: row.operation, description: ax(row.analysis, "meaning") || row.description, types: [row.workload, row.subscription].filter(Boolean), assets: [row.user, row.object].filter(Boolean), timestamp: row.timestamp, raw: row});
+    const automationFindings = window.SocAutomation?.report?.findings || [];
+    const automatedByIndicator = new Map(automationFindings.map(row => [row.indicator, row]));
     const observed = new Map((d.source_ips || []).map(r => [r.ip, r]));
     const crowd = new Map((state.crowdSecIntel?.rows || []).map(r => [r.ip, r]));
     for (const ip of new Set([...observed.keys(), ...crowd.keys()])) {
-      const local = observed.get(ip), ti = crowd.get(ip);
-      rows.push({id: `ip:${ip}`, category: "ip", provider: ti ? (local ? "Wazuh / CrowdSec" : "CrowdSec") : "Wazuh", title: ip, subject: ti ? crowdLocation(ti) : "Location not returned", ip, severity: ti?.reputation === "malicious" ? "high" : ti?.reputation === "suspicious" ? "medium" : "unknown", evidence: local ? "observed" : "intel", count: local?.hits, description: ti ? crowdReason(ti) : "Source address in the Wazuh threat sample. Reputation has not been assessed.", types: ti?.behaviors || [], timestamp: ti ? crowdHistory(ti) : null, crowd: ti, raw: {local, intelligence: ti}});
+      const local = observed.get(ip), ti = crowd.get(ip), automated = automatedByIndicator.get(ip);
+      const cyfirmaMatches = automated?.cyfirma_matches || [];
+      const providers = [local && "Wazuh", ti && "CrowdSec", cyfirmaMatches.length && "CYFIRMA"].filter(Boolean);
+      rows.push({id: `ip:${ip}`, category: "ip", provider: providers.join(" / ") || "Wazuh", title: ip, subject: ti ? crowdLocation(ti) : cyfirmaMatches.length ? `${cyfirmaMatches.length} stored CYFIRMA exact match(es)` : "Location not returned", ip, severity: ti?.reputation === "malicious" || automated?.status === "suspected" ? "high" : ti?.reputation === "suspicious" ? "medium" : "unknown", evidence: local ? "observed" : "intel", count: local?.hits || automated?.event_total, description: ti ? crowdReason(ti) : cyfirmaMatches.length ? "Stored automation result matched this locally observed indicator to CYFIRMA intelligence. Validate event direction and impact before response." : "Source address in the Wazuh threat sample. Reputation has not been assessed.", types: [...(ti?.behaviors || []), ...cyfirmaMatches.flatMap(row => row.labels || [])], timestamp: automated?.enriched_at || (ti ? crowdHistory(ti) : null), crowd: ti, raw: {local, intelligence: ti, automation: automated, cyfirma_matches: cyfirmaMatches}});
     }
     for (const t of d.ai_recon?.sources || []) rows.push({id: `recon:${t.srcip}`, category: "recon", provider: "Wazuh / INFOKOM", title: t.srcip, subject: "Automated probing pattern", ip: t.srcip, evidence: "observed", severity: t.sensitive_hits > 0 ? "high" : "medium", count: t.alerts, description: `${t.sensitive_hits} sensitive-path hits; ${t.unique_paths} distinct paths. Pattern-based detection does not confirm use of AI or successful compromise.`, types: ["Reconnaissance", "Sensitive path probing"], raw: t});
     for (const [i, t] of (d.vulnerabilities?.critical_items || []).entries()) {
       const cve = t.cve || t.id || t.vulnerability?.id;
       rows.push({id: `vuln:${cve}:${i}`, category: "vuln", provider: "Wazuh inventory", title: cve, subject: t.package?.name || t.package_name, cve, severity: String(t.severity || "unknown").toLowerCase(), evidence: "inventory", description: t.description, assets: [t.agent?.name || t.agent?.id].filter(Boolean), types: [t.package?.name].filter(Boolean), raw: t});
-    }
-    for (const [scope, feed] of Object.entries(f.feeds)) {
-      for (const [i, t] of (feed.data?.items || []).entries()) {
-        const matches = localMatchesFor(t.iocs || []);
-        const confidence = Number(t.confidence || 0);
-        rows.push({id: `cyfirma:${scope}:${t.id || i}`, category: "cyfirma", provider: matches.length ? "Wazuh / CYFIRMA" : "CYFIRMA", title: t.name || matches[0]?.indicator || t.iocs?.[0] || "STIX indicator", subject: matches.length ? `${matches[0].indicator} matched local Wazuh telemetry` : t.iocs?.[0] || t.pattern, indicator: matches[0]?.indicator || t.iocs?.[0], severity: matches.length ? confidence >= 70 ? "high" : "medium" : "unknown", evidence: matches.length ? "observed" : "intel", count: matches.reduce((sum, item) => sum + Number(item.occurrences || 0), 0) || undefined, description: matches.length ? `CYFIRMA IOC matched Wazuh telemetry. ${t.description || "Review provider context and local evidence before response."}` : t.description, types: t.labels, timestamp: t.modified || t.created, raw: {...t, local_matches: matches}, scope});
-      }
     }
     for (const row of f.pivots.values()) if (!rows.some(r => r.id === row.id)) rows.push(row);
     const deduplicated = new Map();
@@ -121,9 +90,7 @@
         ? `${row.category}:${String(row.cve || row.title || "").toLowerCase()}:${asset.toLowerCase()}:${String(row.subject || "").toLowerCase()}`
         : row.category === "m365"
           ? `${row.category}:${String(row.title || "").toLowerCase()}:${String(row.subject || "").toLowerCase()}:${row.timestamp || ""}:${row.ip || ""}`
-          : row.category === "cyfirma"
-            ? `${row.category}:${String(row.raw?.id || row.raw?.pattern || row.indicator || row.title || "").toLowerCase()}`
-            : row.id;
+          : row.id;
       const existing = deduplicated.get(identity);
       if (!existing) {
         deduplicated.set(identity, row);
@@ -156,12 +123,11 @@
       [t("Alert pada window terpilih", "Alerts in selected window"), fmt.format(f.coverage?.total_events ?? d.alerts?.total_alerts ?? 0), f.coverage ? t(`${f.coverage.rules.length} rule dimuat dari agregasi indeks`, `${f.coverage.rules.length} rules loaded from index aggregation`) : t(`${fmt.format(d.alerts?.sampled || 0)} disampel untuk ranking ancaman`, `${fmt.format(d.alerts?.sampled || 0)} sampled for threat ranking`)],
       [t("Record prioritas tinggi", "High-priority records"), f.rows.filter(r => r.evidence !== "intel" && ["high", "critical"].includes(r.severity)).length, t("Dari temuan yang dimuat", "From the loaded findings")],
       [t("Kerentanan kritis", "Critical vulnerabilities"), d.vulnerabilities?.critical ?? "-", t(`${d.vulnerabilities?.affected_agents ?? "-"} aset terdampak (semua severity)`, `${d.vulnerabilities?.affected_agents ?? "-"} affected assets (all severities)`)],
-      ["CYFIRMA indicators", Object.values(f.feeds).reduce((n, r) => n + (r.data?.summary?.count || 0), 0), t(`${f.rows.filter(r => r.category === "cyfirma").length} record feed dimuat`, `${f.rows.filter(r => r.category === "cyfirma").length} feed records loaded`)],
+      ["CYFIRMA context", Object.values(f.feeds).reduce((n, r) => n + (r.data?.summary?.count || 0), 0), t("Tersimpan untuk korelasi; feed umum tidak dihitung sebagai temuan", "Stored for correlation; general feed records are not counted as findings")],
       [t("Temuan dianalisis AI", "AI analyzed findings"), f.ai.size, t("Hasil per temuan disimpan agar analisis ulang instan", "Per-finding results are cached for instant reuse")]
     ].map(([name, value, hint]) => `<div><span>${esc(name)}</span><strong>${esc(value)}</strong><small>${esc(hint)}</small></div>`).join("");
     q("#findingsCategories").innerHTML = Object.entries(categories).map(([key, name]) => `<button type="button" data-finding-category="${key}" aria-pressed="${f.category === key}">${name}<span>${key === "all" ? f.rows.length : f.rows.filter(r => r.category === key).length}</span></button>`).join("");
     q("#findingsCount").textContent = t(`${rows.length} record dimuat`, `${rows.length} loaded records`);
-    if (f.category === "cyfirma") q("#findingsCount").innerHTML += Object.entries(f.feeds).filter(([,r]) => r.data?.next_offset != null).map(([scope]) => `<button type="button" data-finding-feed="${scope}">${t("Muat lagi", "Load more")} ${scope}</button>`).join("");
     const visible = rows.slice(f.page * pageSize, (f.page + 1) * pageSize);
     q("#findingsRows").innerHTML = visible.map(r => `<article class="findingRowShell ${f.selected?.id === r.id ? "selected" : ""}"><button type="button" class="findingRow" data-finding-id="${esc(r.id)}" aria-pressed="${f.selected?.id === r.id}"><span class="findingRowMeta">${pill(r.severity === "unknown" ? t("Belum dinilai", "Not assessed") : r.severity, r.severity)}<span>${esc(categories[r.category])}</span></span><strong>${esc(r.title)}</strong><span class="findingSubject">${esc(r.subject || r.description)}</span><span class="findingRowFoot"><span>${esc(evidenceLabels[r.evidence])}</span><span>${r.count == null ? esc(r.provider) : `${fmt.format(r.count)} ${r.countScope ? t("event terindeks", "indexed events") : r.category === "ip" ? t("asosiasi rule", "rule associations") : t("hit sampel", "sample hits")}`}</span></span></button><button type="button" class="findingAiButton" data-finding-ai="${esc(r.id)}" aria-label="${esc(t(`Jalankan analisis AI untuk ${r.title}`, `Run AI analysis for ${r.title}`))}">${f.ai.has(r.id) ? t("Lihat analisis AI", "View AI analysis") : f.aiJobs.has(r.id) ? t("Lihat progres AI", "View AI progress") : t("Run AI Analysis", "Run AI Analysis")}</button></article>`).join("") || `<div class="findingEmpty">${t("Tidak ada record yang cocok pada data dimuat.", "No matching records in the loaded data.")}</div>`;
     q("#findingsPagination").innerHTML = `<button type="button" data-finding-page="-1" ${f.page === 0 ? "disabled" : ""}>Previous</button><span>${rows.length ? f.page + 1 : 0} / ${Math.ceil(rows.length/pageSize)}</span><button type="button" data-finding-page="1" ${(f.page+1)*pageSize >= rows.length ? "disabled" : ""}>Next</button>`;
@@ -402,24 +368,21 @@
     }
   }
   async function loadFeeds() {
-    for (const [scope, kind] of [["tailored", "feed"], ["global", "feed_global"]]) {
-      try { f.feeds[scope] = await intel(kind); } catch (e) { f.feeds[scope] = {ok: false, error: e.message}; }
-      buildRows();
-    }
-  }
-  async function loadMoreFeed(scope, button) {
-    const previous = f.feeds[scope];
-    if (previous?.data?.next_offset == null) return;
-    button.disabled = true;
-    button.textContent = "Loading...";
     try {
-      const result = await intel(scope === "tailored" ? "feed" : "feed_global", String(previous.data.next_offset));
-      if (!result.ok) throw new Error(text(result.error || "Feed unavailable"));
-      f.feeds[scope] = {...result, data: {...result.data, items: [...previous.data.items, ...(result.data.items || [])]}};
-      buildRows();
-    } catch (e) { button.disabled = false; button.textContent = `Retry: ${e.message}`; }
+      const stored = await postJson("/api/intelligence/cyfirma", { ...currentWindowPayload(), limit: 1 });
+      f.feeds = {};
+      for (const scope of ["tailored", "global"]) {
+        const items = (stored.items || []).filter(item => item.scope === scope);
+        const feed = (stored.feed_status || []).find(item => item.scope === scope);
+        f.feeds[scope] = {ok: Boolean(feed) && feed.status !== "error", stored: true,
+          error: feed?.detail?.error,
+          data: {items, next_offset: null, summary: {count: scope === "tailored" ? stored.summary?.tailored : stored.summary?.global}}};
+      }
+    } catch (e) {
+      f.feeds = {stored: {ok: false, error: e.message, data: {items: [], summary: {count: 0}}}};
+    }
+    buildRows();
   }
-
   function aiList(title, values) {
     const rows = list(values).filter(Boolean);
     return rows.length ? section(title, `<ul class="findingAiList">${rows.map(item => `<li>${esc(typeof item === "object" ? item.detail || item.reason || item.signal || JSON.stringify(item) : item)}</li>`).join("")}</ul>`) : "";
@@ -575,13 +538,11 @@
     const ioc = event.target.closest("[data-finding-ioc-record]");
     if (ioc) {
       const record = JSON.parse(ioc.dataset.findingIocRecord);
-      const row = {id: `tool:${record.id || record.name}`, category: "cyfirma", provider: "CYFIRMA", title: record.name || record.iocs?.[0] || "IOC", subject: record.iocs?.[0], indicator: record.iocs?.[0], severity: "unknown", evidence: "intel", description: record.description, types: record.labels, scope: record.scope, raw: record};
+      const row = {id: `tool:${record.id || record.name}`, category: "observable", provider: "CYFIRMA", title: record.name || record.iocs?.[0] || "IOC", subject: record.iocs?.[0], indicator: record.iocs?.[0], severity: "unknown", evidence: "intel", description: record.description, types: record.labels, scope: record.scope, raw: record};
       if (!f.rows.some(r => r.id === row.id)) f.rows.push(row);
       f.category = "all"; q("#findingSearch").value = ""; q("#findingEvidence").value = "all"; q("#findingSeverity").value = "all";
       setView("findings"); select(row); renderList(); return;
     }
-    const feed = event.target.closest("[data-finding-feed]");
-    if (feed) { loadMoreFeed(feed.dataset.findingFeed, feed); return; }
     const category = event.target.closest("[data-finding-category]");
     if (category) { f.category = category.dataset.findingCategory; f.page = 0; renderList(); return; }
     const row = event.target.closest("[data-finding-id]");
@@ -627,6 +588,7 @@
   q("#findingAiOperationsRefresh")?.addEventListener("click", loadAiOperations);
   document.addEventListener("soc:overview", e => { f.data = e.detail; f.coverage = null; f.selected = null; f.pivots.clear(); f.cache.clear(); buildRows(); loadFeeds(); loadAiOperations(); });
   document.addEventListener("soc:intel", () => { if (f.data) buildRows(); });
+  document.addEventListener("soc:automation", () => { if (f.data) buildRows(); });
   setInterval(() => { if (q("#findingsView")?.classList.contains("active")) loadAiOperations(); }, 15000);
   viewTitles.findings = "Security Findings";
   window.SocFindings = {

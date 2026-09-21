@@ -50,6 +50,51 @@ class AutomationTests(unittest.TestCase):
         self.assertEqual(result['findings'][0]['status'], 'suspected')
         self.intel.assert_not_called()
 
+    def test_cyfirma_feed_is_daily_idempotent_and_history_uses_no_provider(self):
+        observed = datetime(2026, 9, 19, 9, tzinfo=timezone.utc).timestamp()
+        rows = [{
+            'id': 'indicator--one', 'scope': 'tailored',
+            'name': 'Observed exploit infrastructure CVE-2026-12345',
+            'description': 'Provider indicator mentioning CVE-2026-12345.',
+            'confidence': 85, 'iocs': ['198.51.100.8', 'malicious.example'],
+            'labels': ['malicious-activity'], 'modified': '2026-09-19T08:00:00Z',
+        }]
+        status = {'tailored': {'status': 'loaded', 'loaded': 1, 'reported': 1,
+                               'fetched_at': '2026-09-19T09:00:00+00:00'}}
+        self.worker._store_cyfirma_observations(rows, status, observed)
+        self.worker._store_cyfirma_observations(rows, status, observed + 300)
+        history = self.worker.cyfirma_updates(
+            datetime(2026, 9, 19, tzinfo=timezone.utc).isoformat(),
+            datetime(2026, 9, 20, tzinfo=timezone.utc).isoformat())
+        self.assertEqual(history['summary']['indicators'], 1)
+        self.assertEqual(history['summary']['tailored'], 1)
+        self.assertEqual(history['summary']['cve_linked'], 1)
+        self.assertEqual(history['items'][0]['cves'], ['CVE-2026-12345'])
+        self.assertEqual(history['cve_items'][0]['cves'], ['CVE-2026-12345'])
+        self.assertEqual(history['provider_calls'], 0)
+        self.assertNotIn('iocs', history['items'][0])
+        with self.worker.db() as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM cyfirma_observations').fetchone()[0], 1)
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM cyfirma_feed_runs').fetchone()[0], 1)
+
+    def test_existing_cyfirma_cache_is_materialized_without_provider_call(self):
+        fetched_at = '2026-09-19T09:00:00+00:00'
+        self.worker.put('feed:tailored', {
+            'rows': [{'id': 'indicator--cached', 'scope': 'tailored',
+                      'name': 'Cached provider record', 'confidence': 'high',
+                      'iocs': ['198.51.100.9']}],
+            'status': {'status': 'loaded', 'loaded': 1, 'reported': 1,
+                       'fetched_at': fetched_at},
+        }, 3600)
+        history = self.worker.cyfirma_updates(
+            datetime(2026, 9, 19, tzinfo=timezone.utc).isoformat(),
+            datetime(2026, 9, 20, tzinfo=timezone.utc).isoformat())
+        self.assertEqual(history['summary']['indicators'], 1)
+        self.assertEqual(history['items'][0]['name'], 'Cached provider record')
+        self.assertEqual(history['items'][0]['confidence'], 0)
+        self.assertEqual(history['provider_calls'], 0)
+        self.call.assert_not_called()
+
     def test_private_ips_paths_and_urls_not_disclosed(self):
         for kind, indicator in [('ip', '10.1.1.1'), ('url', '/.env'), ('url', 'http://127.0.0.1/'),
                                 ('url','https://example.com/?token=secret'), ('domain','internal')]:
