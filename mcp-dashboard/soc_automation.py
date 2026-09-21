@@ -1555,9 +1555,12 @@ def deliver(config, report, channel):
 
 
 class Automation:
-    def __init__(self, config, coverage, intel, evidence, inventory, call, db_path):
+    def __init__(self, config, coverage, intel, evidence, inventory, call, db_path, history=None):
         self.config, self.coverage, self.intel = config, coverage, intel
         self.evidence, self.inventory, self.call = evidence, inventory, call
+        # Optional local materializer. It lets cached provider results be
+        # attached to the event day without issuing another external lookup.
+        self.history = history
         self.db_path = Path(db_path)
         self.lock = threading.Lock()
         self.delivery_lock = threading.Lock()
@@ -2669,6 +2672,24 @@ class Automation:
         candidates = [r for r in coverage.get("observables", []) if public_indicator(r)]
         if self.pipeline and cfg.get('SOC_STREAM_ENABLED') == 'true':
             candidates = self.pipeline.candidates(int_config(cfg, "SOC_QUEUE_BATCH_SIZE", 75))
+        # Keep configured CrowdSec watchlist IPs in the bounded enrichment queue.
+        # They are not Wazuh observables by themselves, but an analyst explicitly
+        # asked to retain their provider verdict and history. Existing candidates
+        # are promoted to the front without duplicating them.
+        watchlist = []
+        watchlist_ips = set()
+        watchlist_rank = {}
+        for value in str(cfg.get("CROWDSEC_WATCHLIST_IPS") or "").split(","):
+            indicator = value.strip()
+            candidate = {"indicator": indicator, "kind": "ip", "level": 0,
+                         "occurrences": 0, "last_seen": None, "watchlist": True}
+            if indicator and public_indicator(candidate):
+                watchlist.append(candidate)
+                watchlist_ips.add(indicator)
+                watchlist_rank.setdefault(indicator, len(watchlist_rank))
+        if watchlist:
+            existing = {str(row.get("indicator")) for row in candidates}
+            candidates = [row for row in watchlist if row["indicator"] not in existing] + candidates
         feed_rows, feed_status = [], {}
         feed_started = time.time()
         feed_budget = int_config(cfg, "SOC_CYFIRMA_MAX_SECONDS", 90)
@@ -2726,7 +2747,10 @@ class Automation:
         with self.db() as db:
             attempts = dict(db.execute("SELECT key,expires FROM cache WHERE key LIKE 'ioc:%'"))
         if not self.pipeline or cfg.get('SOC_STREAM_ENABLED') != 'true':
-            candidates.sort(key=lambda r: (attempts.get("ioc:" + r["indicator"], 0), -r.get("level", 0)))
+            candidates.sort(key=lambda r: (
+                0 if str(r.get("indicator")) in watchlist_ips else 1,
+                watchlist_rank.get(str(r.get("indicator")), 999999),
+                attempts.get("ioc:" + r["indicator"], 0), -r.get("level", 0)))
         for index, candidate in enumerate(candidates):
             if time.time() - enrichment_started > enrichment_cutoff:
                 deferred += len(candidates) - index
@@ -2735,8 +2759,11 @@ class Automation:
             matches = feed_index.get(normalized(indicator), [])
             key = "ioc:" + indicator
             result = self.cached(key)
+            if result is not None and self.history:
+                self.history("finding_intel", {"kind": "aggregate", "indicator": indicator},
+                             result, candidate.get("last_seen"))
             if result is None and used < int(cfg["SOC_IOC_BUDGET"]):
-                result = self.intel("aggregate", indicator)
+                result = self.intel("aggregate", indicator, candidate.get("last_seen"))
                 if candidate["kind"] == "url":
                     result["urlhaus"] = self.intel("urlhaus", indicator)
                 elif candidate["kind"] in {"md5", "sha256"}:

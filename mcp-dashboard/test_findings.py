@@ -149,6 +149,18 @@ class FindingTests(unittest.TestCase):
             self.assertEqual(db.execute("SELECT COUNT(*) FROM provider_history_summary").fetchone()[0], 1)
             self.assertEqual(db.execute("SELECT COUNT(*) FROM provider_history_provider").fetchone()[0], 2)
 
+    def test_provider_history_can_follow_event_timestamp(self):
+        event_time = datetime.now(timezone.utc) - timedelta(days=2)
+        data = {"data": {"results": [{"provider": "crowdsec", "risk_level": "high"}]}}
+        server._provider_history_write(
+            "finding_intel", {"kind": "aggregate", "indicator": "198.51.100.44"},
+            data, event_time.isoformat())
+        history = server._provider_history_payload(
+            (event_time - timedelta(minutes=1)).isoformat(),
+            (event_time + timedelta(minutes=1)).isoformat())
+        self.assertEqual(history["summary"]["snapshots"], 1)
+        self.assertEqual(history["intelligence"][0]["indicator"], "198.51.100.44")
+
     def test_provider_history_30d_includes_old_materialized_snapshot_without_provider_call(self):
         observed = time.time() - 20 * 86400
         stored = {"data": {"results": [{"provider": "cyfirma", "risk_level": "high"}]}}

@@ -1962,7 +1962,7 @@ def _provider_history_materialize_pending(db: sqlite3.Connection, start_ts: floa
     return len(rows)
 
 
-def _provider_history_write(namespace: str, request_payload: Any, data: dict[str, Any]) -> None:
+def _provider_history_write(namespace: str, request_payload: Any, data: dict[str, Any], observed_at: Any = None) -> None:
     if namespace != "finding_intel" or not isinstance(request_payload, dict) or request_payload.get("kind") != "aggregate":
         return
     indicator = str(request_payload.get("indicator") or "").strip()
@@ -1970,7 +1970,18 @@ def _provider_history_write(namespace: str, request_payload: Any, data: dict[str
     if not indicator or not isinstance(result_data, dict):
         return
     now_ts = time.time()
-    bucket_hour = int(now_ts // 3600 * 3600)
+    history_ts = now_ts
+    if observed_at is not None:
+        try:
+            history_ts = float(observed_at)
+        except (TypeError, ValueError):
+            try:
+                history_ts = datetime.fromisoformat(str(observed_at).replace("Z", "+00:00")).timestamp()
+            except (TypeError, ValueError):
+                history_ts = now_ts
+        if history_ts <= 0 or history_ts > now_ts + 86400:
+            history_ts = now_ts
+    bucket_hour = int(history_ts // 3600 * 3600)
     retention_days = _runtime_int("SOC_PROVIDER_HISTORY_RETENTION_DAYS", 180)
     try:
         _overview_cache_init()
@@ -1981,13 +1992,13 @@ def _provider_history_write(namespace: str, request_payload: Any, data: dict[str
                    (id, namespace, cache_key, indicator, observed_at, bucket_hour, payload)
                    VALUES ((SELECT id FROM provider_history WHERE namespace=? AND cache_key=? AND bucket_hour=?),?,?,?,?,?,?)""",
                 (namespace, cache_key, bucket_hour,
-                 namespace, cache_key, indicator, now_ts, bucket_hour,
+                 namespace, cache_key, indicator, history_ts, bucket_hour,
                  json.dumps(data, separators=(",", ":"), default=str)),
             )
             history_id = db.execute("""SELECT id FROM provider_history
                 WHERE namespace=? AND cache_key=? AND bucket_hour=?""",
                 (namespace, cache_key, bucket_hour)).fetchone()[0]
-            _provider_history_materialize(db, int(history_id), indicator, now_ts, data)
+            _provider_history_materialize(db, int(history_id), indicator, history_ts, data)
             db.execute("DELETE FROM provider_history WHERE observed_at < ?", (now_ts - retention_days * 86400,))
             db.execute("DELETE FROM provider_history_summary WHERE history_id NOT IN (SELECT id FROM provider_history)")
             db.execute("DELETE FROM provider_history_provider WHERE history_id NOT IN (SELECT id FROM provider_history)")
@@ -3263,7 +3274,7 @@ def _merge_finding_history(kind: str, indicator: str, result: dict[str, Any]) ->
     return merged
 
 
-def _finding_intel(kind: str, indicator: str = "") -> dict[str, Any]:
+def _finding_intel(kind: str, indicator: str = "", observed_at: Any = None) -> dict[str, Any]:
     """Bounded, cached read-only intelligence for the findings workspace."""
     if not isinstance(indicator, str) or len(indicator) > 512:
         raise ValueError("Invalid indicator")
@@ -3317,7 +3328,7 @@ def _finding_intel(kind: str, indicator: str = "") -> dict[str, Any]:
     if disk_cached:
         disk_cached["cached"] = True
         disk_cached = _merge_finding_history(kind, indicator, disk_cached)
-        _provider_history_write("finding_intel", cache_payload, disk_cached)
+        _provider_history_write("finding_intel", cache_payload, disk_cached, observed_at)
         return disk_cached
     # Share in-flight calls between browser tabs to avoid duplicate quota usage.
     with _finding_lock:
@@ -3356,7 +3367,7 @@ def _finding_intel(kind: str, indicator: str = "") -> dict[str, Any]:
         result = _merge_finding_history(kind, indicator, result)
         ttl = _runtime_int("SOC_PROVIDER_OK_CACHE_SECONDS", 21600) if result.get("ok") and not result.get("partial") else _runtime_int("SOC_PROVIDER_ERROR_BACKOFF_SECONDS", 14400)
         result = _api_cache_write("finding_intel", cache_payload, result, ttl)
-        _provider_history_write("finding_intel", cache_payload, result)
+        _provider_history_write("finding_intel", cache_payload, result, observed_at)
         slot.update(result=result, expires=time.time() + (600 if result.get("ok") else 60))
         return result
 
@@ -3828,7 +3839,7 @@ class BoundedThreadingHTTPServer(ThreadingHTTPServer):
 automation = soc_automation.Automation(_runtime_config_values,
     lambda: analysis_coverage(_indexer_search, "24h"), _finding_intel, _finding_evidence,
     lambda payload: vulnerability_inventory(_indexer_search, payload), _safe_call,
-    AUTOMATION_DB)
+    AUTOMATION_DB, _provider_history_write)
 pipeline = soc_pipeline.Pipeline(automation, _indexer_request)
 automation.pipeline = pipeline
 

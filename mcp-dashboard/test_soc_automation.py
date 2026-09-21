@@ -40,6 +40,12 @@ class AutomationTests(unittest.TestCase):
         self.worker.build()
         self.assertEqual(self.intel.call_count, 2)
 
+    def test_crowdsec_watchlist_is_captured_with_budget_and_not_duplicated(self):
+        self.config.update({"CROWDSEC_WATCHLIST_IPS": "9.9.9.9,8.8.8.8", "SOC_IOC_BUDGET": "1"})
+        report = self.worker.build()
+        self.assertEqual(report["findings"][0]["indicator"], "9.9.9.9")
+        self.intel.assert_called_once_with("aggregate", "9.9.9.9", None)
+
     def test_cyfirma_matches_local_evidence_not_every_feed_item(self):
         self.config['SOC_IOC_BUDGET'] = '0'
         self.call.return_value = {'ok': True, 'data': {'items': [
