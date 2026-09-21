@@ -2058,6 +2058,10 @@ def _provider_history_payload(start: str, end: str, offset: int = 0, query: str 
                 FROM provider_history_cve c
                 JOIN provider_history_summary s ON s.history_id=c.history_id
                 WHERE {summary_where} ORDER BY c.cve LIMIT 30""", summary_params).fetchall()
+            indicator_rows = db.execute(f"""SELECT s.indicator,MAX(s.observed_at)
+                FROM provider_history_summary s WHERE {summary_where}
+                GROUP BY s.indicator ORDER BY MAX(s.observed_at) DESC,s.indicator LIMIT 100""",
+                summary_params).fetchall()
     except sqlite3.Error as exc:
         raise ValueError("Provider history database unavailable") from exc
 
@@ -2099,6 +2103,9 @@ def _provider_history_payload(start: str, end: str, offset: int = 0, query: str 
         "intelligence": intelligence,
         "timeline": [{"key": int(bucket) * 1000, "doc_count": int(count)}
                      for bucket, count in timeline_rows],
+        "indicator_catalog": [{"indicator": indicator,
+                                "observed_at": datetime.fromtimestamp(float(observed_at), timezone.utc).isoformat()}
+                               for indicator, observed_at in indicator_rows],
         "summary": {
             "snapshots": int(aggregate[0] or 0),
             "unique_indicators": int(aggregate[1] or 0),

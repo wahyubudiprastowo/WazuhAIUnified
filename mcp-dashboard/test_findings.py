@@ -145,6 +145,7 @@ class FindingTests(unittest.TestCase):
         self.assertEqual(summary["materialization"]["source"], "sqlite_normalized_summary")
         self.assertTrue(summary["materialization"]["complete"])
         self.assertEqual(result["intelligence"], [])
+        self.assertEqual(result["indicator_catalog"][0]["indicator"], indicator)
         with server._sqlite_db(server.OVERVIEW_CACHE_DB) as db:
             self.assertEqual(db.execute("SELECT COUNT(*) FROM provider_history_summary").fetchone()[0], 1)
             self.assertEqual(db.execute("SELECT COUNT(*) FROM provider_history_provider").fetchone()[0], 2)

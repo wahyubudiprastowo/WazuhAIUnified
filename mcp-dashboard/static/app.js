@@ -2481,7 +2481,9 @@ function renderCrowdSecIntel(payload = state.crowdSecIntel) {
         const tone = row.malicious ? "critical" : row.providers?.some((provider) => provider.error) ? "high" : reputationTone(row.reputation);
         const location = crowdLocation(row);
         const range = row.ip_range_24 || row.ip_range || crowd.ip_range_24 || crowd.ip_range || "-";
-        const sourceLabel = row.watchlist && !number(row.observed_hits) ? "CrowdSec watchlist" : "Wazuh observed";
+        const sourceLabel = row.historical_only
+          ? "Retained provider history"
+          : row.watchlist && !number(row.observed_hits) ? "CrowdSec watchlist" : "Wazuh observed";
         return `
           <article class="crowdCard ${esc(tone)}" tabindex="0" data-tool-name="blueteam_threat_intel_aggregate" data-pivot-ip="${esc(row.ip)}">
             <div class="crowdCardHead">
@@ -2552,6 +2554,22 @@ async function loadCrowdSecIntel(silent = true, live = false) {
   (state.overview.source_ips || []).slice(0, 14).forEach((row, index) => addCandidate(row.ip, "Wazuh observed", 100 - index));
   (window.SocAutomation?.report?.findings || []).slice(0, 12).forEach((row, index) => addCandidate(row.indicator, "Automation finding", 90 - index));
   (state.overview.crowdsec_watchlist_ips || []).slice(0, 8).forEach((ip, index) => addCandidate(ip, "Watchlist", 80 - index));
+  state.crowdSecLoading = true;
+  const automationByIndicator = new Map((window.SocAutomation?.report?.findings || []).map((row) => [row.indicator, row]));
+  let historicalByIndicator = new Map();
+  let historicalCatalog = [];
+  try {
+    const stored = await postJson("/api/history/intelligence", {...currentWindowPayload(), offset: 0});
+    historicalByIndicator = new Map((stored.intelligence || []).map((row) => [row.indicator, row]));
+    historicalCatalog = arrayify(stored.indicator_catalog);
+  } catch (_) {
+    historicalByIndicator = new Map();
+  }
+  // Historical provider observations may not be in the current Wazuh top-IP
+  // sample. Keep them discoverable with a small local-only catalog.
+  historicalCatalog.slice(0, 32).forEach((row, index) => {
+    addCandidate(row.indicator, "Retained provider history", 70 - Math.min(index, 31) / 100);
+  });
   const candidates = [...candidatesByIp.values()]
     .sort((a, b) => b.rank - a.rank)
     .slice(0, 16);
@@ -2564,14 +2582,17 @@ async function loadCrowdSecIntel(silent = true, live = false) {
     renderCrowdSecIntel(state.crowdSecIntel);
     return;
   }
-  state.crowdSecLoading = true;
-  const automationByIndicator = new Map((window.SocAutomation?.report?.findings || []).map((row) => [row.indicator, row]));
-  let historicalByIndicator = new Map();
-  try {
-    const stored = await postJson("/api/history/intelligence", {...currentWindowPayload(), offset: 0});
-    historicalByIndicator = new Map((stored.intelligence || []).map((row) => [row.indicator, row]));
-  } catch (_) {
-    historicalByIndicator = new Map();
+  const historicalOnlyCandidates = candidates
+    .filter((candidate) => candidate.sources.has("Retained provider history") && !historicalByIndicator.has(candidate.ip))
+    .slice(0, 8);
+  if (historicalOnlyCandidates.length) {
+    const detailResponses = await Promise.allSettled(historicalOnlyCandidates.map((candidate) =>
+      postJson("/api/history/intelligence", {...currentWindowPayload(), query: candidate.ip, offset: 0})
+    ));
+    detailResponses.forEach((response) => {
+      if (response.status !== "fulfilled") return;
+      (response.value?.intelligence || []).forEach((row) => historicalByIndicator.set(row.indicator, row));
+    });
   }
   const storedRows = candidates.map((candidate) => {
     const automation = automationByIndicator.get(candidate.ip) || {};
@@ -2598,6 +2619,7 @@ async function loadCrowdSecIntel(silent = true, live = false) {
       observed_hits: observed[candidate.ip]?.hits || automation.event_total || 0,
       observed_score: observed[candidate.ip]?.max_score || automation.level || 0,
       watchlist: (state.overview.crowdsec_watchlist_ips || []).includes(candidate.ip),
+      historical_only: !observed[candidate.ip] && !automation.indicator && !((state.overview.crowdsec_watchlist_ips || []).includes(candidate.ip)),
       enriched_at: historical.observed_at || automation.enriched_at,
     };
   });
