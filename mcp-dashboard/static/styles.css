@@ -130,6 +130,27 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
   gap: 8px;
 }
 
+.navGroup {
+  display: grid;
+  gap: 4px;
+  padding-top: 8px;
+  border-top: 1px solid rgba(159,180,210,0.12);
+}
+
+.navGroup:first-child {
+  padding-top: 0;
+  border-top: 0;
+}
+
+.navGroupLabel {
+  padding: 0 10px 3px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+}
+
 .nav button {
   width: 100%;
   display: grid;
@@ -248,6 +269,10 @@ select option { color: #111827; }
   display: none;
   padding: 18px;
   max-width: 1720px;
+}
+
+.view > *, .view .gridTwo > *, .view .gridThree > * {
+  min-width: 0;
 }
 
 .view.active { display: block; }
@@ -2515,9 +2540,7 @@ select option { color: #111827; }
 }
 
 .settingsActions {
-  position: sticky;
-  top: 0;
-  z-index: 4;
+  position: static;
   display: flex;
   gap: 8px;
   flex-wrap: wrap;
@@ -2527,9 +2550,15 @@ select option { color: #111827; }
   backdrop-filter: blur(16px);
 }
 
+#settingsView .settingsShell > section:first-child .settingsActions {
+  position: sticky;
+  top: 0;
+  z-index: 4;
+}
+
 .settingsGrid {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 360px), 1fr));
   gap: 14px;
   padding: 14px;
 }
@@ -2572,12 +2601,14 @@ select option { color: #111827; }
 
 .settingField {
   display: grid;
-  grid-template-columns: minmax(170px, .45fr) minmax(0, 1fr);
+  grid-template-columns: minmax(150px, .7fr) minmax(0, 1.3fr);
   gap: 12px;
   align-items: center;
   padding: 12px;
   border-bottom: 1px solid rgba(159,180,210,0.13);
 }
+
+.settingField > * { min-width: 0; }
 
 .settingField:last-child {
   border-bottom: 0;

@@ -6,7 +6,12 @@
   let offset=0, items=[], timeline=[], selection=0, generation=0, busy=false;
   const local = ms => new Date(ms+Number($('historyZone').value)*3600000).toISOString().slice(0,16);
   const instant = value => { const ms=Date.parse(value+'Z')-Number($('historyZone').value)*3600000; if(!Number.isFinite(ms)) throw new Error(t('Select valid dates','Pilih tanggal yang valid')); return new Date(ms).toISOString(); };
-  const display = value => new Intl.DateTimeFormat(window.SocLocale?.language==='id'?'id-ID':'en-GB',{dateStyle:'medium',timeStyle:'short',timeZone:$('historyZone').value==='7'?'Asia/Jakarta':'UTC'}).format(new Date(value));
+  const display = value => {
+    if (!value) return '-';
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return String(value);
+    return new Intl.DateTimeFormat(window.SocLocale?.language==='id'?'id-ID':'en-GB',{dateStyle:'medium',timeStyle:'short',timeZone:$('historyZone').value==='7'?'Asia/Jakarta':'UTC'}).format(date);
+  };
   const chip = (value, cls='') => `<span class="historyChip ${esc(cls)}">${esc(value ?? '-')}</span>`;
   const metric = (label, value, detail='') => `<article><span>${esc(label)}</span><strong>${esc(value ?? '-')}</strong>${detail ? `<small>${esc(detail)}</small>` : ''}</article>`;
   const list = value => Array.isArray(value) ? value : value == null ? [] : [value];
@@ -24,8 +29,30 @@
   function renderSummary(summary, mode) {
     const target = $('historySummary');
     if (!target) return;
-    if (!summary || !['reports','intelligence'].includes(mode)) {
+    if (!summary || !['reports','intelligence','cyfirma'].includes(mode)) {
       target.innerHTML = '';
+      return;
+    }
+    if (mode === 'cyfirma') {
+      const labels = Object.entries(summary.top_labels || {}).slice(0, 6).map(([key, value]) => `${key} (${fmt.format(value)})`).join(', ');
+      const phases = Object.entries(summary.top_kill_chain_phases || {}).slice(0, 6).map(([key, value]) => `${key} (${fmt.format(value)})`).join(', ');
+      const feeds = (summary.feed_status || []).map(feed => `${feed.scope}: ${feed.status}`).join(' · ');
+      target.innerHTML = `<div class="historySummaryHero">
+        <div><span>CYFIRMA intelligence ledger</span><strong>${t('Stored STIX indicators','Indikator STIX tersimpan')}</strong><p>${t('Historical feed data is read from the local SQLite ledger. This view makes zero provider calls.','Data feed historis dibaca dari ledger SQLite lokal. Tampilan ini tidak melakukan call provider.')}</p></div>
+        <b>${fmt.format(summary.indicators || 0)}</b>
+      </div>
+      <div class="historyMetrics historySummaryMetrics">
+        ${metric(t('IOC values','Nilai IOC'),fmt.format(summary.ioc_values || 0),t('bounded indicator values','nilai indikator terbatas'))}
+        ${metric(t('Tailored','Tailored'),fmt.format(summary.tailored || 0),t('organization feed','feed organisasi'))}
+        ${metric(t('Global','Global'),fmt.format(summary.global || 0),t('global feed','feed global'))}
+        ${metric(t('CVE linked','Terhubung CVE'),fmt.format(summary.cve_linked || 0),t('explicit references only','hanya referensi eksplisit'))}
+        ${metric(t('Provider calls','Call provider'),fmt.format(0),t('historical read','baca historis'))}
+      </div>
+      <div class="historySummaryGrid">
+        <article><h3>${t('Feed status','Status feed')}</h3><p>${esc(feeds || t('No feed run in this window','Belum ada feed run pada window ini'))}</p><small>${esc(display(summary.last_observed_at) || '-')}</small></article>
+        <article><h3>${t('Top labels','Label teratas')}</h3><p>${esc(labels || t('No labels stored','Belum ada label tersimpan'))}</p></article>
+        <article><h3>${t('Kill-chain phases','Fase kill-chain')}</h3><p>${esc(phases || t('No phases stored','Belum ada fase tersimpan'))}</p></article>
+      </div>`;
       return;
     }
     if (mode === 'intelligence') {
@@ -121,6 +148,25 @@
       <details><summary>${t('Stored source record','Record sumber tersimpan')}</summary><pre>${esc(JSON.stringify(stored,null,2))}</pre></details>`;
       return;
     }
+    if($('historyMode').value==='cyfirma') {
+      const phases = list(row.kill_chain_phases).filter(Boolean);
+      const references = list(row.references).filter(Boolean);
+      $('historyDetail').innerHTML=`<div class="historyReportHero ${Number(row.confidence || 0) >= 70 ? 'high' : 'medium'}">
+        <div><span>CYFIRMA STIX 2.1</span><h2>${esc(row.name || 'STIX indicator')}</h2><p>${esc(row.scope || 'feed')} · ${esc(row.indicator_type || 'indicator')}</p></div>
+        <strong>${fmt.format(Number(row.confidence || 0))}%</strong>
+      </div>
+      <div class="historyMetrics">
+        ${metric(t('IOC values','Nilai IOC'),fmt.format(row.ioc_count || 0),t('stored as bounded count','disimpan sebagai jumlah terbatas'))}
+        ${metric(t('CVE references','Referensi CVE'),fmt.format(list(row.cves).length),t('explicit provider context','konteks eksplisit provider'))}
+        ${metric(t('Kill-chain phases','Fase kill-chain'),fmt.format(phases.length),t('provider supplied','dari provider'))}
+        ${metric(t('References','Referensi'),fmt.format(references.length),t('source links retained','tautan sumber tersimpan'))}
+      </div>
+      <section class="historyBriefBlock"><h3>${t('Provider description','Deskripsi provider')}</h3><p>${esc(row.description || t('No description supplied.','Tidak ada deskripsi.'))}</p></section>
+      <section class="historyBriefBlock"><h3>${t('CVE and classification context','Konteks CVE dan klasifikasi')}</h3><div class="historyChipRow">${list(row.cves).map(v=>chip(v,'cve')).join('') || chip(t('No explicit CVE reference','Tidak ada referensi CVE eksplisit'),'cve')}${list(row.labels).map(v=>chip(v)).join('')}${list(row.ioc_types).map(v=>chip(v)).join('')}</div><p>${esc(phases.join(', ') || t('No kill-chain phase supplied.','Tidak ada fase kill-chain.'))}</p></section>
+      <section class="historyBriefBlock"><h3>${t('Validity and provenance','Masa berlaku dan provenance')}</h3><dl>${[[t('Captured','Ditangkap'),row.observed_at],[t('Created','Dibuat'),row.created],[t('Modified','Diubah'),row.modified],[t('Valid from','Berlaku sejak'),row.valid_from],[t('Valid until','Berlaku sampai'),row.valid_until]].map(([k,v])=>`<dt>${esc(k)}</dt><dd>${esc(v ? display(v) : '-')}</dd>`).join('')}</dl></section>
+      <details><summary>${t('Stored references','Referensi tersimpan')}</summary><pre>${esc(JSON.stringify(references,null,2))}</pre></details>`;
+      return;
+    }
     $('historyDetail').textContent=t('Loading report...','Memuat laporan...');
     try {const {report:r}=await postJson('/api/history/report',{id:row.id});if(token!==selection)return;
       const ai = r.ai || {}, res = ai.result || {}, verdict = res.verdict || {};
@@ -180,23 +226,25 @@
     if ($('historySummary')) $('historySummary').innerHTML = '';
     try {
       const mode=$('historyMode').value;
-      const data=await postJson('/api/history/'+mode,{start:instant($('historyStart').value),end:instant($('historyEnd').value),offset,query:$('historyQuery').value,min_level:Number($('historyLevel').value)});
+      const endpoint = mode === 'cyfirma' ? '/api/intelligence/cyfirma' : '/api/history/'+mode;
+      const data=await postJson(endpoint,{start:instant($('historyStart').value),end:instant($('historyEnd').value),offset,limit:mode === 'cyfirma' ? 30 : undefined,query:$('historyQuery').value,min_level:Number($('historyLevel').value)});
       if(token!==generation)return; if(data.ok===false)throw new Error(t('Partial index response. Narrow the time range and retry.','Respons indeks parsial. Persempit periode lalu coba lagi.'));
-      items=data.events||data.reports||data.intelligence||[]; if(reset){timeline=data.timeline||[];chart();renderSummary(data.summary, mode);}
-      $('historyStatus').textContent=mode==='events'?`${fmt.format(data.total)} ${t('events in selected interval; not all are attacks','event pada periode terpilih; tidak semuanya serangan')}`:mode==='intelligence'?`${fmt.format(data.total)} ${t('stored provider snapshots in selected interval','snapshot provider tersimpan pada periode terpilih')}`:`${fmt.format(items.length)} ${t('analysis reports in selected interval','laporan analisis pada periode terpilih')}`;
-      $('historyHead').innerHTML=`<tr><th>${t('Time','Waktu')}</th><th>${t('Record','Rekaman')}</th><th>${mode==='events'?'Level':mode==='intelligence'?t('Risk','Risiko'):'AI'}</th></tr>`;
-      $('historyRows').innerHTML=items.map((r,i)=>{const when=mode==='events'?r['@timestamp']:mode==='intelligence'?r.observed_at:r.generated_at;const record=mode==='events'?r.rule?.description||r.id:mode==='intelligence'?`${r.indicator} · ${r.provider_results} provider result(s)`:'#'+r.id+' · '+r.findings+' '+t('findings','findings');const sub=mode==='events'?r.agent?.name||'':mode==='intelligence'?`${r.provider_matches} match · ${r.cve_refs?.length||0} CVE · ${r.cyfirma_matches||0} CYFIRMA`:reportCard(r);const level=mode==='events'?r.rule?.level:mode==='intelligence'?r.risk:r.verdict?.severity||r.ai;return `<tr><td>${esc(display(when))}</td><td><button type="button" data-history-row="${i}">${esc(record)}</button><br>${esc(sub)}</td><td>${esc(level)}</td></tr>`;}).join('');
+      items=mode==='cyfirma'?data.items||[]:data.events||data.reports||data.intelligence||[]; if(reset){timeline=data.timeline||[];chart();renderSummary(data.summary, mode);}
+      $('historyStatus').textContent=mode==='events'?`${fmt.format(data.total)} ${t('events in selected interval; not all are attacks','event pada periode terpilih; tidak semuanya serangan')}`:mode==='intelligence'?`${fmt.format(data.total)} ${t('stored provider snapshots in selected interval','snapshot provider tersimpan pada periode terpilih')}`:mode==='cyfirma'?`${fmt.format(items.length)} ${t('stored CYFIRMA indicators in selected interval','indikator CYFIRMA tersimpan pada periode terpilih')}`:`${fmt.format(items.length)} ${t('analysis reports in selected interval','laporan analisis pada periode terpilih')}`;
+      $('historyHead').innerHTML=`<tr><th>${t('Time','Waktu')}</th><th>${t('Record','Rekaman')}</th><th>${mode==='events'?'Level':mode==='intelligence'?t('Risk','Risiko'):mode==='cyfirma'?t('Confidence','Confidence'):'AI'}</th></tr>`;
+      $('historyRows').innerHTML=items.map((r,i)=>{const when=mode==='events'?r['@timestamp']:mode==='intelligence'?r.observed_at:mode==='cyfirma'?r.observed_at:r.generated_at;const record=mode==='events'?r.rule?.description||r.id:mode==='intelligence'?`${r.indicator} · ${r.provider_results} provider result(s)`:mode==='cyfirma'?r.name||r.id:'#'+r.id+' · '+r.findings+' '+t('findings','findings');const sub=mode==='events'?r.agent?.name||'':mode==='intelligence'?`${r.provider_matches} match · ${r.cve_refs?.length||0} CVE · ${r.cyfirma_matches||0} CYFIRMA`:mode==='cyfirma'?`${r.scope || 'feed'} · ${r.ioc_count || 0} IOC · ${(r.cves || []).length} CVE`:reportCard(r);const level=mode==='events'?r.rule?.level:mode==='intelligence'?r.risk:mode==='cyfirma'?`${r.confidence || 0}%`:r.verdict?.severity||r.ai;return `<tr><td>${esc(display(when))}</td><td><button type="button" data-history-row="${i}">${esc(record)}</button><br>${esc(sub)}</td><td>${esc(level)}</td></tr>`;}).join('');
       $('historyPage').textContent=`${offset+Number(items.length>0)}–${offset+items.length}`;
-      $('historyPrevious').disabled=offset===0; $('historyNext').disabled=mode==='events'?offset+items.length>=data.total||offset>=9950:items.length<20;
+      $('historyPrevious').disabled=offset===0; $('historyNext').disabled=mode==='events'?offset+items.length>=data.total||offset>=9950:mode==='cyfirma'?items.length<30:items.length<20;
       if(items.length)await choose(0);
     }catch(e){if(token===generation){$('historyStatus').textContent=e.message; $('historyRows').innerHTML=''; $('historyNext').disabled=true;}}
     finally{if(token===generation){busy=false;$('historySearch').disabled=false;}}
   }
   $('historyFilters').onsubmit=e=>{e.preventDefault();load();};
   $('historyQuery').disabled=true; $('historyLevel').disabled=true;
-  $('historyMode').onchange=()=>{const mode=$('historyMode').value;$('historyQuery').disabled=mode==='reports';$('historyLevel').disabled=mode!=='events';load();};
-  $('historyPrevious').onclick=()=>{if(!busy){offset=Math.max(0,offset-($('historyMode').value==='events'?50:20));load(false);}};
-  $('historyNext').onclick=()=>{if(!busy){offset+=$('historyMode').value==='events'?50:20;load(false);}};
+  $('historyMode').onchange=()=>{const mode=$('historyMode').value;$('historyQuery').disabled=!['events','intelligence'].includes(mode);$('historyLevel').disabled=mode!=='events';load();};
+  const pageSize = () => $('historyMode').value === 'events' ? 50 : $('historyMode').value === 'cyfirma' ? 30 : 20;
+  $('historyPrevious').onclick=()=>{if(!busy){offset=Math.max(0,offset-pageSize());load(false);}};
+  $('historyNext').onclick=()=>{if(!busy){offset+=pageSize();load(false);}};
   $('historyRows').onclick=e=>{const b=e.target.closest('[data-history-row]');if(b)choose(Number(b.dataset.historyRow));};
   $('historyTimeline').onclick=e=>{const b=e.target.closest('[data-bucket]');if(!b)return;const i=Number(b.dataset.bucket),step=timeline.length>1?timeline[1].key-timeline[0].key:3600000; $('historyStart').value=local(timeline[i].key);$('historyEnd').value=local(timeline[i].key+step);load();};
   document.querySelector('[data-view="history"]').addEventListener('click',()=>{pipeline();if(!items.length)load();});

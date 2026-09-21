@@ -77,6 +77,8 @@ class AutomationTests(unittest.TestCase):
         self.assertEqual(history['summary']['cve_linked'], 1)
         self.assertEqual(history['items'][0]['cves'], ['CVE-2026-12345'])
         self.assertEqual(history['cve_items'][0]['cves'], ['CVE-2026-12345'])
+        self.assertEqual(history['items'][0]['indicator_type'], 'indicator')
+        self.assertEqual(history['timeline'][0]['doc_count'], 1)
         self.assertEqual(history['provider_calls'], 0)
         self.assertNotIn('iocs', history['items'][0])
         with self.worker.db() as db:

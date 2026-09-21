@@ -1682,18 +1682,21 @@ class Automation:
             if value and str(value) not in phases:
                 phases.append(str(value)[:120])
         references = [str(value)[:500] for value in (row.get("references") or []) if value][:10]
+        ioc_types = [str(value)[:64] for value in (row.get("ioc_types") or []) if value][:12]
         try:
             confidence = int(float(row.get("confidence") or 0))
         except (TypeError, ValueError):
             confidence = 0
         safe = {
             "id": str(row.get("id") or "")[:300], "scope": scope,
+            "indicator_type": str(row.get("type") or "indicator")[:64],
             "name": str(row.get("name") or "STIX indicator")[:500],
             "description": str(row.get("description") or "")[:3000],
             "confidence": max(0, min(confidence, 100)),
             "created": row.get("created"), "modified": row.get("modified"),
             "valid_from": row.get("valid_from"), "valid_until": row.get("valid_until"),
             "labels": labels, "kill_chain_phases": phases, "references": references,
+            "reference_count": len(references), "ioc_types": ioc_types,
             "cves": cves, "ioc_count": len(row.get("iocs") or []),
         }
         identity = "\x1f".join((bucket_day, scope, item_key))
@@ -1803,6 +1806,9 @@ class Automation:
             runs = db.execute('''SELECT scope,status,loaded,reported,cached,collected_at,detail
                 FROM cyfirma_feed_runs WHERE collected_at>=? AND collected_at<?
                 ORDER BY collected_at DESC LIMIT 12''', (start_ts, end_ts)).fetchall()
+            timeline_rows = db.execute('''SELECT bucket_day,COUNT(DISTINCT item_key),COALESCE(SUM(ioc_count),0)
+                FROM cyfirma_observations WHERE observed_at>=? AND observed_at<?
+                GROUP BY bucket_day ORDER BY bucket_day''', (start_ts, end_ts)).fetchall()
         def decode_rows(records):
             decoded = []
             for raw, observed_at in records:
@@ -1816,6 +1822,13 @@ class Automation:
 
         items = decode_rows(rows)
         cve_items = decode_rows(cve_rows)
+        labels = {}
+        phases = {}
+        for item in items:
+            for value in item.get("labels") or []:
+                labels[str(value)] = labels.get(str(value), 0) + 1
+            for value in item.get("kill_chain_phases") or []:
+                phases[str(value)] = phases.get(str(value), 0) + 1
         statuses = []
         seen_scopes = set()
         for scope, status, loaded, reported, cached, collected_at, detail in runs:
@@ -1831,8 +1844,14 @@ class Automation:
             "summary": {"indicators": int(totals[0] or 0), "tailored": int(totals[1] or 0),
                 "global": int(totals[2] or 0), "ioc_values": int(totals[3] or 0),
                 "cve_linked": int(totals[5] or 0),
-                "last_observed_at": datetime.fromtimestamp(totals[4], timezone.utc).isoformat() if totals[4] else None},
+                "last_observed_at": datetime.fromtimestamp(totals[4], timezone.utc).isoformat() if totals[4] else None,
+                "top_labels": dict(sorted(labels.items(), key=lambda item: item[1], reverse=True)[:8]),
+                "top_kill_chain_phases": dict(sorted(phases.items(), key=lambda item: item[1], reverse=True)[:8]),
+                "feed_status": statuses},
             "items": items, "cve_items": cve_items, "feed_status": statuses,
+            "timeline": [{"key": datetime.fromisoformat(day).replace(tzinfo=timezone.utc).timestamp() * 1000,
+                          "doc_count": int(indicators), "ioc_values": int(ioc_values)}
+                         for day, indicators, ioc_values in timeline_rows],
             "provider_calls": 0, "storage": "soc-automation SQLite daily ledger",
             "scope_note": "CYFIRMA endpoints currently provide STIX indicators. CVE linkage appears only when a feed record explicitly references a CVE; absence is not evidence that no relevant CVE exists.",
         }

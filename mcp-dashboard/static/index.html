@@ -4,14 +4,14 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Wazuh MCP SOC Command</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260915-2">
+    <link rel="stylesheet" href="/static/styles.css?v=20260921-6">
     <link rel="stylesheet" href="/static/findings.css?v=20260920-2">
     <link rel="stylesheet" href="/static/analysis.css?v=20260909-14">
     <link rel="stylesheet" href="/static/enterprise.css?v=20260921-3">
     <link rel="stylesheet" href="/static/automation.css?v=20260914-1">
-    <link rel="stylesheet" href="/static/history.css?v=20260915-3">
+    <link rel="stylesheet" href="/static/history.css?v=20260921-4">
     <link rel="stylesheet" href="/static/workflows.css?v=20260920-2">
-    <link rel="stylesheet" href="/static/intelligence.css?v=20260920-1">
+    <link rel="stylesheet" href="/static/intelligence.css?v=20260921-2">
   </head>
   <body>
     <aside class="sidebar">
@@ -22,19 +22,31 @@
           <small>AI Security Operations</small>
         </div>
       </div>
-      <nav class="nav">
-        <button data-view="findings" type="button"><span>FX</span>Findings</button>
-        <button class="active" data-view="command" type="button"><span>01</span>Command</button>
-        <button data-view="workbench" type="button"><span>WB</span>Workbench</button>
-        <button data-view="l1" type="button"><span>L1</span>Triage</button>
-        <button data-view="l2" type="button"><span>L2</span>Investigate</button>
-        <button data-view="incidents" type="button"><span>IR</span>Incidents</button>
-        <button data-view="history" type="button"><span>HT</span>Event History</button>
-        <button data-view="l3" type="button"><span>L3</span>Hunt</button>
-        <button data-view="vuln" type="button"><span>CV</span>Vulnerabilities</button>
-        <button data-view="assets" type="button"><span>AS</span>Assets</button>
-        <button data-view="tools" type="button"><span>TC</span>Tool Console</button>
-        <button data-view="settings" type="button"><span>ST</span>Settings</button>
+      <nav class="nav" aria-label="SOC navigation">
+        <div class="navGroup">
+          <span class="navGroupLabel">Monitor</span>
+          <button class="active" data-view="command" type="button"><span>01</span>Command</button>
+          <button data-view="findings" type="button"><span>FX</span>Findings</button>
+          <button data-view="history" type="button"><span>HT</span>Event History</button>
+        </div>
+        <div class="navGroup">
+          <span class="navGroupLabel">Investigate</span>
+          <button data-view="workbench" type="button"><span>WB</span>Workbench</button>
+          <button data-view="l1" type="button"><span>L1</span>Triage</button>
+          <button data-view="l2" type="button"><span>L2</span>Investigate</button>
+          <button data-view="incidents" type="button"><span>IR</span>Incidents</button>
+          <button data-view="l3" type="button"><span>L3</span>Hunt</button>
+        </div>
+        <div class="navGroup">
+          <span class="navGroupLabel">Exposure</span>
+          <button data-view="vuln" type="button"><span>CV</span>Vulnerabilities</button>
+          <button data-view="assets" type="button"><span>AS</span>Assets</button>
+        </div>
+        <div class="navGroup">
+          <span class="navGroupLabel">Admin</span>
+          <button data-view="tools" type="button"><span>TC</span>Tool Console</button>
+          <button data-view="settings" type="button"><span>ST</span>Settings</button>
+        </div>
       </nav>
       <div class="sideStatus">
         <span id="connectionDot"></span>
@@ -73,7 +85,7 @@
           <label><span data-htext="Start">Start</span><input id="historyStart" type="datetime-local" required></label>
           <label><span data-htext="End">End</span><input id="historyEnd" type="datetime-local" required></label>
           <label><span data-htext="Timezone">Timezone</span><select id="historyZone"><option value="7">WIB (UTC+7)</option><option value="0">UTC</option></select></label>
-          <label><span data-htext="Records">Records</span><select id="historyMode"><option value="reports" data-htext="SOC snapshots">SOC snapshots</option><option value="intelligence" data-htext="Provider intelligence">Provider intelligence</option><option value="events" data-htext="Raw event drill-down">Raw event drill-down</option></select></label>
+          <label><span data-htext="Records">Records</span><select id="historyMode"><option value="reports" data-htext="SOC snapshots">SOC snapshots</option><option value="intelligence" data-htext="Provider intelligence">Provider intelligence</option><option value="cyfirma">CYFIRMA intelligence</option><option value="events" data-htext="Raw event drill-down">Raw event drill-down</option></select></label>
           <label class="historyQuery"><span data-htext="Search">Search</span><input id="historyQuery" type="search" placeholder="IP, rule, device, operation"></label>
           <label><span data-htext="Minimum level">Minimum level</span><select id="historyLevel"><option value="0">0+</option><option value="7">7+</option><option value="12">12+</option><option value="15">15</option></select></label>
           <button type="submit" id="historySearch" data-htext="Search">Search</button>
@@ -563,8 +575,8 @@
     <script src="/static/analysis-workspace.js?v=20260913-1"></script>
     <script src="/static/enterprise.js?v=20260915-3"></script>
     <script src="/static/automation.js?v=20260921-2"></script>
-    <script src="/static/history.js?v=20260920-3"></script>
+    <script src="/static/history.js?v=20260921-5"></script>
     <script src="/static/workflows.js?v=20260921-1"></script>
-    <script src="/static/intelligence.js?v=20260921-1"></script>
+    <script src="/static/intelligence.js?v=20260921-3"></script>
   </body>
 </html>
