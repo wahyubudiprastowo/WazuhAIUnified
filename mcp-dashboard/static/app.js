@@ -3317,14 +3317,18 @@ function renderTelemetryEvidence(data) {
   const health = indexer.health || "unavailable";
   const decoderCoverage = quality.decoder_coverage_percent === null || quality.decoder_coverage_percent === undefined
     ? "-" : `${number(quality.decoder_coverage_percent).toFixed(2)}%`;
+  const decoderMissing = quality.decoder_unmatched_events === null || quality.decoder_unmatched_events === undefined
+    ? "-" : fmt.format(number(quality.decoder_unmatched_events));
+  const rollupCoverage = quality.rollup_coverage_percent === null || quality.rollup_coverage_percent === undefined
+    ? "" : ` · rollup ${number(quality.rollup_coverage_percent).toFixed(2)}%`;
   root.innerHTML = `
     <div class="evidenceMetrics">
       <div class="evidenceMetric"><span>Indexed events</span><strong>${fmt.format(number(quality.indexed_events))}</strong><small>${quality.partial ? "partial response" : "exact window count"}</small></div>
       <div class="evidenceMetric"><span>Indexer query</span><strong>${fmt.format(number(indexer.query_took_ms))} ms</strong><small>${esc(health)}</small></div>
       <div class="evidenceMetric"><span>Failed shards</span><strong>${fmt.format(number(indexer.shards_failed))}</strong><small>${fmt.format(number(indexer.shards_successful))}/${fmt.format(number(indexer.shards_total))} successful</small></div>
-      <div class="evidenceMetric"><span>Decoder coverage</span><strong>${esc(decoderCoverage)}</strong><small>${fmt.format(number(quality.decoder_unmatched_events))} without decoder</small></div>
+      <div class="evidenceMetric"><span>Decoder coverage</span><strong>${esc(decoderCoverage)}</strong><small>${esc(decoderMissing)} without decoder</small></div>
     </div>
-    <p class="evidenceNote"><b>Scope:</b> ${esc(indexer.scope || "Operational aggregation unavailable.")} ${quality.note ? ` ${esc(quality.note)}` : ""}</p>
+    <p class="evidenceNote"><b>Scope:</b> ${esc(indexer.scope || "Operational aggregation unavailable.")}${esc(rollupCoverage)} ${quality.note ? ` ${esc(quality.note)}` : ""}</p>
     <p class="evidenceNote"><b>Signals:</b> ${fmt.format(number(telemetry.dropped_events))} dropped, ${fmt.format(number(telemetry.agent_flooding))} agent flooding, ${fmt.format(number(telemetry.manager_queue))} manager queue.</p>
   `;
 }
@@ -3377,8 +3381,8 @@ function renderDecoderEvidence(data) {
   root.innerHTML = `
     <div class="evidenceMetrics evidenceMetricsCompact">
       <div class="evidenceMetric"><span>Decoder buckets</span><strong>${fmt.format(number(decoders.observed))}</strong><small>top ${fmt.format(number(decoders.bucket_limit || 20))}</small></div>
-      <div class="evidenceMetric"><span>Named decoder events</span><strong>${fmt.format(number(decoders.named_events))}</strong><small>${decoders.coverage_percent === null || decoders.coverage_percent === undefined ? "coverage unavailable" : `${number(decoders.coverage_percent).toFixed(2)}% of window`}</small></div>
-      <div class="evidenceMetric"><span>Missing decoder field</span><strong>${fmt.format(number(decoders.unmatched_events))}</strong><small>not equal to decoder failure</small></div>
+      <div class="evidenceMetric"><span>Named decoder events</span><strong>${decoders.named_events === null || decoders.named_events === undefined ? "-" : fmt.format(number(decoders.named_events))}</strong><small>${decoders.coverage_percent === null || decoders.coverage_percent === undefined ? "coverage unavailable" : `${number(decoders.coverage_percent).toFixed(2)}% of window`}</small></div>
+      <div class="evidenceMetric"><span>Missing decoder field</span><strong>${decoders.unmatched_events === null || decoders.unmatched_events === undefined ? "-" : fmt.format(number(decoders.unmatched_events))}</strong><small>not equal to decoder failure</small></div>
     </div>
     <div class="evidenceTableWrap"><table class="evidenceTable"><thead><tr><th>Decoder</th><th>Events</th><th>Max level</th><th>Last seen</th><th>Latest rule</th></tr></thead><tbody>${rows || '<tr><td colspan="5">No decoder buckets were returned.</td></tr>'}</tbody></table></div>
     <p class="evidenceNote">${esc(decoders.note || "Decoder failure telemetry was not available.")}</p>

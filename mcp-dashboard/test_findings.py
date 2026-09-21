@@ -373,6 +373,24 @@ class FindingTests(unittest.TestCase):
         refresh.assert_not_called()
         overview.assert_not_called()
 
+    def test_materialized_overview_marks_decoder_coverage_as_unavailable(self):
+        window = {"requested": "7d", "label": "7 days", "bounds": {"gte": "now-7d", "lt": "now"}}
+        rollup = {
+            "coverage": {"complete": False, "rows": 2,
+                          "gaps": {"coverage_percent": 12.43, "missing": 100}},
+            "timeline": [{"key": "2026-09-20T00:00:00Z", "doc_count": 42}],
+            "dimensions": {}, "bucket_minutes": 5,
+        }
+        with patch.object(server.automation, "history_summary", return_value={"totals": {}}), \
+             patch.object(server.automation, "report_timeline", return_value=[]), \
+             patch.object(server.pipeline, "rollup_summary", return_value=rollup):
+            result = server._materialized_overview(window, {"range": "7d"})
+        quality = result["operational_evidence"]["data_quality"]
+        self.assertEqual(quality["indexed_events"], 42)
+        self.assertEqual(quality["rollup_coverage_percent"], 12.43)
+        self.assertIsNone(quality["decoder_coverage_percent"])
+        self.assertTrue(quality["partial"])
+
     def test_finding_case_sync_reuses_case_and_records_analyst_verdict(self):
         calls = []
 

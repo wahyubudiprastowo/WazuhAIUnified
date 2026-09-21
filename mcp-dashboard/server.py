@@ -2341,6 +2341,8 @@ def _materialized_overview(window: dict[str, Any], payload: Any) -> dict[str, An
                if rollup_rows else int(totals.get("indexed_events") or 0))
     critical = int(totals.get("critical_cves") or 0)
     rollup_complete = bool((rollup.get("coverage") or {}).get("complete"))
+    rollup_coverage = (rollup.get("coverage") or {}).get("gaps") or {}
+    rollup_coverage_percent = rollup_coverage.get("coverage_percent")
     timeline_source = rollup.get("timeline") if rollup_rows else timeline_rows
     destination_rows = dimensions.get("destination_ip") or history.get("top_destinations") or []
     asset_rows = dimensions.get("asset") or history.get("affected_assets") or []
@@ -2370,13 +2372,29 @@ def _materialized_overview(window: dict[str, Any], payload: Any) -> dict[str, An
         "cloud_m365": {"ok": True, "total": 0, "workloads": [], "operations": [], "client_ips": [], "events": []},
         "detection_layers": [],
         "operational_evidence": {
+            "data_quality": {
+                "indexed_events": indexed,
+                "decoder_named_events": None,
+                "decoder_unmatched_events": None,
+                "decoder_coverage_percent": None,
+                "sampled_network_events": 0,
+                "sampled_identity_events": 0,
+                "sampled_limit_per_surface": 0,
+                "bounded": True,
+                "partial": not rollup_complete,
+                "rollup_coverage_percent": rollup_coverage_percent,
+                "source": "Durable 5-minute detection rollups",
+                "note": ("Rollup is complete; decoder coverage requires an exact alert-window aggregation."
+                         if rollup_complete else "Historical rollup is partial; missing buckets are being backfilled in the background."),
+            },
             "network": {"events": [], "observed": 0}, "identity": {"events": [], "observed": 0},
             "mitre": {"techniques": [{"technique": row.get("value"), "count": row.get("count")}
                                       for row in mitre_rows], "timeline": [], "observed": len(mitre_rows)},
             "decoders": {"items": [{"name": row.get("value"), "count": row.get("count"),
                                       "max_level": row.get("max_level"), "last_seen": row.get("last_seen"),
                                       "rule": row.get("label")} for row in decoder_rows],
-                         "observed": len(decoder_rows), "unmatched_events": 0,
+                         "observed": len(decoder_rows), "named_events": None, "coverage_percent": None,
+                         "unmatched_events": None,
                          "note": "Materialized decoder volume; failed decoder telemetry requires manager metrics."},
             "telemetry": {"indexer": {"health": "materializing", "scope": "Exact historical aggregation is building."}},
         },
