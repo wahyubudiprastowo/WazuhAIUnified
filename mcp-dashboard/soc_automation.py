@@ -778,11 +778,9 @@ def build_intelligence_deck(report):
         "generated_at": report.get("generated_at"),
         "status": "ready",
         "coverage_cards": [
-            {"label": "Indexed alerts", "value": coverage.get("indexed_events"), "detail": "Wazuh alerts and decoded syslog in the current automation window"},
             {"label": "Eligible IOCs", "value": coverage.get("eligible_candidates"), "detail": "Public observables queued for provider enrichment"},
             {"label": "Enriched IOCs", "value": coverage.get("analyzed_candidates"), "detail": "Indicators with local evidence, provider context, or CYFIRMA matches"},
             {"label": "Deferred IOCs", "value": coverage.get("deferred_candidates"), "detail": "Queued indicators intentionally delayed by API budget/backoff"},
-            {"label": "Queue depth", "value": (coverage.get("pipeline") or {}).get("queued_indicators"), "detail": "Deduplicated IOC backlog from Wazuh/syslog discovery"},
             {"label": "Critical CVEs", "value": coverage.get("critical_inventory_records"), "detail": "Wazuh vulnerability inventory records loaded for prioritization"},
         ],
         "provider_coverage": provider_rows,

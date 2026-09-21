@@ -70,9 +70,9 @@
     return {
       generated_at: report?.generated_at,
       coverage_cards: [
-        {label:'Indexed alerts', value:c.indexed_events, detail:'Wazuh alerts and decoded syslog in the automation window'},
         {label:'Eligible IOCs', value:c.eligible_candidates, detail:'Public observables available for enrichment'},
         {label:'Enriched IOCs', value:c.analyzed_candidates, detail:'Indicators with evidence or provider context'},
+        {label:'Deferred IOCs', value:c.deferred_candidates, detail:'Queued indicators intentionally delayed by API budget/backoff'},
         {label:'Critical CVEs', value:c.critical_inventory_records, detail:'Wazuh vulnerability inventory records'},
       ],
       provider_coverage: Object.entries(c.cyfirma_feeds || {}).map(([scope, feed]) => ({provider:`CYFIRMA ${scope}`, status:feed.status, matched:feed.loaded, context:feed.reported, errors:feed.error ? 1 : 0, tags:[]})),
@@ -122,6 +122,7 @@
       return;
     }
     const d = deck(report);
+    const coverageCards = (d.coverage_cards || []).filter(card => !/^(indexed alerts?|indexed events?|queue depth)$/i.test(String(card.label || '').trim()));
     if (statusEl) statusEl.textContent = `${tr('Last run', 'Last run')}: ${report.generated_at || '-'}`;
     const ai = report.ai || {};
     const top = d.top_findings?.[0];
@@ -133,7 +134,7 @@
         ${ai.result?.verdict ? `<small>${esc(ai.result.verdict.status || 'needs_review')} · ${esc(ai.result.verdict.confidence || 'low')} confidence</small>` : ''}
         <button type="button" data-open-automation>${tr('Buka laporan lengkap', 'Open full report')}</button>
       </article>
-      ${(d.coverage_cards || []).map(card => `
+      ${coverageCards.map(card => `
         <article class="aiMetricCard">
           <span>${esc(card.label)}</span>
           <strong>${fmt.format(Number(card.value || 0))}</strong>
@@ -362,7 +363,7 @@
     renderDeckSurfaces(report);
     const d = deck(report);
     panel.innerHTML = `<div class="automationMetrics">
-      <div><span>${tr('Alert terindeks · 24 jam', 'Indexed alerts · 24 hours')}</span><strong>${fmt.format(c.indexed_events)}</strong></div>
+      <div><span>${tr('Temuan di laporan', 'Findings in report')}</span><strong>${fmt.format((report.findings || []).length)}</strong></div>
       <div><span>${tr('Kandidat IOC dimuat', 'IOC candidates loaded')}</span><strong>${fmt.format(c.loaded_candidates)}</strong></div>
       <div><span>${tr('IOC diperkaya / layak', 'Enriched / eligible IOCs')}</span><strong>${c.analyzed_candidates} / ${c.eligible_candidates}</strong></div>
       <div><span>AI Analyst</span><strong>${esc(label(report.ai?.status))}</strong></div></div>

@@ -3313,21 +3313,16 @@ function renderTelemetryEvidence(data) {
   const indexer = telemetry.indexer || {};
   const quality = data.operational_evidence?.data_quality || {};
   const health = indexer.health || "unavailable";
-  const decoderCoverage = quality.decoder_coverage_percent === null || quality.decoder_coverage_percent === undefined
-    ? "-" : `${number(quality.decoder_coverage_percent).toFixed(2)}%`;
-  const decoderMissing = quality.decoder_unmatched_events === null || quality.decoder_unmatched_events === undefined
-    ? "-" : fmt.format(number(quality.decoder_unmatched_events));
   const rollupCoverage = quality.rollup_coverage_percent === null || quality.rollup_coverage_percent === undefined
     ? "" : ` · rollup ${number(quality.rollup_coverage_percent).toFixed(2)}%`;
   root.innerHTML = `
     <div class="evidenceMetrics">
-      <div class="evidenceMetric"><span>Indexed events</span><strong>${fmt.format(number(quality.indexed_events))}</strong><small>${quality.partial ? "partial response" : "exact window count"}</small></div>
       <div class="evidenceMetric"><span>Indexer query</span><strong>${fmt.format(number(indexer.query_took_ms))} ms</strong><small>${esc(health)}</small></div>
       <div class="evidenceMetric"><span>Failed shards</span><strong>${fmt.format(number(indexer.shards_failed))}</strong><small>${fmt.format(number(indexer.shards_successful))}/${fmt.format(number(indexer.shards_total))} successful</small></div>
-      <div class="evidenceMetric"><span>Decoder coverage</span><strong>${esc(decoderCoverage)}</strong><small>${esc(decoderMissing)} without decoder</small></div>
+      <div class="evidenceMetric"><span>Dropped signals</span><strong>${fmt.format(number(telemetry.dropped_events))}</strong><small>matched alerts in window</small></div>
+      <div class="evidenceMetric"><span>Queue / flooding</span><strong>${fmt.format(number(telemetry.manager_queue) + number(telemetry.agent_flooding))}</strong><small>${fmt.format(number(telemetry.agent_flooding))} agent flooding</small></div>
     </div>
     <p class="evidenceNote"><b>Scope:</b> ${esc(indexer.scope || "Operational aggregation unavailable.")}${esc(rollupCoverage)} ${quality.note ? ` ${esc(quality.note)}` : ""}</p>
-    <p class="evidenceNote"><b>Signals:</b> ${fmt.format(number(telemetry.dropped_events))} dropped, ${fmt.format(number(telemetry.agent_flooding))} agent flooding, ${fmt.format(number(telemetry.manager_queue))} manager queue.</p>
   `;
 }
 
@@ -3458,7 +3453,6 @@ function renderDataQuality(data) {
   const status = materialization.exact ? "complete" : (materialization.status || "building");
   const tone = materialization.exact && !quality.partial ? "available" : "skipped";
   const metrics = [
-    ["Indexed events", fmt.format(number(quality.indexed_events ?? funnel.indexed_events)), quality.partial ? "partial response" : "exact window count"],
     ["Decoder coverage", decoderCoverage, quality.decoder_unmatched_events == null ? "exact coverage unavailable" : `${fmt.format(number(quality.decoder_unmatched_events))} without decoder`],
     ["Rollup coverage", rollupCoverage, `${status} · 5-minute summaries`],
     ["Pipeline lag", lag, funnel.pipeline_status || "unavailable"],
