@@ -635,15 +635,15 @@ Output only JSON with this schema:
   "daily_brief": "what happened in this window by attack, source, target, CVE, provider confidence and action",
   "verdict": {"status": "benign|needs_review|suspicious|malicious", "severity": "low|medium|high|critical", "confidence": "low|medium|high", "reason": "why"},
   "assessment": "evidence-based analyst assessment",
-  "attack_categories": [{"category": "bruteforce|scan|web_attack.sqli|web_attack.xss|dos|malware|mitm_suspected|exploit_attempt|phishing|authentication|network_attack|web_attack|file_integrity|cloud|vulnerability|reconnaissance|other", "count": 0, "severity": "low|medium|high|critical", "evidence": ["rule/event ids"]}],
-  "network_paths": [{"source": "source IP or identity", "destination": "destination IP/device/service", "action": "allow|deny|block|unknown", "events": 0, "evidence": ["event/rule ids"]}],
-  "identities": [{"user": "account", "activity": "observed operation", "asset": "device/workload", "evidence": ["event/rule ids"]}],
-  "data_impact": [{"data": "file/mailbox/object/path or unknown", "operation": "read/write/delete/download/unknown", "status": "observed|suspected|not_established", "evidence": ["event/rule ids"]}],
+  "attack_categories": [{"category": "bruteforce|scan|web_attack.sqli|web_attack.xss|dos|malware|mitm_suspected|exploit_attempt|phishing|authentication|network_attack|web_attack|file_integrity|cloud|vulnerability|reconnaissance|other", "count": 0, "severity": "low|medium|high|critical", "evidence": ["exact event_id or rule_id from supplied context"]}],
+  "network_paths": [{"source": "source IP or identity", "destination": "destination IP/device/service", "action": "allow|deny|block|unknown", "events": 0, "evidence": ["exact event_id or rule_id from supplied context"]}],
+  "identities": [{"user": "account", "activity": "observed operation", "asset": "device/workload", "evidence": ["exact event_id or rule_id from supplied context"]}],
+  "data_impact": [{"data": "file/mailbox/object/path or unknown", "operation": "read/write/delete/download/unknown", "status": "observed|suspected|not_established", "evidence": ["exact event_id or rule_id from supplied context"]}],
   "anomaly_baseline": [{"signal": "what changed vs history", "current": "current value", "baseline": "historical value", "interpretation": "why it matters"}],
-  "attack_narrative": [{"stage": "Observed|Reputation|Exposure|Impact", "detail": "what happened", "evidence": ["event/rule/provider ids"]}],
+  "attack_narrative": [{"stage": "Observed|Reputation|Exposure|Impact", "detail": "what happened", "evidence": ["exact event_id or rule_id from supplied context"]}],
   "affected_assets": [{"asset": "host/device/user", "role": "reporter|target|user|unknown", "evidence": "why this asset matters"}],
   "provider_findings": [{"provider": "name", "verdict": "match|no_match|error|unknown", "signal": "what this provider contributes"}],
-  "cve_priorities": [{"cve": "CVE id", "asset": "asset", "priority": "patch_now|schedule|verify_only", "reason": "inventory/exposure rationale"}],
+  "cve_priorities": [{"cve": "CVE id", "asset": "asset", "priority": "patch_now|schedule|verify_only", "reason": "inventory/exposure rationale", "evidence": ["exact event_id or rule_id from supplied context"]}],
   "confidence_drivers": ["provider/evidence reasons that raise or lower confidence"],
   "escalation": {"level": "none|l1|l2|l3|incident", "reason": "why", "sla": "recommended handling time"},
   "action_plan": {"l1": ["validation steps"], "l2": ["correlation steps"], "l3": ["hunt steps"], "response": ["guardrailed response steps"]},
@@ -658,6 +658,7 @@ Return only valid JSON using this schema: summary, verdict{status,severity,confi
 daily_brief, attack_categories[], network_paths[], identities[], data_impact[], anomaly_baseline[], attack_narrative[], affected_assets[], provider_findings[], cve_priorities[],
 confidence_drivers[], escalation{level,reason,sla},
 action_plan{l1[],l2[],l3[],response[]}, recommendations[], gaps[].
+For every structured activity/asset/CVE claim, cite exact event_id or rule_id values from supplied context in its evidence array. Never invent IDs. If unsupported, return an empty evidence array; the system will mark that claim unverified.
 Separate observed activity, provider reputation, vulnerable inventory, and confirmed compromise. Do not invent facts.
 No-match is unknown, not safe. A malicious source IP does not prove the reporting device is infected.
 Use ai_memory to identify spikes/new signals; say "insufficient history" if no reliable baseline is supplied.
@@ -1265,6 +1266,11 @@ def local_ai_fallback(report, error="AI provider unavailable"):
         "reason": f"{row.get('severity')} inventory finding on {row.get('package')} {row.get('version')}; verify exposure and vendor advisory."}
         for row in vulnerabilities[:8]]
     category_counts = Counter(row.get("attack_category") or "other" for row in findings)
+    category_evidence = {}
+    for finding in findings:
+        category_evidence[finding.get("attack_category") or "other"] = list(dict.fromkeys(
+            str(value) for event in (finding.get("evidence") or [])[:3]
+            for value in (event.get("event_id"), event.get("rule_id")) if value))[:8]
     network_paths = []
     identities = []
     for finding in findings[:6]:
@@ -1298,13 +1304,14 @@ def local_ai_fallback(report, error="AI provider unavailable"):
                 "reason": "Derived from local evidence, provider coverage, CVE inventory and queue priority; analyst verification is required."},
             "assessment": "The fallback assessment separates observed Wazuh/syslog activity from external reputation and vulnerability inventory. Treat no-match and provider errors as unknown, not safe.",
             "attack_categories": [{"category": category, "count": count, "severity": severity,
-                "evidence": [row.get("indicator") for row in findings if row.get("attack_category") == category][:4]}
+                "evidence": category_evidence.get(category, []),
+                "citation_status": "verified_reference" if category_evidence.get(category) else "unverified"}
                 for category, count in category_counts.most_common(8)],
-            "network_paths": network_paths[:12],
-            "identities": identities[:12],
+            "network_paths": [{**row, "citation_status": "verified_reference" if row.get("evidence") else "unverified"} for row in network_paths[:12]],
+            "identities": [{**row, "citation_status": "verified_reference" if row.get("evidence") else "unverified"} for row in identities[:12]],
             "data_impact": [],
             "anomaly_baseline": [{"signal": "AI historical comparison", "current": "not model-evaluated", "baseline": "stored in report history", "interpretation": "Run model analysis when provider is reachable for richer anomaly narrative."}],
-            "attack_narrative": [{"stage": "Observed", "detail": f"{top.get('indicator', 'No IOC')} is the highest ranked local indicator in this cycle.", "evidence": [top.get("indicator", "local-report")]}],
+            "attack_narrative": [{"stage": "Observed", "detail": f"{top.get('indicator', 'No IOC')} is the highest ranked local indicator in this cycle.", "evidence": list(dict.fromkeys(str(value) for event in (top.get("evidence") or [])[:3] for value in (event.get("event_id"), event.get("rule_id")) if value)), "citation_status": "verified_reference" if top.get("evidence") else "unverified"}],
             "affected_assets": [{"asset": asset, "role": "reporter|target|unknown", "evidence": "Observed in local report evidence"} for asset in sorted({dev for row in findings for dev in (row.get("devices") or [])})[:8]],
             "provider_findings": provider_findings,
             "cve_priorities": cve_priorities,
@@ -1327,7 +1334,48 @@ def local_ai_fallback(report, error="AI provider unavailable"):
     }
 
 
-def normalize_ai_result(parsed, report):
+def _window_evidence_ids(context):
+    allowed = set()
+    if not isinstance(context, dict):
+        return allowed
+    for row in context.get("rules", []) if isinstance(context.get("rules"), list) else []:
+        value = row.get("rule_id") if isinstance(row, dict) else None
+        if isinstance(value, (str, int)) and str(value).strip():
+            allowed.add(str(value).strip()[:300])
+    for finding in context.get("top_findings", []) if isinstance(context.get("top_findings"), list) else []:
+        if not isinstance(finding, dict):
+            continue
+        for event in finding.get("evidence", []) if isinstance(finding.get("evidence"), list) else []:
+            if not isinstance(event, dict):
+                continue
+            for key in ("event_id", "rule_id"):
+                value = event.get(key)
+                if isinstance(value, (str, int)) and str(value).strip():
+                    allowed.add(str(value).strip()[:300])
+    return allowed
+
+
+def _validate_window_citations(rows, allowed, field_name, violations):
+    validated = []
+    for row in rows:
+        item = dict(row)
+        raw_refs = item.get("evidence") or item.get("evidence_ids") or []
+        if isinstance(raw_refs, (str, int)):
+            raw_refs = [raw_refs]
+        raw_refs = [str(ref).strip()[:300] for ref in raw_refs[:20]
+                    if isinstance(ref, (str, int)) and str(ref).strip()] if isinstance(raw_refs, list) else []
+        valid_refs = list(dict.fromkeys(ref for ref in raw_refs if ref in allowed))
+        unknown_refs = [ref for ref in raw_refs if ref not in allowed]
+        if unknown_refs:
+            violations.append(f"{field_name} cited unknown evidence IDs: " + ", ".join(unknown_refs[:4]))
+        item["evidence"] = valid_refs
+        item.pop("evidence_ids", None)
+        item["citation_status"] = "verified_reference" if valid_refs and not unknown_refs else "unverified"
+        validated.append(item)
+    return validated
+
+
+def normalize_ai_result(parsed, report, evidence_context=None):
     if not isinstance(parsed, dict):
         raise ValueError("Model returned invalid assessment schema")
     summary = str(parsed.get("summary") or "")[:1600]
@@ -1335,6 +1383,8 @@ def normalize_ai_result(parsed, report):
     if not summary or not assessment:
         raise ValueError("Model returned invalid assessment schema")
     verdict = parsed.get("verdict") if isinstance(parsed.get("verdict"), dict) else {}
+    citation_violations = []
+    allowed_evidence = _window_evidence_ids(evidence_context)
     result = {
         "summary": summary,
         "daily_brief": str(parsed.get("daily_brief") or summary)[:1800],
@@ -1345,15 +1395,15 @@ def normalize_ai_result(parsed, report):
             "confidence": str(verdict.get("confidence") or "low")[:40],
             "reason": str(verdict.get("reason") or summary)[:700],
         },
-        "attack_narrative": _dict_list(parsed.get("attack_narrative"), 8),
-        "attack_categories": _dict_list(parsed.get("attack_categories"), 10),
-        "network_paths": _dict_list(parsed.get("network_paths"), 12),
-        "identities": _dict_list(parsed.get("identities"), 12),
-        "data_impact": _dict_list(parsed.get("data_impact"), 12),
+        "attack_narrative": _validate_window_citations(_dict_list(parsed.get("attack_narrative"), 8), allowed_evidence, "attack_narrative", citation_violations),
+        "attack_categories": _validate_window_citations(_dict_list(parsed.get("attack_categories"), 10), allowed_evidence, "attack_categories", citation_violations),
+        "network_paths": _validate_window_citations(_dict_list(parsed.get("network_paths"), 12), allowed_evidence, "network_paths", citation_violations),
+        "identities": _validate_window_citations(_dict_list(parsed.get("identities"), 12), allowed_evidence, "identities", citation_violations),
+        "data_impact": _validate_window_citations(_dict_list(parsed.get("data_impact"), 12), allowed_evidence, "data_impact", citation_violations),
         "anomaly_baseline": _dict_list(parsed.get("anomaly_baseline"), 8),
         "affected_assets": _dict_list(parsed.get("affected_assets"), 10),
         "provider_findings": _dict_list(parsed.get("provider_findings"), 12),
-        "cve_priorities": _dict_list(parsed.get("cve_priorities"), 10),
+        "cve_priorities": _validate_window_citations(_dict_list(parsed.get("cve_priorities"), 10), allowed_evidence, "cve_priorities", citation_violations),
         "confidence_drivers": _string_list(parsed.get("confidence_drivers"), 10),
         "escalation": parsed.get("escalation") if isinstance(parsed.get("escalation"), dict) else {"level": "l1", "reason": "Analyst validation required", "sla": "same shift"},
         "action_plan": parsed.get("action_plan") if isinstance(parsed.get("action_plan"), dict) else {},
@@ -1366,6 +1416,17 @@ def normalize_ai_result(parsed, report):
         result["gaps"] = list(report.get("limitations") or [])[:4]
     for lane in ("l1", "l2", "l3", "response"):
         result["action_plan"][lane] = _string_list(result["action_plan"].get(lane), 8)
+    result["evidence_references"] = sorted({ref for key in ("attack_narrative", "attack_categories", "network_paths", "identities", "data_impact", "cve_priorities")
+        for row in result[key] for ref in row.get("evidence", [])})[:100]
+    if citation_violations or any(row.get("citation_status") != "verified_reference"
+            for key in ("attack_narrative", "attack_categories", "network_paths", "identities", "data_impact", "cve_priorities")
+            for row in result[key]):
+        result["gaps"].append("One or more structured AI claims lack a valid event_id/rule_id citation from the supplied context.")
+        result["confidence_drivers"].append("Structured claims without validated event/rule references are not treated as observed evidence.")
+        result["verdict"]["confidence"] = "low"
+        result["verdict"]["status"] = "needs_review"
+    if citation_violations:
+        result["gaps"].extend(list(dict.fromkeys(citation_violations))[:5])
     return apply_contract(result, "window")
 
 
@@ -1410,7 +1471,7 @@ def analyze_with_model(config, report):
         parsed = _extract_ai_json_object(text, required=("summary", "assessment", "verdict", "gaps"))
     except (json.JSONDecodeError, ValueError) as exc:
         raise ValueError("AI returned malformed output; deterministic fallback required") from exc
-    parsed = normalize_ai_result(parsed, report)
+    parsed = normalize_ai_result(parsed, report, context)
     return {"status": "completed", "model": config["AI_MODEL"], "advisory": True, "schema": "soc-analyst-v2",
             "contract_version": CONTRACT_VERSION, "contract": contract_metadata("window"),
             "result": parsed, "evidence_findings_sent": len(context["top_findings"]), "fallback_used": fallback_used,
@@ -2597,19 +2658,6 @@ class Automation:
         ai = report.get("ai") or {}
         ai_result = ai.get("result") or {}
         verdict = ai_result.get("verdict") or {}
-        ai_categories = [row for row in (ai_result.get("attack_categories") or [])
-                         if isinstance(row, dict) and row.get("category")]
-        if ai_categories:
-            attack_categories.clear()
-        for row in ai_categories:
-            if isinstance(row, dict) and row.get("category"):
-                attack_categories[str(row["category"])] += int(row.get("count") or 0)
-        for row in ai_result.get("network_paths") or []:
-            if isinstance(row, dict) and row.get("destination") and row.get("destination") != "unknown":
-                destination_ips[str(row["destination"])] += int(row.get("events") or 1)
-        for row in ai_result.get("identities") or []:
-            if isinstance(row, dict) and row.get("user"):
-                identities[str(row["user"])] += 1
         coverage = report.get("coverage") or {}
         rules = []
         for row in report.get("rules") or []:
@@ -2629,6 +2677,7 @@ class Automation:
         if any((row.get("intelligence") or {}).get("cve") for row in vulnerabilities):
             cve_sources.extend(["NVD/CVE", "EPSS", "KEV", "PoC"])
         return {
+            "aggregation_version": 2,
             "id": report_id,
             "created": created,
             "generated_at": report.get("generated_at"),
@@ -2686,7 +2735,8 @@ class Automation:
             missing = db.execute(
                 """SELECT r.id,r.created,r.data FROM reports r
                    LEFT JOIN report_summaries s ON s.report_id=r.id
-                   WHERE r.created>=? AND r.created<? AND s.report_id IS NULL""",
+                   WHERE r.created>=? AND r.created<?
+                   AND (s.report_id IS NULL OR COALESCE(json_extract(s.data,'$.aggregation_version'),0)<2)""",
                 (start_ts, end_ts)).fetchall()
             for report_id, created, raw in missing:
                 try:

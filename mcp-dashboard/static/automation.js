@@ -251,6 +251,10 @@
     const recommendations = Array.isArray(result.recommendations) ? result.recommendations : [];
     const actionPlan = result.action_plan || {};
     const lanes = ['l1', 'l2', 'l3', 'response'];
+    const citationGroups = ['attack_narrative', 'attack_categories', 'network_paths', 'identities', 'data_impact', 'cve_priorities'];
+    const claimRows = citationGroups.flatMap(key => result[key] || []);
+    const verifiedClaims = claimRows.filter(row => row.citation_status === 'verified_reference').length;
+    const unverifiedClaims = claimRows.length - verifiedClaims;
     return `<section class="reportAiPanel analystV2">
       <article class="aiVerdictCard ${severityTone(verdict.severity || verdict.status)}">
         <span>Verdict</span>
@@ -262,6 +266,11 @@
         <span>${tr('Penilaian', 'Assessment')}</span>
         ${result.daily_brief ? `<p><b>${tr('Daily brief', 'Daily brief')}:</b> ${esc(result.daily_brief)}</p>` : ''}
         <p>${esc(result.assessment || tr('Run analysis after AI settings are saved and reachable.', 'Run analysis after AI settings are saved and reachable.'))}</p>
+      </article>
+      <article>
+        <span>${tr('Validasi evidence AI', 'AI evidence validation')}</span>
+        <p>${verifiedClaims} ${tr('klaim dengan ID event/rule yang tervalidasi', 'claims with validated event/rule IDs')}</p>
+        <small>${unverifiedClaims} ${tr('klaim belum terverifikasi; jangan perlakukan sebagai observasi', 'claims unverified; do not treat as observations')}</small>
       </article>
       <article>
         <span>${tr('Eskalasi', 'Escalation')}</span>
@@ -278,7 +287,7 @@
       </article>
       <article>
         <span>${tr('Alur serangan', 'Attack narrative')}</span>
-        ${(result.attack_narrative || []).map(row => `<p><b>${esc(row.stage || 'Stage')}</b>: ${esc(row.detail || '-')}<br><small>${esc((row.evidence || []).join(', '))}</small></p>`).join('') || `<p>${tr('No attack narrative returned yet.', 'No attack narrative returned yet.')}</p>`}
+        ${(result.attack_narrative || []).map(row => `<p><b>${esc(row.stage || 'Stage')}</b>: ${esc(row.detail || '-')}<br><small>${esc(row.citation_status === 'verified_reference' ? (row.evidence || []).join(', ') : tr('Unverified: no matching event/rule citation', 'Unverified: no matching event/rule citation'))}</small></p>`).join('') || `<p>${tr('No attack narrative returned yet.', 'No attack narrative returned yet.')}</p>`}
       </article>
       <article>
         <span>${tr('Aset terdampak', 'Affected assets')}</span>

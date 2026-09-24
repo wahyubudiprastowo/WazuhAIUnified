@@ -241,6 +241,28 @@ class AutomationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'malformed output'):
                 soc.analyze_with_model(self.config, report)
 
+    def test_window_ai_rejects_unknown_citations_and_marks_uncited_claims(self):
+        context = {'rules': [{'rule_id': '5710'}], 'top_findings': [{'evidence': [
+            {'event_id': 'event-1', 'rule_id': '5710'}]}]}
+        parsed = {
+            'summary': 'Review authentication activity', 'assessment': 'Evidence requires validation.',
+            'verdict': {'status': 'suspicious', 'severity': 'high', 'confidence': 'high'},
+            'attack_categories': [{'category': 'authentication', 'count': 4, 'evidence': ['event-1', 'fake-id']}],
+            'network_paths': [{'source': '198.51.100.10', 'destination': '10.0.0.8', 'events': 4, 'evidence': ['5710']}],
+            'identities': [{'user': 'admin', 'activity': 'failed login'}],
+            'attack_narrative': [{'stage': 'Observed', 'detail': 'Repeated authentication failures', 'evidence': ['not-supplied']}],
+            'action_plan': {'l1': [], 'l2': [], 'l3': [], 'response': []}, 'gaps': [],
+        }
+        result = soc.normalize_ai_result(parsed, {'limitations': []}, context)
+        self.assertEqual(result['attack_categories'][0]['evidence'], ['event-1'])
+        self.assertEqual(result['attack_categories'][0]['citation_status'], 'unverified')
+        self.assertEqual(result['network_paths'][0]['citation_status'], 'verified_reference')
+        self.assertEqual(result['identities'][0]['citation_status'], 'unverified')
+        self.assertEqual(result['attack_narrative'][0]['evidence'], [])
+        self.assertEqual(result['verdict']['confidence'], 'low')
+        self.assertEqual(result['verdict']['status'], 'needs_review')
+        self.assertEqual(result['evidence_references'], ['5710', 'event-1'])
+
     def test_finding_ai_citations_are_validated_against_supplied_evidence(self):
         context = {'id': 'finding-1', 'local_evidence': [{'event_id': 'event-1', 'rule': {'id': '5710'}}]}
         result = soc.normalize_finding_ai_result({
@@ -442,7 +464,19 @@ class AutomationTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]['attack_categories'][0]['category'], 'authentication')
         self.assertEqual(rows[0]['top_destinations'][0]['value'], '10.0.0.8')
+        self.assertEqual(rows[0]['top_destinations'][0]['count'], 1)
         self.assertEqual(rows[0]['top_identities'][0]['value'], 'admin')
+        self.assertEqual(rows[0]['top_identities'][0]['count'], 1)
+        stale_summary = dict(rows[0], aggregation_version=1,
+            top_destinations=[{'value': '10.0.0.8', 'count': 20}],
+            top_identities=[{'value': 'admin', 'count': 20}])
+        with self.worker.db() as db:
+            db.execute('UPDATE report_summaries SET data=? WHERE report_id=7',
+                       (__import__('json').dumps(stale_summary),))
+        refreshed = self.worker._summary_rows(created - 1, created + 1)[0]
+        self.assertEqual(refreshed['aggregation_version'], 2)
+        self.assertEqual(refreshed['top_destinations'][0]['count'], 1)
+        self.assertEqual(refreshed['top_identities'][0]['count'], 1)
         with self.worker.db() as db:
             self.assertEqual(db.execute('SELECT COUNT(*) FROM report_summaries').fetchone()[0], 1)
             duplicate_window = __import__('copy').deepcopy(report)
