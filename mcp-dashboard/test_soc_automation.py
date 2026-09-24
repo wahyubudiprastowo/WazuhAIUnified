@@ -233,6 +233,41 @@ class AutomationTests(unittest.TestCase):
             self.assertIn('UNTRUSTED DATA', payload['messages'][0]['content'])
             self.assertIn(CONTRACT_VERSION, payload['messages'][0]['content'])
 
+    def test_window_ai_rejects_narrative_as_completed_json(self):
+        report = self.worker.build()
+        self.config.update(AI_ANALYST_ENABLED='true', AI_PROVIDER_BASE_URL='http://model/v1', AI_MODEL='model')
+        with patch.object(soc, 'post_chat', return_value={'choices': [{'finish_reason': 'stop',
+                'message': {'content': 'The activity appears suspicious; investigate the source.'}}]}):
+            with self.assertRaisesRegex(ValueError, 'malformed output'):
+                soc.analyze_with_model(self.config, report)
+
+    def test_finding_ai_citations_are_validated_against_supplied_evidence(self):
+        context = {'id': 'finding-1', 'local_evidence': [{'event_id': 'event-1', 'rule': {'id': '5710'}}]}
+        result = soc.normalize_finding_ai_result({
+            'summary': 'Review login failures',
+            'verdict': {'status': 'suspicious', 'severity': 'high', 'confidence': 'high'},
+            'source_facts': [
+                {'fact': 'Repeated failures were observed.', 'evidence_ids': ['event-1']},
+                {'fact': 'An unknown event was observed.', 'evidence_ids': ['invented-event']},
+                'Legacy uncited claim',
+            ],
+            'inference': 'Could indicate credential guessing.', 'actions': {}, 'gaps': [],
+        }, context)
+        self.assertEqual(result['source_facts'], ['Repeated failures were observed.'])
+        self.assertEqual(result['source_fact_citations'], [{'fact': 'Repeated failures were observed.', 'evidence_ids': ['event-1']}])
+        self.assertEqual(result['unverified_source_facts'], ['An unknown event was observed.', 'Legacy uncited claim'])
+        self.assertEqual(result['evidence_references'], ['event-1'])
+        self.assertEqual(result['verdict']['confidence'], 'low')
+        self.assertEqual(result['verdict']['status'], 'needs_review')
+        self.assertTrue(any('not present' in item for item in result['gaps']))
+
+    def test_finding_ai_truncated_output_is_rejected_for_local_fallback(self):
+        self.config.update(AI_ANALYST_ENABLED='true', AI_PROVIDER_BASE_URL='http://model/v1', AI_MODEL='model')
+        with patch.object(soc, 'post_chat', return_value={'choices': [{'finish_reason': 'length',
+                'message': {'content': '{"summary":"partial"}'}}]}):
+            with self.assertRaisesRegex(ValueError, 'truncated'):
+                soc.analyze_finding_with_model(self.config, {'id': 'finding-1'})
+
     def test_report_publishes_before_ai_and_poll_skips_unchanged_payload(self):
         self.config.update(AI_ANALYST_ENABLED='true',AI_AUTO_ANALYZE='true')
         with patch.object(soc,'analyze_with_model') as model:

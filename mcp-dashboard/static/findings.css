@@ -214,6 +214,8 @@
 .findingAiSummary { margin: 18px 0 4px; font-size: 16px; line-height: 1.65; }
 .findingAiList { margin: 0; padding-left: 22px; }
 .findingAiList li { margin: 7px 0; line-height: 1.55; }
+.findingAiList li small { display: block; color: var(--muted); margin-top: 2px; }
+.findingAiList .findingUnverifiedFact { color: var(--muted); }
 .findingConsensus { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 8px; }
 .findingConsensus article, .findingCveAi article { border: 1px solid #38505a; background: #142027; padding: 12px; min-width: 0; }
 .findingConsensus article strong { margin-right: 8px; }

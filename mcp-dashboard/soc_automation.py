@@ -674,15 +674,17 @@ OUTPUT RULES (strict): Return EXACTLY ONE valid JSON object. Do not emit any tex
 (no ```), no markdown, no commentary, no explanation outside the JSON, no "Here is the analysis". Omit optional keys
 that have no evidence instead of fabricating empty placeholders. The response must be parseable by a JSON parser.
 
+For source_facts, return objects {fact,evidence_ids}; cite only exact event or rule IDs present in local_evidence.
+If no supplied evidence ID supports a statement, do not present it as a source fact; put it in gaps or inference.
 Return only JSON with: summary, verdict{status,severity,confidence,reason}, attack_category,
-network_flow{source,destination,ports,protocol,action,direction,evidence}, identity_activity[], data_impact[], source_facts[], inference,
+network_flow{source,destination,ports,protocol,action,direction,evidence}, identity_activity[], data_impact[], source_facts[{fact,evidence_ids}], inference,
 attack_path[{stage,detail,evidence}], affected_assets[{asset,role,evidence}], provider_consensus[{provider,status,signal}],
 cves[{cve,relationship,local_exposure,priority,reason}], actions{l1[],l2[],l3[],response[]}, quality_checks[], gaps[].
 Recommendations must be specific, reversible, evidence-gated, and in the requested language. Keep all string values
 concise and factual; never wrap the object in prose."""
 
 
-FINDING_SKILL_VERSION = "soc-finding-v3"
+FINDING_SKILL_VERSION = "soc-finding-v4"
 
 
 def finding_analysis_profile(context):
@@ -1406,10 +1408,8 @@ def analyze_with_model(config, report):
         raise ValueError("AI returned no answer text; check model reasoning mode and token budget")
     try:
         parsed = _extract_ai_json_object(text, required=("summary", "assessment", "verdict", "gaps"))
-    except (json.JSONDecodeError, ValueError):
-        parsed = {"summary": text[:1200], "assessment": text[:4000],
-                  "recommendations": ["Review the model narrative and validate each conclusion against the cited Wazuh evidence."],
-                  "gaps": ["The model returned narrative text instead of the requested JSON schema."]}
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise ValueError("AI returned malformed output; deterministic fallback required") from exc
     parsed = normalize_ai_result(parsed, report)
     return {"status": "completed", "model": config["AI_MODEL"], "advisory": True, "schema": "soc-analyst-v2",
             "contract_version": CONTRACT_VERSION, "contract": contract_metadata("window"),
@@ -1440,6 +1440,22 @@ def _bounded_finding_context(value, depth=0):
     return str(value)[:300]
 
 
+def _finding_evidence_ids(context):
+    allowed = set()
+    if isinstance(context, dict):
+        for row in context.get("local_evidence", []) if isinstance(context.get("local_evidence"), list) else []:
+            if not isinstance(row, dict):
+                continue
+            event_id = row.get("event_id") or row.get("id")
+            if isinstance(event_id, (str, int)) and str(event_id).strip():
+                allowed.add(str(event_id).strip()[:300])
+            rule = row.get("rule")
+            rule_id = rule.get("id") if isinstance(rule, dict) else row.get("rule_id")
+            if isinstance(rule_id, (str, int)) and str(rule_id).strip():
+                allowed.add(str(rule_id).strip()[:300])
+    return allowed
+
+
 def normalize_finding_ai_result(parsed, context):
     if not isinstance(parsed, dict):
         raise ValueError("AI returned an invalid finding assessment")
@@ -1448,6 +1464,31 @@ def normalize_finding_ai_result(parsed, context):
     if not summary:
         raise ValueError("AI finding assessment has no summary")
     actions = parsed.get("actions") if isinstance(parsed.get("actions"), dict) else {}
+    allowed_evidence = _finding_evidence_ids(context)
+    violations = []
+    source_facts, source_fact_citations, unverified_source_facts = [], [], []
+    for item in parsed.get("source_facts", []) if isinstance(parsed.get("source_facts"), list) else []:
+        if isinstance(item, dict):
+            fact = str(item.get("fact") or item.get("detail") or "").strip()[:1000]
+            cited = item.get("evidence_ids") or item.get("evidence") or []
+        else:
+            fact, cited = str(item or "").strip()[:1000], []
+        if not fact:
+            continue
+        if isinstance(cited, (str, int)):
+            cited = [cited]
+        cited = [str(value).strip()[:300] for value in cited[:12]
+                 if isinstance(value, (str, int)) and str(value).strip()] if isinstance(cited, list) else []
+        valid_refs = list(dict.fromkeys(value for value in cited if value in allowed_evidence))
+        invalid_refs = [value for value in cited if value not in allowed_evidence]
+        if invalid_refs:
+            violations.append("Model cited evidence IDs not present in supplied context: " + ", ".join(invalid_refs[:4]))
+        if valid_refs:
+            source_facts.append(fact)
+            source_fact_citations.append({"fact": fact, "evidence_ids": valid_refs})
+        else:
+            unverified_source_facts.append(fact)
+
     result = {
         "summary": summary,
         "attack_category": str(parsed.get("attack_category") or "other")[:80],
@@ -1460,7 +1501,11 @@ def normalize_finding_ai_result(parsed, context):
             "confidence": str(verdict.get("confidence") or "low")[:40],
             "reason": str(verdict.get("reason") or summary)[:900],
         },
-        "source_facts": _string_list(parsed.get("source_facts"), 12),
+        "source_facts": source_facts[:12],
+        "source_fact_citations": source_fact_citations[:12],
+        "unverified_source_facts": unverified_source_facts[:12],
+        "evidence_references": list(dict.fromkeys(
+            value for item in source_fact_citations for value in item["evidence_ids"]))[:30],
         "inference": str(parsed.get("inference") or summary)[:3000],
         "attack_path": _dict_list(parsed.get("attack_path"), 10),
         "affected_assets": _dict_list(parsed.get("affected_assets"), 12),
@@ -1472,8 +1517,20 @@ def normalize_finding_ai_result(parsed, context):
     }
     for lane in ("l1", "l2", "l3", "response"):
         result["actions"][lane] = _string_list(actions.get(lane), 8)
+    if result["unverified_source_facts"]:
+        result["gaps"].append("One or more model source facts lack a citation to an evidence ID supplied to the model.")
+        result["quality_checks"].append("Uncited model statements are separated from observed source facts.")
+        result["verdict"]["confidence"] = "low"
+        result["verdict"]["status"] = "needs_review"
     if not result["source_facts"]:
-        result["source_facts"] = [f"Finding {context.get('title') or context.get('id') or 'selected record'} was supplied for analyst review."]
+        result["gaps"].append("No source facts with evidence citations were returned.")
+        result["verdict"]["confidence"] = "low"
+        result["verdict"]["status"] = "needs_review"
+    if violations:
+        result["gaps"].extend(violations[:4])
+        result["quality_checks"].append("Unknown evidence references were rejected.")
+        result["verdict"]["confidence"] = "low"
+        result["verdict"]["status"] = "needs_review"
     if not result["quality_checks"]:
         result["quality_checks"] = ["Analyst must verify conclusions against original Wazuh/syslog evidence before response."]
     return apply_contract(result, "finding")
@@ -1514,7 +1571,10 @@ def local_finding_ai_fallback(context, error="AI provider unavailable"):
                 "asset": row.get("device"), "evidence": row.get("event_id")} for row in local_evidence if row.get("user")][:12],
             "data_impact": [],
             "verdict": {"status": "needs_review", "severity": context.get("severity") or "unknown", "confidence": "low", "reason": "The AI provider was unavailable, so no model inference was used."},
-            "source_facts": [f"Evidence type: {context.get('evidence') or 'unknown'}", f"Provider/source: {context.get('provider') or 'unknown'}", f"Observed count: {context.get('count') or 0}"],
+            "source_facts": ([f"Local event record {row.get('event_id')} was returned as evidence for this finding." for row in local_evidence if row.get("event_id")][:12]),
+            "source_fact_citations": ([{"fact": f"Local event record {row.get('event_id')} was returned as evidence for this finding.", "evidence_ids": [str(row.get("event_id"))]} for row in local_evidence if row.get("event_id")][:12]),
+            "unverified_source_facts": [],
+            "evidence_references": list(dict.fromkeys(str(row.get("event_id")) for row in local_evidence if row.get("event_id")))[:30],
             "inference": "The record requires correlation with original events, source/destination direction, affected asset role, and provider provenance.",
             "attack_path": [{"stage": "Observed", "detail": context.get("description") or "Selected SOC finding", "evidence": context.get("id") or context.get("title")}],
             "affected_assets": affected_assets[:12],
@@ -1557,23 +1617,21 @@ def analyze_finding_with_model(config, finding):
         ],
     }, headers, timeout=min(max(int(config.get("AI_TIMEOUT_SECONDS", "180")), 10), 180))
     choice = (result.get("choices") or [{}])[0]
+    if choice.get("finish_reason") == "length":
+        raise ValueError("AI output truncated; deterministic fallback required")
     answer = ((choice.get("message") or {}).get("content") or "").strip()
     if not answer:
         raise ValueError("AI returned no finding assessment")
-    fallback_used = False
-    parsed = None
     try:
         parsed = _extract_ai_json_object(answer, required=("summary", "verdict", "inference", "source_facts"))
-    except (json.JSONDecodeError, ValueError):
-        fallback_used = True
-    if not isinstance(parsed, dict) or not str(parsed.get("summary") or "").strip():
-        fallback_used = True
-        parsed = {"summary": answer[:1200], "inference": answer[:3000],
-                  "gaps": ["The model returned narrative text instead of the requested JSON schema. Review the narrative and map it to the finding evidence."]}
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise ValueError("AI returned malformed finding output; deterministic fallback required") from exc
+    if not str(parsed.get("summary") or "").strip():
+        raise ValueError("AI finding output is missing its summary; deterministic fallback required")
     elapsed = round(time.time() - started, 1)
     return {"status": "completed", "model": config["AI_MODEL"], "advisory": True,
             "schema": "soc-finding-v1", "contract_version": CONTRACT_VERSION,
-            "contract": contract_metadata("finding"), "fallback_used": fallback_used, "generated_at": now(),
+            "contract": contract_metadata("finding"), "fallback_used": False, "generated_at": now(),
             "elapsed_seconds": elapsed,
             "result": normalize_finding_ai_result(parsed, context)}
 
