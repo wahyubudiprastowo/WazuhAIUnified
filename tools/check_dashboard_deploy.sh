@@ -83,6 +83,34 @@ for asset in index.html app.js findings.js analysis-workspace.js automation.js w
   echo "${asset}: current"
 done
 
+echo '== Shared dashboard/materializer code parity =='
+for source in server.py soc_pipeline.py soc_automation.py entity_resolver.py detection_taxonomy.py telemetry_contract.py; do
+  host_hash="$(sha256sum "mcp-dashboard/${source}" | cut -d' ' -f1)"
+  for service in mcp-dashboard mcp-materializer; do
+    container_hash="$("${compose[@]}" exec -T "${service}" sha256sum "/app/${source}" | cut -d' ' -f1)"
+    if [[ "${host_hash}" != "${container_hash}" ]]; then
+      echo "MISMATCH: ${source} in ${service} (container image is stale)" >&2
+      exit 1
+    fi
+  done
+  echo "${source}: current in both services"
+done
+
+echo '== Runtime build identity =='
+expected_build_id="$(sed -n 's/^DASHBOARD_BUILD_ID = "\([^"]*\)"$/\1/p' mcp-dashboard/server.py)"
+if [[ -z "${expected_build_id}" ]]; then
+  echo 'Could not read expected dashboard build ID from source' >&2
+  exit 1
+fi
+for service in mcp-dashboard mcp-materializer; do
+  runtime_build_id="$("${compose[@]}" exec -T "${service}" python3 -c 'import server; print(server.DASHBOARD_BUILD_ID)')"
+  if [[ "${runtime_build_id}" != "${expected_build_id}" ]]; then
+    echo "MISMATCH: build ID in ${service}: expected ${expected_build_id}, got ${runtime_build_id}" >&2
+    exit 1
+  fi
+  echo "${service}: ${runtime_build_id}"
+done
+
 echo '== Materializer worker =='
 "${compose[@]}" exec -T mcp-materializer python3 - <<'PY'
 import os

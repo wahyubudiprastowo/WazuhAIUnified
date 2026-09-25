@@ -152,7 +152,7 @@ class PipelineTests(unittest.TestCase):
         start = datetime.fromisoformat(status['checkpoint'])
         event = {
             '@timestamp': (start + timedelta(minutes=1)).isoformat(),
-            'rule': {'id': '9001', 'level': 12, 'description': 'Fortigate deny',
+            'rule': {'id': '9001', 'level': 12, 'description': 'Fortigate brute force login failed',
                      'mitre': {'id': ['T1110']}},
             'agent': {'name': 'edge-fw'}, 'decoder': {'name': 'fortigate'},
             'data': {'srcip': '1.1.1.1', 'dstip': '10.0.0.8', 'dstport': '443',
@@ -171,6 +171,8 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(summary['dimensions']['decoder'][0]['value'], 'fortigate')
         self.assertEqual(summary['dimensions']['destination_ip'][0]['value'], '10.0.0.8')
         self.assertEqual(summary['dimensions']['mitre'][0]['value'], 'T1110')
+        self.assertEqual(summary['dimensions']['detection_family'][0]['value'], 'bruteforce')
+        self.assertTrue(summary['coverage']['taxonomy']['complete'])
 
     def test_historical_backfill_is_bounded_aggregation_and_advances_cursor(self):
         self.config.update({'SOC_ROLLUP_BACKFILL_DAYS': '7', 'SOC_ROLLUP_BACKFILL_CHUNK_MINUTES': '30'})

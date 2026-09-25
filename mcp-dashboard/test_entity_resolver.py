@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+import time
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -129,6 +130,85 @@ class EntityResolverTests(unittest.TestCase):
         self.assertEqual(first["matches"]["identity"], ["analyst@example.test"])
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM entity_clusters").fetchone()[0], 1)
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM entity_evidence").fetchone()[0], 2)
+
+    def test_cross_source_candidates_keep_provenance_and_never_claim_confirmation(self):
+        now = time.time()
+        wazuh = entity_resolver.prepare_evidence(
+            "wazuh", "wz-1", now,
+            {"userPrincipalName": "analyst@example.test", "srcip": "198.51.100.11"},
+            "Repeated sign-in failure", "12", 80)
+        m365 = entity_resolver.prepare_evidence(
+            "m365", "m365-1", now + 90,
+            {"userPrincipalName": "ANALYST@example.test", "clientIp": "198.51.100.11"},
+            "Risky sign-in", "high", 80)
+        entity_resolver.ingest_prepared(self.db, [wazuh, m365])
+
+        result = entity_resolver.materialize_correlation_candidates(self.db)
+        candidates = entity_resolver.correlation_candidates(self.db)
+        self.assertGreaterEqual(result["candidates"], 1)
+        candidate = next(row for row in candidates["items"] if row["primary_entity"]["type"] == "user")
+        self.assertEqual(candidate["classification"], "candidate")
+        self.assertFalse(candidate["confirmed"])
+        self.assertEqual(set(candidate["sources"]), {"wazuh", "m365"})
+        self.assertEqual({row["evidence_id"] for row in candidate["evidence"]},
+                         {wazuh["evidence_id"], m365["evidence_id"]})
+        self.assertTrue(all(row["source_record_id"] for row in candidate["evidence"]))
+
+    def test_candidate_status_distinguishes_not_run_from_completed_empty_run(self):
+        before = entity_resolver.correlation_candidates(self.db)
+        self.assertEqual(before["status"], "materializing")
+        self.assertIsNone(before["last_materialized_at"])
+
+        entity_resolver.materialize_correlation_candidates(self.db)
+        after = entity_resolver.correlation_candidates(self.db)
+        self.assertEqual(after["status"], "no_candidates")
+        self.assertIsNotNone(after["last_materialized_at"])
+        self.assertEqual(after["observations_considered"], 0)
+
+        historical = entity_resolver.correlation_candidates(self.db, start=time.time() - 48 * 3600)
+        self.assertEqual(historical["status"], "partial")
+        self.assertFalse(historical["range_covered"])
+
+    def test_entity_timeline_is_chronological_and_only_shows_explicit_attack_mapping(self):
+        first = entity_resolver.prepare_wazuh_evidence({
+            "@timestamp": "2026-09-24T10:00:00Z",
+            "rule": {"id": "9101", "level": 12, "description": "Suspicious process",
+                     "mitre": {"id": ["T1059.001"], "tactic": ["Execution"],
+                               "technique": ["PowerShell"]}},
+            "decoder": {"name": "windows_eventchannel"},
+            "agent": {"id": "007", "name": "HOST-7"},
+            "data": {"srcip": "198.51.100.20", "user": "analyst@example.test"},
+        }, "wz-event-1", "wazuh-alerts-4.x")
+        second = entity_resolver.prepare_evidence(
+            "defender_xdr", "dx-event-2", "2026-09-24T10:05:00Z",
+            {"userPrincipalName": "analyst@example.test", "title": "Risky sign-in"},
+            "Risky sign-in", "high", 85)
+        entity_resolver.ingest_prepared(self.db, [first, second])
+
+        result = entity_resolver.entity_timeline(
+            self.db, [{"entity_type": "user", "entity_value": "analyst@example.test"}],
+            entity_resolver._epoch("2026-09-24T09:00:00Z"),
+            entity_resolver._epoch("2026-09-24T11:00:00Z"), 20)
+        self.assertEqual(result["status"], "available")
+        self.assertEqual([event["source"] for event in result["events"]], ["wazuh", "defender_xdr"])
+        mapped, unmapped = result["events"]
+        self.assertEqual(mapped["attack_techniques"][0]["id"], "T1059.001")
+        self.assertEqual(mapped["attack_techniques"][0]["mapping_source"], "wazuh_rule.mitre")
+        self.assertEqual(unmapped["attack_mapping_status"], "not_mapped_in_source_evidence")
+        self.assertEqual(mapped["matched_entities"], [{"type": "user", "value": "analyst@example.test"}])
+        self.assertTrue(mapped["source_record_id"])
+        self.assertIn("does not establish causality", result["interpretation"])
+
+    def test_same_source_two_events_and_weak_shared_cve_do_not_make_candidates(self):
+        now = time.time()
+        one = entity_resolver.prepare_evidence(
+            "wazuh", "wz-one", now, {"cve": "CVE-2026-12345", "srcip": "198.51.100.12"})
+        two = entity_resolver.prepare_evidence(
+            "wazuh", "wz-two", now + 60, {"cve": "CVE-2026-12345", "srcip": "198.51.100.12"})
+        entity_resolver.ingest_prepared(self.db, [one, two])
+        entity_resolver.materialize_correlation_candidates(self.db)
+        groups = entity_resolver.correlation_candidates(self.db)
+        self.assertFalse(groups["items"])
 
     def test_recent_defender_updates_are_one_incident_card(self):
         defender_xdr.ensure_schema(self.db)

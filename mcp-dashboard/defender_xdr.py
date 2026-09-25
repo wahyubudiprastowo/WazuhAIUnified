@@ -27,6 +27,10 @@ COLLECTIONS = {
     "incidents": {"path": "/api/incidents", "title": "incidentName", "timestamp": "lastUpdateTime"},
     "alerts": {"path": "/api/alerts", "title": "title", "timestamp": "lastUpdateTime"},
 }
+GRAPH_COLLECTIONS = {
+    "incidents": {"path": "/v1.0/security/incidents", "timestamp": "lastUpdateDateTime"},
+    "alerts": {"path": "/v1.0/security/alerts_v2", "timestamp": "lastUpdateDateTime"},
+}
 
 
 def _request_json(url: str, headers: dict[str, str], timeout: int = 15) -> dict[str, Any]:
@@ -56,8 +60,15 @@ def ensure_schema(db) -> None:
     db.execute('''CREATE TABLE IF NOT EXISTS defender_xdr_observations (
         item_key TEXT PRIMARY KEY, observed_at REAL NOT NULL, collected_at REAL NOT NULL,
         alert_id TEXT, incident_id TEXT, severity TEXT, status TEXT, category TEXT, title TEXT,
-        data TEXT NOT NULL)''')
+        data TEXT NOT NULL, record_type TEXT NOT NULL DEFAULT 'incident')''')
+    columns = {row[1] for row in db.execute("PRAGMA table_info(defender_xdr_observations)")}
+    if "record_type" not in columns:
+        db.execute("ALTER TABLE defender_xdr_observations ADD COLUMN record_type TEXT NOT NULL DEFAULT 'incident'")
+        # Older collector versions stored both modes in one table. An empty
+        # incident_id identifies the legacy alert-mode records unambiguously.
+        db.execute("UPDATE defender_xdr_observations SET record_type='alert' WHERE COALESCE(incident_id,'')='' AND COALESCE(alert_id,'')!=''")
     db.execute("CREATE INDEX IF NOT EXISTS defender_xdr_observed ON defender_xdr_observations(observed_at DESC)")
+    db.execute("CREATE INDEX IF NOT EXISTS defender_xdr_type_observed ON defender_xdr_observations(record_type,observed_at DESC)")
     db.execute('''CREATE TABLE IF NOT EXISTS defender_xdr_correlations (
         correlation_key TEXT PRIMARY KEY, item_key TEXT NOT NULL, correlated_at REAL NOT NULL,
         score INTEGER NOT NULL, data TEXT NOT NULL)''')
@@ -183,8 +194,113 @@ def _observed_epoch(value: str, fallback: float) -> float:
         return fallback
 
 
+def _safe_graph_next_link(value: str, collection_path: str) -> str:
+    parsed = urllib.parse.urlsplit(value)
+    allowed_path = collection_path.split("?", 1)[0]
+    if parsed.scheme != "https" or parsed.netloc != "graph.microsoft.com" or parsed.path != allowed_path:
+        raise ValueError("Microsoft Graph returned an invalid pagination link")
+    return value
+
+
+def _collect_one(db, provider: str, mode: str, token: str, base: str, batch: int,
+                 interval: int) -> dict[str, Any]:
+    graph = provider == "graph"
+    collection = GRAPH_COLLECTIONS[mode] if graph else COLLECTIONS[mode]
+    source = f"{provider}:{mode}"
+    checkpoint = db.execute("SELECT checkpoint,updated_at,detail,status FROM defender_xdr_checkpoint WHERE source=?",
+                            (source,)).fetchone()
+    now = time.time()
+    try:
+        detail = json.loads(checkpoint[2] or "{}") if checkpoint else {}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        detail = {}
+    has_pending_page = bool(detail.get("next_link")) and checkpoint[3] != "error" if checkpoint else False
+    if checkpoint and now - float(checkpoint[1] or 0) < interval and not has_pending_page:
+        return {"source": source, "status": "cooldown", "received": 0}
+    path = collection["path"]
+    if graph:
+        if detail.get("next_link"):
+            url = _safe_graph_next_link(str(detail["next_link"]), path)
+        else:
+            query = {"$top": str(batch)}
+            if mode == "incidents":
+                query["$expand"] = "alerts"
+            if checkpoint and checkpoint[0]:
+                query["$filter"] = collection["timestamp"] + " ge " + str(checkpoint[0])
+            url = base + path + "?" + urllib.parse.urlencode(query)
+    else:
+        query = {"$top": str(batch)}
+        if checkpoint and checkpoint[0]:
+            query["$filter"] = collection["timestamp"] + " ge " + str(checkpoint[0])
+        url = base + path + "?" + urllib.parse.urlencode(query)
+
+    try:
+        payload = _request_json(url, {"Authorization": "Bearer " + token, "Accept": "application/json"})
+        values = payload.get("value") if isinstance(payload.get("value"), list) else []
+        rows = []
+        for item in values[:batch]:
+            if not isinstance(item, dict):
+                continue
+            observed = _observed(item)
+            if mode == "incidents":
+                incident_id = str(item.get("id") or item.get("incidentId") or "")[:256]
+                alert_id = ""
+                title = item.get("displayName") if graph else item.get(collection.get("title", "title"))
+                record_type = "incident"
+            else:
+                alert_id = str(item.get("id") or item.get("providerAlertId") or item.get("alertId") or "")[:256]
+                incident_id = str(item.get("incidentId") or "")[:256]
+                title = item.get("title") or item.get("alertName")
+                record_type = "alert"
+            identity = alert_id or incident_id
+            # Keep the historical incident key so polling after upgrade updates
+            # existing rows instead of duplicating the retained ledger.
+            key_material = f"{identity}\x1f{observed}" if record_type == "incident" else f"alert\x1f{identity}\x1f{observed}"
+            key = hashlib.sha256(key_material.encode()).hexdigest()
+            severity = str(item.get("severity") or "")[:32]
+            item_status = str(item.get("status") or "")[:64]
+            categories = item.get("categories")
+            if isinstance(categories, list):
+                categories = ", ".join(str(value) for value in categories[:8])
+            category = str(item.get("category") or categories or item.get("determination") or
+                           item.get("classification") or item.get("serviceSource") or item.get("threatName") or "")[:256]
+            title = str(title or category or ("Defender alert" if record_type == "alert" else "Defender incident"))[:500]
+            rows.append((key, _observed_epoch(observed, now), now, alert_id, incident_id,
+                         severity, item_status, category, title, json.dumps(item, separators=(",", ":")), record_type))
+        db.executemany("""INSERT INTO defender_xdr_observations
+            (item_key,observed_at,collected_at,alert_id,incident_id,severity,status,category,title,data,record_type)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(item_key) DO UPDATE SET
+            collected_at=excluded.collected_at,severity=excluded.severity,status=excluded.status,
+            category=excluded.category,title=excluded.title,data=excluded.data,record_type=excluded.record_type""", rows)
+        next_link = payload.get("@odata.nextLink") if graph else None
+        prior_watermark = detail.get("max_observed") or (checkpoint[0] if checkpoint else None)
+        observed_values = [_observed(value) for value in values if isinstance(value, dict)]
+        candidates = [value for value in [prior_watermark, *observed_values] if value]
+        max_observed = max(candidates, key=lambda value: _observed_epoch(value, 0)) if candidates else None
+        next_checkpoint = prior_watermark if next_link else max_observed
+        saved_detail = {"received": len(rows), "provider": provider, "mode": mode,
+                        "next_link": _safe_graph_next_link(str(next_link), path) if next_link and graph else None,
+                        "max_observed": max_observed if next_link else None,
+                        "page_records": int(detail.get("page_records") or 0) + len(rows) if next_link else 0}
+        db.execute("""INSERT INTO defender_xdr_checkpoint(source,checkpoint,updated_at,status,detail)
+            VALUES (?,?,?,?,?) ON CONFLICT(source) DO UPDATE SET checkpoint=excluded.checkpoint,
+            updated_at=excluded.updated_at,status=excluded.status,detail=excluded.detail""",
+            (source, next_checkpoint, now, "ok", json.dumps(saved_detail)))
+        return {"source": source, "status": "ok", "received": len(rows),
+                "has_more": bool(saved_detail["next_link"])}
+    except (urllib.error.URLError, urllib.error.HTTPError, ValueError, json.JSONDecodeError) as exc:
+        message = str(exc)[:300]
+        previous_detail = dict(detail)
+        previous_detail["error"] = message
+        db.execute("""INSERT INTO defender_xdr_checkpoint(source,checkpoint,updated_at,status,detail)
+            VALUES (?,?,?,?,?) ON CONFLICT(source) DO UPDATE SET checkpoint=excluded.checkpoint,updated_at=excluded.updated_at,
+            status=excluded.status,detail=excluded.detail""",
+            (source, checkpoint[0] if checkpoint else None, now, "error", json.dumps(previous_detail)))
+        return {"source": source, "status": "error", "received": 0, "reason": message}
+
+
 def collect(db, config: dict[str, str]) -> dict[str, Any]:
-    """Collect a bounded alert page. Disabled/missing config never makes HTTP calls."""
+    """Collect independently checkpointed, bounded Defender incident and alert pages."""
     ensure_schema(db)
     if config.get("DEFENDER_XDR_ENABLED") != "true":
         return {"enabled": False, "status": "disabled", "observations": 0}
@@ -195,91 +311,67 @@ def collect(db, config: dict[str, str]) -> dict[str, Any]:
         return {"enabled": True, "status": "not_configured", "observations": 0,
                 "reason": "Defender XDR tenant/client/secret are required"}
     provider = str(config.get("DEFENDER_XDR_API_PROVIDER") or "defender").strip().lower()
+    mode = str(config.get("DEFENDER_XDR_COLLECTION_MODE") or "both").strip().lower()
     if provider not in PROVIDERS:
         return {"enabled": True, "status": "invalid_configuration", "observations": 0,
                 "reason": "Defender XDR API provider must be defender or graph"}
-    mode = str(config.get("DEFENDER_XDR_COLLECTION_MODE") or "incidents").strip().lower()
-    collection = COLLECTIONS.get(mode)
-    if collection is None:
+    if mode not in {"incidents", "alerts", "both"}:
         return {"enabled": True, "status": "invalid_configuration", "observations": 0,
-                "reason": "Defender XDR collection mode must be incidents or alerts"}
+                "reason": "Defender XDR collection mode must be incidents, alerts, or both"}
+    modes = ["incidents", "alerts"] if mode == "both" else [mode]
     interval = max(300, min(int(config.get("DEFENDER_XDR_POLL_INTERVAL_SECONDS") or 900), 86400))
-    source = f"{provider}:{mode}"
-    row = db.execute("SELECT checkpoint,updated_at,status FROM defender_xdr_checkpoint WHERE source=?", (source,)).fetchone()
-    # `checkpoint` is an ISO timestamp returned by Defender. Cooldown must use
-    # the durable local update epoch, otherwise the second poll tries to cast
-    # an ISO value to float and the collector never reaches its backoff path.
-    if row and time.time() - float(row[1] or 0) < interval:
-        count = int(db.execute("SELECT COUNT(*) FROM defender_xdr_observations").fetchone()[0] or 0)
-        return {"enabled": True, "status": "cooldown", "provider": provider, "mode": mode, "observations": count}
     batch = max(1, min(int(config.get("DEFENDER_XDR_BATCH_SIZE") or 50), 100))
     try:
-        if provider == "graph" and mode != "incidents":
-            return {"enabled": True, "status": "invalid_configuration", "observations": 0,
-                    "reason": "Microsoft Graph supports incidents mode only"}
         token = _token(tenant, client, secret, PROVIDERS[provider]["scope"])
         configured_base = str(config.get("DEFENDER_XDR_API_BASE_URL") or "")
-        # Older deployments retain the Defender default in this field. A Graph
-        # provider selection intentionally switches to the documented Graph base.
         if provider == "graph" and configured_base == DEFAULT_BASE_URL:
             configured_base = GRAPH_BASE_URL
         base = _safe_base(configured_base, provider)
-        query = {"$top": str(batch)}
-        # Incident-level metadata does not always contain the affected entity.
-        # Graph supports expanding the related alerts in the same bounded request,
-        # which supplies the IP/user/device clues needed for local correlation.
-        if provider == "graph":
-            query["$expand"] = "alerts"
-        # This endpoint supports an OData time filter. If the collector has no
-        # watermark yet, its first bounded pull stays deliberately small.
-        if row and row[0]:
-            query["$filter"] = ("lastUpdateDateTime" if provider == "graph" else collection["timestamp"]) + " ge " + str(row[0])
-        path = "/v1.0/security/incidents" if provider == "graph" else collection["path"]
-        url = base + path + "?" + urllib.parse.urlencode(query)
-        payload = _request_json(url, {"Authorization": "Bearer " + token, "Accept": "application/json"})
-        values = payload.get("value") if isinstance(payload.get("value"), list) else []
-        rows = []
-        now = time.time()
-        for item in values[:batch]:
-            if not isinstance(item, dict):
-                continue
-            alert_id = str(item.get("id") or item.get("alertId") or item.get("incidentId") or "")[:256]
-            observed = _observed(item)
-            key = hashlib.sha256((alert_id + "\x1f" + observed).encode()).hexdigest()
-            severity = str(item.get("severity") or "")[:32]
-            status = str(item.get("status") or "")[:64]
-            category = str(item.get("determination") or item.get("classification") or item.get("category") or item.get("threatName") or "")[:256]
-            title_key = "displayName" if provider == "graph" else collection["title"]
-            title = str(item.get(title_key) or item.get("title") or item.get("alertName") or category)[:500]
-            incident_id = str(item.get("incidentId") or (item.get("id") if mode == "incidents" else ""))[:256]
-            rows.append((key, _observed_epoch(observed, now), now, alert_id, incident_id, severity,
-                         status, category, title, json.dumps(item, separators=(",", ":"))))
-        db.executemany("""INSERT INTO defender_xdr_observations
-            (item_key,observed_at,collected_at,alert_id,incident_id,severity,status,category,title,data)
-            VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(item_key) DO UPDATE SET
-            collected_at=excluded.collected_at,severity=excluded.severity,status=excluded.status,
-            category=excluded.category,title=excluded.title,data=excluded.data""", rows)
-        db.execute("""INSERT INTO defender_xdr_checkpoint(source,checkpoint,updated_at,status,detail)
-            VALUES (?,?,?,?,?) ON CONFLICT(source) DO UPDATE SET checkpoint=excluded.checkpoint,
-            updated_at=excluded.updated_at,status=excluded.status,detail=excluded.detail""",
-            (source, _observed(values[0]) if values else None, now, "ok", json.dumps({"received": len(rows), "provider": provider, "mode": mode})))
-        count = int(db.execute("SELECT COUNT(*) FROM defender_xdr_observations").fetchone()[0] or 0)
-        return {"enabled": True, "status": "ok", "provider": provider, "mode": mode, "received": len(rows), "observations": count}
     except (urllib.error.URLError, urllib.error.HTTPError, ValueError, json.JSONDecodeError) as exc:
-        message = str(exc)[:300]
-        db.execute("""INSERT INTO defender_xdr_checkpoint(source,checkpoint,updated_at,status,detail)
-            VALUES (?,NULL,?,?,?) ON CONFLICT(source) DO UPDATE SET updated_at=excluded.updated_at,
-            status=excluded.status,detail=excluded.detail""", (source, time.time(), "error", message))
-        count = int(db.execute("SELECT COUNT(*) FROM defender_xdr_observations").fetchone()[0] or 0)
-        return {"enabled": True, "status": "error", "provider": provider, "mode": mode, "observations": count, "reason": message}
-
-
-def status(db) -> dict[str, Any]:
-    ensure_schema(db)
+        return {"enabled": True, "status": "error", "provider": provider, "mode": mode,
+                "observations": int(db.execute("SELECT COUNT(*) FROM defender_xdr_observations").fetchone()[0] or 0),
+                "reason": str(exc)[:300]}
+    sources = [_collect_one(db, provider, item_mode, token, base, batch, interval) for item_mode in modes]
+    statuses = {row["status"] for row in sources}
+    result_status = "ok" if statuses <= {"ok", "cooldown"} and "ok" in statuses else "cooldown" if statuses == {"cooldown"} else "partial" if "ok" in statuses or "cooldown" in statuses else "error"
     count = int(db.execute("SELECT COUNT(*) FROM defender_xdr_observations").fetchone()[0] or 0)
+    return {"enabled": True, "status": result_status, "provider": provider, "mode": mode,
+            "received": sum(int(row.get("received") or 0) for row in sources),
+            "observations": count, "sources": sources}
+
+
+def status(db, start: str | None = None, end: str | None = None) -> dict[str, Any]:
+    ensure_schema(db)
+    time_filters = []
+    time_params = []
+    for value, operator in ((start, ">="), (end, "<")):
+        if value:
+            epoch = _observed_epoch(str(value), 0)
+            if not epoch:
+                raise ValueError("Defender status bounds must be ISO timestamps")
+            time_filters.append(f"observed_at {operator} ?")
+            time_params.append(epoch)
+    time_where = " WHERE " + " AND ".join(time_filters) if time_filters else ""
+    count = int(db.execute("SELECT COUNT(*) FROM defender_xdr_observations" + time_where,
+                           time_params).fetchone()[0] or 0)
     row = db.execute("SELECT updated_at,status,detail FROM defender_xdr_checkpoint ORDER BY updated_at DESC LIMIT 1").fetchone()
+    counts = {str(kind): int(total) for kind, total in db.execute(
+        "SELECT record_type,COUNT(DISTINCT COALESCE(NULLIF(alert_id,''),NULLIF(incident_id,''))) "
+        "FROM defender_xdr_observations" + time_where + " GROUP BY record_type", time_params).fetchall()}
+    checkpoints = {}
+    for source, checkpoint, updated_at, status_value, detail in db.execute(
+            "SELECT source,checkpoint,updated_at,status,detail FROM defender_xdr_checkpoint ORDER BY source"):
+        try:
+            parsed_detail = json.loads(detail or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            parsed_detail = {}
+        checkpoints[source] = {"checkpoint": checkpoint,
+            "updated_at": datetime.fromtimestamp(updated_at, timezone.utc).isoformat(),
+            "status": status_value, **parsed_detail}
     recent_rows = db.execute("""SELECT observed_at,alert_id,incident_id,severity,status,category,title
-        FROM defender_xdr_observations ORDER BY observed_at DESC LIMIT 40""").fetchall()
+        FROM defender_xdr_observations WHERE record_type='incident'""" +
+        (" AND " + " AND ".join(time_filters) if time_filters else "") +
+        " ORDER BY observed_at DESC LIMIT 40", time_params).fetchall()
     recent, recent_keys = [], set()
     for item in recent_rows:
         key = str(item[2] or item[1] or "")
@@ -289,8 +381,34 @@ def status(db) -> dict[str, Any]:
         recent.append(item)
         if len(recent) >= 8:
             break
+    alert_rows = db.execute("""SELECT observed_at,alert_id,incident_id,severity,status,category,title,data
+        FROM defender_xdr_observations WHERE record_type='alert'""" +
+        (" AND " + " AND ".join(time_filters) if time_filters else "") +
+        " ORDER BY observed_at DESC LIMIT 250", time_params).fetchall()
+    recent_alerts = []
+    recent_alert_ids = set()
+    for observed_at, alert_id, incident_id, severity, item_status, category, title, raw in alert_rows:
+        if not alert_id or alert_id in recent_alert_ids:
+            continue
+        recent_alert_ids.add(alert_id)
+        try:
+            document = json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            document = {}
+        recent_alerts.append({"record_type": "alert", "observed_at": datetime.fromtimestamp(observed_at, timezone.utc).isoformat(),
+            "alert_id": alert_id, "incident_id": incident_id, "severity": severity or "unknown",
+            "status": item_status or "unknown", "category": category or "", "title": title or "Defender alert",
+            "service_source": document.get("serviceSource") or document.get("productName") or "",
+            "detection_source": document.get("detectionSource") or "",
+            "description": str(document.get("description") or "")[:600],
+            "mitre_techniques": (document.get("mitreTechniques") or [])[:8] if isinstance(document.get("mitreTechniques"), list) else [],
+            "alert_url": document.get("alertWebUrl") or "",
+            "cluster_id": entity_resolver.cluster_id(str(incident_id or alert_id))})
+        if len(recent_alerts) >= 50:
+            break
     profile_rows = db.execute("""SELECT observed_at,alert_id,incident_id,severity,status,data
-        FROM defender_xdr_observations ORDER BY observed_at DESC LIMIT 100""").fetchall()
+        FROM defender_xdr_observations""" + time_where +
+        " ORDER BY observed_at DESC LIMIT 100", time_params).fetchall()
     field_counts = {field: 0 for field in (
         "alert_or_incident", "severity", "entities", "status", "first_seen", "last_update")}
     for observed_at, alert_id, incident_id, severity, item_status, raw in profile_rows:
@@ -309,16 +427,19 @@ def status(db) -> dict[str, Any]:
         field_counts["last_update"] += int(_contains_key(document, _LAST_UPDATE_KEYS))
     available_fields = [field for field, value in field_counts.items() if value]
     latest_observed = profile_rows[0][0] if profile_rows else None
-    return {"observations": count, "last_checked_at": datetime.fromtimestamp(row[0], timezone.utc).isoformat() if row else None,
+    return {"observations": count, "counts": {"incidents": counts.get("incident", 0), "alerts": counts.get("alert", 0)},
+            "checkpoints": checkpoints,
+            "last_checked_at": datetime.fromtimestamp(row[0], timezone.utc).isoformat() if row else None,
             "status": row[1] if row else "not_started", "detail": row[2] if row else None,
             "last_observed_at": datetime.fromtimestamp(latest_observed, timezone.utc).isoformat() if latest_observed else None,
             "available_fields": available_fields, "field_counts": field_counts,
             "field_sample_size": len(profile_rows),
-            "recent": [{"observed_at": datetime.fromtimestamp(item[0], timezone.utc).isoformat(),
+            "recent": [{"record_type": "incident", "observed_at": datetime.fromtimestamp(item[0], timezone.utc).isoformat(),
                         "alert_id": item[1], "incident_id": item[2], "severity": item[3] or "unknown",
                         "status": item[4] or "unknown", "category": item[5] or "", "title": item[6] or "Defender XDR record",
                         "cluster_id": entity_resolver.cluster_id(str(item[2] or item[1] or ""))}
-                       for item in recent], "entity_graph": entity_resolver.status(db)}
+                       for item in recent], "recent_alerts": recent_alerts,
+            "entity_graph": entity_resolver.status(db)}
 
 
 def history(db, start: str | None = None, end: str | None = None, limit: int = 30, offset: int = 0) -> dict[str, Any]:
@@ -335,13 +456,16 @@ def history(db, start: str | None = None, end: str | None = None, limit: int = 3
             params.append(epoch)
     where = " WHERE " + " AND ".join(filters) if filters else ""
     total = int(db.execute("SELECT COUNT(*) FROM defender_xdr_observations" + where, params).fetchone()[0] or 0)
-    rows = db.execute("""SELECT observed_at,collected_at,alert_id,incident_id,severity,status,category,title,data
+    rows = db.execute("""SELECT observed_at,collected_at,alert_id,incident_id,severity,status,category,title,data,record_type
         FROM defender_xdr_observations""" + where + " ORDER BY observed_at DESC LIMIT ? OFFSET ?", (*params, limit, offset)).fetchall()
     items = []
     severity_counts: dict[str, int] = {}
-    for observed_at, collected_at, alert_id, incident_id, severity, item_status, category, title, raw in rows:
+    type_counts: dict[str, int] = {}
+    for observed_at, collected_at, alert_id, incident_id, severity, item_status, category, title, raw, record_type in rows:
         level = str(severity or "unknown").lower()
         severity_counts[level] = severity_counts.get(level, 0) + 1
+        record_type = str(record_type or "incident")
+        type_counts[record_type] = type_counts.get(record_type, 0) + 1
         try:
             data = json.loads(raw)
         except (TypeError, ValueError, json.JSONDecodeError):
@@ -349,10 +473,10 @@ def history(db, start: str | None = None, end: str | None = None, limit: int = 3
         items.append({
             "observed_at": datetime.fromtimestamp(observed_at, timezone.utc).isoformat(),
             "collected_at": datetime.fromtimestamp(collected_at, timezone.utc).isoformat(),
-            "alert_id": alert_id, "incident_id": incident_id, "severity": severity or "unknown",
+            "record_type": record_type, "alert_id": alert_id, "incident_id": incident_id, "severity": severity or "unknown",
             "status": item_status or "unknown", "category": category or "", "title": title or "Defender XDR record",
             "data": data,
         })
     return {"source": "Microsoft Defender XDR local ledger", "total": total, "items": items,
-            "summary": {"severity": severity_counts}, "provider_calls": 0,
+            "summary": {"severity": severity_counts, "record_types": type_counts}, "provider_calls": 0,
             "storage": "soc-automation SQLite Defender ledger"}

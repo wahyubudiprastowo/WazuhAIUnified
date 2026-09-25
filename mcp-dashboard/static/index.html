@@ -111,7 +111,7 @@
           <label>Severity<select id="findingSeverity"><option value="all">All severities</option><option value="critical">Critical</option><option value="high">High</option><option value="medium">Medium</option><option value="low">Low</option><option value="unknown">Not assessed</option></select></label>
         </div>
         <div class="findingsWorkspace">
-          <section class="findingsList" aria-label="Finding results"><div class="findingsListHead"><strong id="findingsCount">Loading findings</strong><span>Most urgent first</span></div><div id="findingsRows"></div><div class="findingsPagination" id="findingsPagination"></div></section>
+          <section class="findingsList" aria-label="Finding results"><div class="findingsListHead"><strong id="findingsCount">Loading findings</strong><span id="findingsScope" role="status" aria-live="polite">Loading overview</span></div><div id="findingsRows"></div><div class="findingsPagination" id="findingsPagination"></div></section>
           <section class="findingDetail" id="findingDetail" aria-label="Finding details"><div class="findingEmpty">Waiting for telemetry...</div></section>
         </div>
         <section class="findingAiOperations" aria-labelledby="findingAiOperationsTitle">
@@ -154,6 +154,16 @@
             </div>
           </section>
         </div>
+
+        <section class="glassPanel situationPanel" aria-labelledby="situationTitle">
+          <div class="panelHead">
+            <div><h2 id="situationTitle">SOC Situation Awareness</h2><span>Case verdicts, affected context, and classified alert signals are kept distinct.</span></div>
+            <button type="button" data-view-link="incidents">Open incident workspace</button>
+          </div>
+          <div id="situationSummary" class="situationMetrics" aria-live="polite"></div>
+          <div id="situationDecision" class="situationDecisionGrid"></div>
+          <div id="situationCandidates" class="situationCandidates"></div>
+        </section>
 
         <div class="insightStrip" id="insightStrip"></div>
 
@@ -531,11 +541,11 @@
         </form>
       </section>
     </main>
-    <script src="/static/app.js?v=20260923-20"></script>
-    <script src="/static/findings.js?v=20260923-6"></script>
+    <script src="/static/app.js?v=20260925-7"></script>
+    <script src="/static/findings.js?v=20260925-3"></script>
     <script src="/static/vendor/chart.umd.js"></script>
     <script src="/static/locale.js?v=20260911-1"></script>
-    <script src="/static/analysis-workspace.js?v=20260923-3"></script>
+    <script src="/static/analysis-workspace.js?v=20260925-2"></script>
     <script src="/static/enterprise.js?v=20260923-2"></script>
     <script src="/static/automation.js?v=20260923-2"></script>
     <script src="/static/history.js?v=20260922-2"></script>

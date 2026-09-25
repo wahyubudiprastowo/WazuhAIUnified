@@ -92,6 +92,7 @@
     if (a.loadingWindow === windowKey) return;
     const generation = ++a.generation;
     a.loadingWindow = windowKey;
+    window.SocFindings?.setCoverageStatus("loading");
     if (a.coverageWindow !== windowKey) {
       a.coverage = null; a.results.clear(); a.pending.clear(); a.busy = false;
     }
@@ -108,11 +109,16 @@
       if (state.view === "l1") renderThreatTable("#l1Queue", data.rules.slice(0, 25));
       if (!eligible().some(row => row.indicator === a.selected)) a.selected = eligible()[0]?.indicator || "";
       render();
-    } catch (e) { if (generation === a.generation) activeAreas().forEach(el => el.innerHTML = `<div class="analysisBody">${t("Cakupan belum tersedia", "Coverage unavailable")}: ${esc(e.message)}</div>`); }
+    } catch (e) { if (generation === a.generation) {
+      window.SocFindings?.setCoverageStatus("error", e.message);
+      activeAreas().forEach(el => el.innerHTML = `<div class="analysisBody">${t("Cakupan belum tersedia", "Coverage unavailable")}: ${esc(e.message)}</div>`);
+    } }
     finally { if (generation === a.generation) a.loadingWindow = ""; }
   }
   document.addEventListener("soc:overview", () => { if (coverageEnabled(state.view)) setTimeout(loadCoverage, 0); });
   document.addEventListener("soc:view", event => { if (coverageEnabled(event.detail.view)) setTimeout(loadCoverage, 0); });
+  // Reuse an overview that arrived before this module subscribed to the event.
+  if (state.overview && coverageEnabled(state.view)) setTimeout(loadCoverage, 0);
   document.querySelector("#refreshBtn")?.addEventListener("click", () => { if (coverageEnabled(state.view)) setTimeout(() => loadCoverage(true), 0); });
   document.addEventListener("soc:language", render);
   document.addEventListener("change", e => {

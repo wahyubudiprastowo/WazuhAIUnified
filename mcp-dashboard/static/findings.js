@@ -5,7 +5,7 @@
   const categories = {all: "All findings", wazuh: "Wazuh rules", decoder: "Decoder coverage", m365: "Microsoft 365", defender: "Defender XDR", ip: "Source IP / Geo", observable: "Log indicators", recon: "AI bot recon", vuln: "CVE & Exposure"};
   const severityOrder = {critical: 5, high: 4, medium: 3, low: 2, unknown: 1};
   const evidenceLabels = {observed: "Wazuh observed", inventory: "Asset inventory", intel: "External intelligence", security: "Microsoft Defender XDR", pending: "Local evidence not verified"};
-  const f = {rows: [], category: "all", selected: null, page: 0, feeds: {}, pivots: new Map(), cache: new Map(), ai: new Map(), aiJobs: new Map(), feedback: new Map(), workflowResults: new Map(), tabLoads: new Set(), sequence: 0, cveSequence: 0, tab: "overview", data: null};
+  const f = {rows: [], category: "all", selected: null, page: 0, feeds: {}, pivots: new Map(), cache: new Map(), ai: new Map(), aiJobs: new Map(), feedback: new Map(), workflowResults: new Map(), tabLoads: new Set(), sequence: 0, cveSequence: 0, tab: "overview", data: null, coverageStatus: "idle", coverageError: ""};
   const findingRecipes = {
     wazuh: ["analyze_alert_patterns", "blueteam_attack_chain", "blueteam_pivot_suggest", "blueteam_false_positive_kb"],
     decoder: ["blueteam_wazuh_get_decoders", "get_wazuh_rules_summary", "blueteam_baseline_drift"],
@@ -39,6 +39,8 @@
     blueteam_cve_advisory: "Build a remediation-oriented advisory.",
   };
   const list = (value) => Array.isArray(value) ? value : value == null ? [] : [value];
+  const records = (value) => Array.isArray(value) ? value.filter(item => item && typeof item === "object" && !Array.isArray(item)) : [];
+  const strings = (value) => Array.isArray(value) ? value.filter(item => typeof item === "string" && item) : typeof value === "string" && value ? [value] : [];
   const label = (value) => typeof value === "object" && value !== null ? value.label || value.name || value.id || value.value || "" : String(value ?? "");
   const labels = (value) => [...new Set(list(value).flatMap(item => {
     if (item && typeof item === "object") return label(item) ? [String(label(item))] : Object.values(item).flatMap(labels);
@@ -61,24 +63,56 @@
   const isHash = (value) => /^[a-f\d]{32}$|^[a-f\d]{40}$|^[a-f\d]{64}$/i.test(value || "");
   const isFullUrl = (value) => /^https?:\/\/[^/\s]+/i.test(value || "");
   function buildRows() {
+    try {
+      buildRowsFromData();
+    } catch (error) {
+      f.rows = [];
+      f.selected = null;
+      f.coverageStatus = "error";
+      f.coverageError = String(error?.message || error).slice(0, 240);
+      const message = t(`Temuan gagal dirender: ${f.coverageError}`, `Findings could not be rendered: ${f.coverageError}`);
+      if (q("#findingsCount")) q("#findingsCount").textContent = t("Findings unavailable", "Findings unavailable");
+      if (q("#findingsScope")) q("#findingsScope").textContent = message;
+      if (q("#findingsRows")) q("#findingsRows").innerHTML = `<div class="findingEmpty">${esc(message)}</div>`;
+      if (q("#findingDetail")) q("#findingDetail").innerHTML = `<div class="findingEmpty">${esc(message)}</div>`;
+      console.error("[SOC Findings] Payload rendering failed", error);
+    }
+  }
+
+  function buildRowsFromData() {
     const d = f.data;
     if (!d) return;
     const rows = [];
-    for (const row of f.coverage?.rules || d.threats || []) rows.push({id: `rule:${row.rule_id}`, category: "wazuh", provider: "Wazuh", title: ax(row.analysis, "title") || row.description || `Rule ${row.rule_id}`, subject: `Rule ${row.rule_id} | ${row.description}`, severity: severityClass(Number(row.level)), evidence: "observed", confidence: row.detection?.confidence, count: row.count, countScope: row.count_scope, ip: (row.source_ips || [])[0], rule: row.rule_id, description: ax(row.analysis, "meaning") || `Rule level ${row.level}. ${row.count} event(s) in the returned threat sample.`, types: [...(row.groups || []), row.detection?.family].filter(Boolean), assets: (row.affected_agents || []).map(a => a.name || a.id), timestamp: row.last_seen, raw: row});
-    for (const row of f.coverage?.decoders || []) rows.push({id: `decoder:${row.name}`, category: "decoder", provider: "Wazuh index", title: row.name, subject: row.latest_rule ? `Latest rule ${row.latest_rule_id}: ${row.latest_rule}` : "Decoded Wazuh events", severity: severityClass(Number(row.max_level)), evidence: "observed", count: row.count, countScope: "index aggregation", rule: row.latest_rule_id, description: `${fmt.format(Number(row.count || 0))} indexed event(s) decoded in the selected window. Maximum observed rule level ${Number(row.max_level || 0)}.`, types: ["decoder", row.location].filter(Boolean), assets: [row.latest_agent?.name || row.latest_agent?.id].filter(Boolean), timestamp: row.last_seen, raw: row});
-    for (const [i, row] of (d.cloud_m365?.events || []).entries()) rows.push({id: `m365:${row.timestamp}:${i}`, category: "m365", provider: "Wazuh / Microsoft 365", title: row.operation || row.description, subject: row.user || row.workload, severity: severityClass(Number(row.level)), evidence: "observed", ip: row.client_ip, operation: row.operation, description: ax(row.analysis, "meaning") || row.description, types: [row.workload, row.subscription].filter(Boolean), assets: [row.user, row.object].filter(Boolean), timestamp: row.timestamp, raw: row});
-    const defenderCorrelations = new Map((d.external_intelligence?.defender_xdr?.correlations?.items || []).map(row => [String(row.incident_id || row.alert_id || ""), row]));
-    for (const row of (d.external_intelligence?.defender_xdr?.recent || [])) {
+    const coveredRules = records(f.coverage?.rules?.length ? f.coverage.rules : d.threats);
+    const coveredDecoders = records(f.coverage?.decoders?.length ? f.coverage.decoders : d.operational_evidence?.decoders?.items);
+    for (const row of coveredRules) rows.push({id: `rule:${row.rule_id}`, category: "wazuh", provider: "Wazuh", title: ax(row.analysis, "title") || row.description || `Rule ${row.rule_id}`, subject: `Rule ${row.rule_id} | ${row.description}`, severity: severityClass(Number(row.level)), evidence: "observed", confidence: row.detection?.confidence, count: row.count, countScope: row.count_scope, ip: strings(row.source_ips)[0], rule: row.rule_id, description: ax(row.analysis, "meaning") || `Rule level ${row.level}. ${row.count} event(s) in the returned threat sample.`, types: [...strings(row.groups), row.detection?.family].filter(Boolean), assets: records(row.affected_agents).map(a => a.name || a.id).filter(Boolean), timestamp: row.last_seen, raw: row});
+    for (const row of coveredDecoders) rows.push({id: `decoder:${row.name}`, category: "decoder", provider: "Wazuh index", title: row.name, subject: row.latest_rule ? `Latest rule ${row.latest_rule_id}: ${row.latest_rule}` : "Decoded Wazuh events", severity: severityClass(Number(row.max_level)), evidence: "observed", count: row.count, countScope: f.coverage?.decoders?.length ? "index aggregation" : "bounded overview aggregation", rule: row.latest_rule_id, description: `${fmt.format(Number(row.count || 0))} indexed event(s) decoded in the selected window. Maximum observed rule level ${Number(row.max_level || 0)}.`, types: ["decoder", row.location].filter(Boolean), assets: [row.latest_agent?.name || row.latest_agent?.id].filter(Boolean), timestamp: row.last_seen, raw: row});
+    for (const [i, row] of records(d.cloud_m365?.events).entries()) rows.push({id: `m365:${row.timestamp}:${i}`, category: "m365", provider: "Wazuh / Microsoft 365", title: row.operation || row.description, subject: row.user || row.workload, severity: severityClass(Number(row.level)), evidence: "observed", ip: row.client_ip, operation: row.operation, description: ax(row.analysis, "meaning") || row.description, types: [row.workload, row.subscription].filter(Boolean), assets: [row.user, row.object].filter(Boolean), timestamp: row.timestamp, raw: row});
+    const defenderCorrelations = new Map(records(d.external_intelligence?.defender_xdr?.correlations?.items).map(row => [String(row.incident_id || row.alert_id || ""), row]));
+    for (const row of records(d.external_intelligence?.defender_xdr?.recent)) {
       const correlation = defenderCorrelations.get(String(row.incident_id || row.alert_id || ""));
       const matches = correlation?.matches || {};
-      const matchedIp = (matches.ip || [])[0];
-      const matchedEntities = [...(matches.identity || []), ...(matches.asset || [])];
+      const matchedIp = strings(matches.ip)[0];
+      const matchedEntities = [...strings(matches.identity), ...strings(matches.asset)];
       rows.push({id: `defender:${correlation?.cluster_id || row.cluster_id || row.incident_id || row.alert_id || row.title}`, category: "defender", provider: "Microsoft Defender XDR", title: row.title || "Defender XDR incident", subject: row.incident_id || row.alert_id || row.category || "Stored security incident", severity: String(row.severity || "unknown").toLowerCase(), evidence: "security", ip: matchedIp, confidence: correlation?.confidence, assets: matchedEntities, description: correlation ? `Defender status: ${row.status || "unknown"}. Durable local graph matched ${correlation.signal_types} canonical entity type(s): IP ${matches.ip?.join(", ") || "none"}; identity ${matches.identity?.join(", ") || "none"}; asset ${matches.asset?.join(", ") || "none"}.` : `Defender status: ${row.status || "unknown"}. Classification: ${row.category || "not returned"}. Stored locally after checkpointed collection; no strong canonical entity match has been established.`, types: [row.category, row.status].filter(Boolean), timestamp: row.observed_at, raw: {...row, correlation}});
+    }
+    for (const row of records(d.external_intelligence?.defender_xdr?.recent_alerts)) {
+      const correlation = defenderCorrelations.get(String(row.incident_id || row.alert_id || ""));
+      const matches = correlation?.matches || {};
+      const matchedIp = strings(matches.ip)[0];
+      const matchedEntities = [...strings(matches.identity), ...strings(matches.asset)];
+      rows.push({id: `defender-alert:${row.alert_id || row.title}`, category: "defender", provider: "Microsoft Defender XDR alert",
+        title: row.title || "Defender security alert", subject: row.incident_id ? `Incident ${row.incident_id}` : row.alert_id,
+        severity: String(row.severity || "unknown").toLowerCase(), evidence: "security", ip: matchedIp,
+        confidence: correlation?.confidence, assets: matchedEntities,
+        description: [row.description, `${row.service_source || "Microsoft security provider"} · ${row.detection_source || row.category || "Alert"} · ${row.status || "unknown"}.`, correlation ? `Related incident has ${correlation.signal_types} matching canonical entity type(s).` : "No local incident correlation established."].filter(Boolean).join(" "),
+        types: [row.service_source, row.detection_source, row.category, row.status].filter(Boolean), timestamp: row.observed_at,
+        raw: {...row, correlation}});
     }
     const automationFindings = window.SocAutomation?.report?.findings || [];
     const automatedByIndicator = new Map(automationFindings.map(row => [row.indicator, row]));
-    const observed = new Map((d.source_ips || []).map(r => [r.ip, r]));
-    const crowd = new Map((state.crowdSecIntel?.rows || []).map(r => [r.ip, r]));
+    const observed = new Map(records(d.source_ips).filter(r => r.ip).map(r => [r.ip, r]));
+    const crowd = new Map(records(state.crowdSecIntel?.rows).filter(r => r.ip).map(r => [r.ip, r]));
     for (const ip of new Set([...observed.keys(), ...crowd.keys()])) {
       const local = observed.get(ip), ti = crowd.get(ip), automated = automatedByIndicator.get(ip);
       const cyfirmaMatches = automated?.cyfirma_matches || [];
@@ -87,8 +121,8 @@
       const confidence = local && providerMatches ? "confirmed_by_multi_source" : local ? "rule_matched" : "provider_only";
       rows.push({id: `ip:${ip}`, category: "ip", provider: providers.join(" / ") || "Wazuh", title: ip, subject: ti ? crowdLocation(ti) : cyfirmaMatches.length ? `${cyfirmaMatches.length} stored CYFIRMA exact match(es)` : "Location not returned", ip, severity: ti?.reputation === "malicious" || automated?.status === "suspected" ? "high" : ti?.reputation === "suspicious" ? "medium" : "unknown", evidence: local ? "observed" : "intel", confidence, count: local?.hits || automated?.event_total, description: ti ? crowdReason(ti) : cyfirmaMatches.length ? "Stored automation result matched this locally observed indicator to CYFIRMA intelligence. Validate event direction and impact before response." : "Source address in the Wazuh threat sample. Reputation has not been assessed.", types: [...(ti?.behaviors || []), ...cyfirmaMatches.flatMap(row => row.labels || [])], timestamp: automated?.enriched_at || (ti ? crowdHistory(ti) : null), crowd: ti, raw: {local, intelligence: ti, automation: automated, cyfirma_matches: cyfirmaMatches}});
     }
-    for (const t of d.ai_recon?.sources || []) rows.push({id: `recon:${t.srcip}`, category: "recon", provider: "Wazuh / INFOKOM", title: t.srcip, subject: "Automated probing pattern", ip: t.srcip, evidence: "observed", severity: t.sensitive_hits > 0 ? "high" : "medium", count: t.alerts, description: `${t.sensitive_hits} sensitive-path hits; ${t.unique_paths} distinct paths. Pattern-based detection does not confirm use of AI or successful compromise.`, types: ["Reconnaissance", "Sensitive path probing"], raw: t});
-    for (const [i, t] of (d.vulnerabilities?.critical_items || []).entries()) {
+    for (const t of records(d.ai_recon?.sources)) rows.push({id: `recon:${t.srcip}`, category: "recon", provider: "Wazuh / INFOKOM", title: t.srcip, subject: "Automated probing pattern", ip: t.srcip, evidence: "observed", severity: t.sensitive_hits > 0 ? "high" : "medium", count: t.alerts, description: `${t.sensitive_hits} sensitive-path hits; ${t.unique_paths} distinct paths. Pattern-based detection does not confirm use of AI or successful compromise.`, types: ["Reconnaissance", "Sensitive path probing"], raw: t});
+    for (const [i, t] of records(d.vulnerabilities?.critical_items).entries()) {
       const cve = t.cve || t.id || t.vulnerability?.id;
       rows.push({id: `vuln:${cve}:${i}`, category: "vuln", provider: "Wazuh inventory", title: cve, subject: t.package?.name || t.package_name, cve, severity: String(t.severity || "unknown").toLowerCase(), evidence: "inventory", description: t.description, assets: [t.agent?.name || t.agent?.id].filter(Boolean), types: [t.package?.name].filter(Boolean), raw: t});
     }
@@ -128,17 +162,35 @@
     const rows = filtered(), pageSize = 12;
     f.page = Math.min(f.page, Math.max(0, Math.ceil(rows.length / pageSize) - 1));
     const d = f.data || {};
+    const alertCount = f.coverage?.total_events ?? (d.alerts?.status === "available" ? d.alerts?.total_alerts : null);
+    const ruleCount = f.coverage?.rules?.length || d.threats?.length || 0;
+    const scope = f.coverageStatus === "ready"
+      ? (f.coverage?.coverage_warning || (f.coverage?.rules?.length
+          ? t(`${f.coverage.rules.length} rule unik dimuat; kandidat agregasi dibatasi`, `${f.coverage.rules.length} unique rules loaded; aggregation candidates are bounded`)
+          : t(`Agregasi tidak mengembalikan rule; memakai ${ruleCount} rule overview terbatas`, `Aggregation returned no rules; using ${ruleCount} bounded overview rules`)))
+      : f.coverageStatus === "loading"
+        ? t(`Memuat agregasi lengkap; ${ruleCount} rule dari overview sementara`, `Loading full aggregation; ${ruleCount} overview rules shown meanwhile`)
+        : f.coverageStatus === "error"
+          ? t(`Agregasi lengkap tidak tersedia; menampilkan overview terbatas${f.coverageError ? ` · ${f.coverageError}` : ""}`, `Full aggregation unavailable; showing bounded overview${f.coverageError ? ` · ${f.coverageError}` : ""}`)
+          : d.detail_materialization?.status === "building" || d.historical_detail?.status === "materializing" || d.materialization?.status === "building" || d.alerts?.status === "materializing"
+            ? t("Snapshot rentang ini sedang dimaterialisasi; detail belum tersedia", "This range snapshot is materializing; details are not available yet")
+            : d.detail_materialization?.status === "error"
+              ? t(`Detail historis gagal dimuat; tekan Refresh untuk mencoba lagi${d.detail_materialization.message ? ` · ${d.detail_materialization.message}` : ""}`, `Historical details failed to load; press Refresh to retry${d.detail_materialization.message ? ` · ${d.detail_materialization.message}` : ""}`)
+            : d.alerts?.status === "unavailable"
+              ? t("Sumber alert tidak tersedia; periksa status koneksi dan errors", "Alert source unavailable; check connection status and errors")
+              : t(`${ruleCount} rule pada overview terbatas; bukan seluruh alert`, `${ruleCount} rules in bounded overview; not the full alert set`);
+    q("#findingsScope").textContent = scope;
     q("#findingsSummary").innerHTML = [
-      [t("Alert pada window terpilih", "Alerts in selected window"), fmt.format(f.coverage?.total_events ?? d.alerts?.total_alerts ?? 0), f.coverage ? t(`${f.coverage.rules.length} rule dimuat dari agregasi indeks`, `${f.coverage.rules.length} rules loaded from index aggregation`) : t(`${fmt.format(d.alerts?.sampled || 0)} disampel untuk ranking ancaman`, `${fmt.format(d.alerts?.sampled || 0)} sampled for threat ranking`)],
+      [t("Alert pada window terpilih", "Alerts in selected window"), alertCount == null ? "-" : fmt.format(alertCount), f.coverage ? t(`${ruleCount} rule dimuat dari agregasi indeks`, `${ruleCount} rules loaded from index aggregation`) : scope],
       [t("Record prioritas tinggi", "High-priority records"), f.rows.filter(r => r.evidence !== "intel" && ["high", "critical"].includes(r.severity)).length, t("Dari temuan yang dimuat", "From the loaded findings")],
       [t("Kerentanan kritis", "Critical vulnerabilities"), d.vulnerabilities?.critical ?? "-", t(`${d.vulnerabilities?.affected_agents ?? "-"} aset terdampak (semua severity)`, `${d.vulnerabilities?.affected_agents ?? "-"} affected assets (all severities)`)],
       ["CYFIRMA context", Object.values(f.feeds).reduce((n, r) => n + (r.data?.summary?.count || 0), 0), t("Tersimpan untuk korelasi; feed umum tidak dihitung sebagai temuan", "Stored for correlation; general feed records are not counted as findings")],
       [t("Temuan dianalisis AI", "AI analyzed findings"), f.ai.size, t("Hasil per temuan disimpan agar analisis ulang instan", "Per-finding results are cached for instant reuse")]
     ].map(([name, value, hint]) => `<div><span>${esc(name)}</span><strong>${esc(value)}</strong><small>${esc(hint)}</small></div>`).join("");
     q("#findingsCategories").innerHTML = Object.entries(categories).map(([key, name]) => `<button type="button" data-finding-category="${key}" aria-pressed="${f.category === key}">${name}<span>${key === "all" ? f.rows.length : f.rows.filter(r => r.category === key).length}</span></button>`).join("");
-    q("#findingsCount").textContent = t(`${rows.length} record dimuat`, `${rows.length} loaded records`);
+    q("#findingsCount").textContent = t(`${rows.length} record ditampilkan`, `${rows.length} records shown`);
     const visible = rows.slice(f.page * pageSize, (f.page + 1) * pageSize);
-    q("#findingsRows").innerHTML = visible.map(r => `<article class="findingRowShell ${f.selected?.id === r.id ? "selected" : ""}"><button type="button" class="findingRow" data-finding-id="${esc(r.id)}" aria-pressed="${f.selected?.id === r.id}"><span class="findingRowMeta">${pill(r.severity === "unknown" ? t("Belum dinilai", "Not assessed") : r.severity, r.severity)}<span>${esc(categories[r.category])}</span></span><strong>${esc(r.title)}</strong><span class="findingSubject">${esc(r.subject || r.description)}</span><span class="findingRowFoot"><span>${esc(evidenceLabels[r.evidence])}</span><span>${r.count == null ? esc(r.provider) : `${fmt.format(r.count)} ${r.countScope ? t("event terindeks", "indexed events") : r.category === "ip" ? t("asosiasi rule", "rule associations") : t("hit sampel", "sample hits")}`}</span></span></button><button type="button" class="findingAiButton" data-finding-ai="${esc(r.id)}" aria-label="${esc(t(`Jalankan analisis AI untuk ${r.title}`, `Run AI analysis for ${r.title}`))}">${f.ai.has(r.id) ? t("Lihat analisis AI", "View AI analysis") : f.aiJobs.has(r.id) ? t("Lihat progres AI", "View AI progress") : t("Run AI Analysis", "Run AI Analysis")}</button></article>`).join("") || `<div class="findingEmpty">${t("Tidak ada record yang cocok pada data dimuat.", "No matching records in the loaded data.")}</div>`;
+    q("#findingsRows").innerHTML = visible.map(r => `<article class="findingRowShell ${f.selected?.id === r.id ? "selected" : ""}"><button type="button" class="findingRow" data-finding-id="${esc(r.id)}" aria-pressed="${f.selected?.id === r.id}"><span class="findingRowMeta">${pill(r.severity === "unknown" ? t("Belum dinilai", "Not assessed") : r.severity, r.severity)}<span>${esc(categories[r.category])}</span></span><strong>${esc(r.title)}</strong><span class="findingSubject">${esc(r.subject || r.description)}</span><span class="findingRowFoot"><span>${esc(evidenceLabels[r.evidence])}</span><span>${r.count == null ? esc(r.provider) : `${fmt.format(r.count)} ${r.countScope ? t("event terindeks", "indexed events") : r.category === "ip" ? t("asosiasi rule", "rule associations") : t("hit sampel", "sample hits")}`}</span></span></button><button type="button" class="findingAiButton" data-finding-ai="${esc(r.id)}" aria-label="${esc(t(`Jalankan analisis AI untuk ${r.title}`, `Run AI analysis for ${r.title}`))}">${f.ai.has(r.id) ? t("Lihat analisis AI", "View AI analysis") : f.aiJobs.has(r.id) ? t("Lihat progres AI", "View AI progress") : t("Run AI Analysis", "Run AI Analysis")}</button></article>`).join("") || `<div class="findingEmpty">${rows.length ? t("Tidak ada record yang cocok dengan filter ini.", "No records match these filters.") : esc(scope)}</div>`;
     q("#findingsPagination").innerHTML = `<button type="button" data-finding-page="-1" ${f.page === 0 ? "disabled" : ""}>Previous</button><span>${rows.length ? f.page + 1 : 0} / ${Math.ceil(rows.length/pageSize)}</span><button type="button" data-finding-page="1" ${(f.page+1)*pageSize >= rows.length ? "disabled" : ""}>Next</button>`;
     if (!f.selected || !rows.some(r => r.id === f.selected.id)) {
       if (visible[0]) select(visible[0]);
@@ -217,7 +269,7 @@
 
   function select(row) {
     f.selected = row; f.tab = "overview"; const sequence = ++f.sequence;
-    q("#findingDetail").innerHTML = `<div class="findingDetailHead"><div class="findingDetailLead"><div>${pill(evidenceLabels[row.evidence])}${pill(row.severity === "unknown" ? t("Belum dinilai", "Not assessed") : row.severity, row.severity)}</div><h2>${esc(row.title)}</h2><p>${esc(row.subject || row.provider)}</p><small>${esc(row.provider)}${row.timestamp ? ` | ${esc(row.timestamp)}` : ""}</small></div><button type="button" class="findingAiPrimary" data-finding-ai="${esc(row.id)}">${f.ai.has(row.id) ? t("Buka analisis AI", "Open AI analysis") : f.aiJobs.has(row.id) ? t("Lihat progres AI", "View AI progress") : t("Run AI Analysis", "Run AI Analysis")}</button></div><div class="findingDetailTabs" role="tablist"><button role="tab" aria-selected="true" data-finding-tab="overview">${t("Ringkasan", "Overview")}</button><button role="tab" aria-selected="false" data-finding-tab="evidence">${t("Bukti lokal", "Local evidence")}</button><button role="tab" aria-selected="false" data-finding-tab="intel">${t("Intelijen ancaman", "Threat intelligence")}</button><button role="tab" aria-selected="false" data-finding-tab="cve">${t("Konteks CVE", "CVE context")}</button><button role="tab" aria-selected="false" data-finding-tab="ai">AI Analyst</button></div><div class="findingTab" data-finding-panel="overview">${overview(row)}</div><div class="findingTab" data-finding-panel="evidence" hidden><div id="findingEvents" class="findingEmpty">${t("Buka tab untuk memuat bukti lokal.", "Open this tab to load local evidence.")}</div></div><div class="findingTab" data-finding-panel="intel" hidden><div id="findingProviders" class="findingEmpty">${t("Buka tab untuk memuat konsensus provider.", "Open this tab to load provider consensus.")}</div><div id="findingWorkflowTools"></div></div><div class="findingTab" data-finding-panel="cve" hidden><div id="findingCves">${section(t("Kerentanan terkait", "Referenced vulnerabilities"), cveButtons(cveIds(row.raw))) + warning(row.category === "vuln" ? t("Wazuh melaporkan CVE ini pada inventaris aset. Eksploitasi belum terkonfirmasi.", "Wazuh reported this CVE in asset inventory. Exploitation is not confirmed.") : t("Referensi CVE penyedia menjelaskan aktivitas yang dilaporkan. Paparan lokal harus dicek terpisah.", "Provider CVE references describe reported activity. Local exposure must be checked separately."))}</div></div><div class="findingTab" data-finding-panel="ai" hidden><div id="findingAiResult">${f.ai.has(row.id) ? renderFindingAi(f.ai.get(row.id)) : f.aiJobs.has(row.id) ? findingAiProgress(f.aiJobs.get(row.id)) : `<div class="findingAiEmpty"><strong>${t("Analisis terarah belum dijalankan", "Targeted analysis has not run")}</strong><p>${t("AI hanya menerima konteks terpilih yang dibatasi, bukan jutaan log mentah.", "AI receives bounded selected context, not millions of raw logs.")}</p><button type="button" class="findingAiPrimary" data-finding-ai="${esc(row.id)}">${t("Run AI Analysis", "Run AI Analysis")}</button></div>`}</div></div>`;
+    q("#findingDetail").innerHTML = `<div class="findingDetailHead"><div class="findingDetailLead"><div>${pill(evidenceLabels[row.evidence])}${pill(row.severity === "unknown" ? t("Belum dinilai", "Not assessed") : row.severity, row.severity)}</div><h2>${esc(row.title)}</h2><p>${esc(row.subject || row.provider)}</p><small>${esc(row.provider)}${row.timestamp ? ` | ${esc(row.timestamp)}` : ""}</small></div><button type="button" class="findingAiPrimary" data-finding-ai="${esc(row.id)}">${f.ai.has(row.id) ? t("Buka analisis AI", "Open AI analysis") : f.aiJobs.has(row.id) ? t("Lihat progres AI", "View AI progress") : t("Run AI Analysis", "Run AI Analysis")}</button></div><div class="findingDetailTabs" role="tablist"><button role="tab" aria-selected="true" data-finding-tab="overview">${t("Ringkasan", "Overview")}</button><button role="tab" aria-selected="false" data-finding-tab="evidence">${t("Bukti lokal", "Local evidence")}</button><button role="tab" aria-selected="false" data-finding-tab="intel">${t("Intelijen ancaman", "Threat intelligence")}</button><button role="tab" aria-selected="false" data-finding-tab="cve">${t("Konteks CVE", "CVE context")}</button><button role="tab" aria-selected="false" data-finding-tab="ai">AI Analyst</button></div><div class="findingTab" data-finding-panel="overview">${overview(row)}</div><div class="findingTab" data-finding-panel="evidence" hidden><div id="findingEvents" class="findingEmpty">${t("Buka tab untuk memuat bukti lokal.", "Open this tab to load local evidence.")}</div></div><div class="findingTab" data-finding-panel="intel" hidden><div id="findingProviders" class="findingEmpty">${section(t("Status Threat Intel indikator", "Indicator Threat Intel status"), `<div class="findingTags">${pill(t("Not tried", "Not tried"), "unknown")}</div><p>${t("Belum ada provider yang dipanggil. Buka tab untuk menjalankan lookup teragregasi.", "No provider has been queried. Open the tab to run the aggregated lookup.")}</p>`)}</div><div id="findingWorkflowTools"></div></div><div class="findingTab" data-finding-panel="cve" hidden><div id="findingCves">${section(t("Kerentanan terkait", "Referenced vulnerabilities"), cveButtons(cveIds(row.raw)) + warning(row.category === "vuln" ? t("Wazuh melaporkan CVE ini pada inventaris aset. Eksploitasi belum terkonfirmasi.", "Wazuh reported this CVE in asset inventory. Exploitation is not confirmed.") : t("Referensi CVE penyedia menjelaskan aktivitas yang dilaporkan. Paparan lokal harus dicek terpisah.", "Provider CVE references describe activity reported by the provider. Check local exposure separately.")))}</div></div><div class="findingTab" data-finding-panel="ai" hidden><div id="findingAiResult">${f.ai.has(row.id) ? renderFindingAi(f.ai.get(row.id)) : f.aiJobs.has(row.id) ? findingAiProgress(f.aiJobs.get(row.id)) : `<div class="findingAiEmpty"><strong>${t("Analisis terarah belum dijalankan", "Targeted analysis has not run")}</strong><p>${t("AI hanya menerima konteks terpilih yang dibatasi, bukan jutaan log mentah.", "AI receives bounded selected context, not millions of raw logs.")}</p><button type="button" class="findingAiPrimary" data-finding-ai="${esc(row.id)}">${t("Run AI Analysis", "Run AI Analysis")}</button></div>`}</div></div>`;
     document.querySelectorAll(".findingRow").forEach(el => { const selected = el.dataset.findingId === row.id; el.closest(".findingRowShell")?.classList.toggle("selected", selected); el.setAttribute("aria-pressed", String(selected)); });
     loadFeedback(row, sequence);
   }
@@ -227,13 +279,14 @@
     let fields;
     if (row.category === "vuln") fields = field("Affected asset", labels(row.assets).join(", ")) + field("Package", r.package?.name) + field("Installed version", r.package?.version) + field("Inventory severity", r.severity) + field("Published", r.published_at) + field("Vendor advisory", r.reference);
     else if (row.category === "cyfirma") fields = field("Indicator", row.indicator) + field("Scope", row.scope) + field("Source confidence (0-100)", r.confidence) + field("Local exposure", row.raw?.local_matches?.length ? "Matched Wazuh telemetry" : "Not established") + field("Created", r.created) + field("Modified", r.modified);
-    else if (row.category === "defender") fields = field("Defender incident", r.incident_id || r.alert_id) + field("Correlation cluster", r.correlation?.cluster_id || r.cluster_id) + field("Status", r.status) + field("Classification", r.category) + field("Matched IP", r.correlation?.matches?.ip) + field("Matched identity", r.correlation?.matches?.identity) + field("Matched asset", r.correlation?.matches?.asset) + field("Evidence records", r.correlation?.evidence_ids?.length) + field("Correlation confidence", r.correlation?.confidence || "No strong canonical entity match") + field("Case workflow", r.correlation?.case_candidate ? "Candidate only; analyst approval required" : "No candidate created");
+    else if (row.category === "defender") fields = field("Record type", r.record_type || (r.incident_id ? "incident" : "alert")) + field("Incident ID", r.incident_id || "-") + field("Alert ID", r.alert_id || "-") + field("Service source", r.service_source || r.data?.serviceSource || r.data?.productName) + field("Detection source", r.detection_source || r.data?.detectionSource) + field("ATT&CK techniques", r.mitre_techniques || r.data?.mitreTechniques) + field("Correlation cluster", r.correlation?.cluster_id || r.cluster_id) + field("Status", r.status) + field("Classification", r.category) + field("Matched IP", r.correlation?.matches?.ip) + field("Matched identity", r.correlation?.matches?.identity) + field("Matched asset", r.correlation?.matches?.asset) + field("Evidence records", r.correlation?.evidence_ids?.length) + field("Correlation confidence", r.correlation?.confidence || "No strong canonical entity match") + field("Case workflow", r.correlation?.case_candidate ? "Candidate only; analyst approval required" : "No candidate created");
     else if (row.category === "observable") fields = field(t("Indikator", "Indicator"), row.indicator) + field(t("Sumber", "Source"), row.provider) + field(t("Status bukti", "Evidence status"), t("Periksa event yang cocok di Local evidence", "Check matching events in Local evidence"));
     else fields = field("Source IP", row.ip) + field("Source address ownership", row.crowd?.as_name) + field("IP geolocation", row.crowd ? crowdLocation(row.crowd) : null) + field("Affected asset / account", labels(row.assets).join(", ")) + field("First seen", r.first_seen || r.created) + field("Last seen", row.timestamp);
     const iocFields = row.category === "cyfirma" ? section("IOC context", `<dl class="findingFields">${field("Scope", row.scope)}${field("Provider confidence (0-100)", r.confidence)}${field("Valid from", r.valid_from)}${field("Valid until", r.valid_until)}${field("STIX pattern", r.pattern)}</dl>${row.raw?.local_matches?.length ? section("Matched Wazuh indicators", `<div class="findingTags">${row.raw.local_matches.map(m => `<span class="findingTag">${esc(m.indicator)} · ${esc(m.kind)} · ${fmt.format(Number(m.occurrences || 0))} hits</span>`).join("")}</div>`) : ""}${section("Indicators", `<div class="findingTags">${chips(r.iocs)}</div>`)}${section("Kill chain phases", chips((r.kill_chain_phases || []).map(p => p.phase_name)))}`) : "";
     const defenderNotice = row.category === "defender" && r.correlation?.case_candidate ? warning("A local entity match was stored. Review the evidence, then use Analyst disposition to create or update a persistent case.") : "";
     const orgCve = row.category === "vuln" && Array.isArray(r.cyfirma_org_vulnerability) && r.cyfirma_org_vulnerability.length ? section("CYFIRMA Organization CVE context", `<div class="findingTags">${r.cyfirma_org_vulnerability.map(item => `<span class="findingTag">${esc(item.name || "Organization vulnerability context")} · confidence ${esc(item.confidence ?? 0)}</span>`).join("")}</div>`) : "";
-    return section(t("Makna alert / alasan temuan", "Alert meaning / finding reason"), `<p>${esc(row.description || t("Sumber tidak memberikan deskripsi.", "Source did not provide a description."))}</p>${r.analysis ? `<p class="findingMuted">${esc(r.analysis.original)}</p><p>${esc(ax(r.analysis, "cve_context"))}</p>` : ""}${row.evidence === "intel" ? warning(t("Intelijen eksternal. Kecocokan lokal belum dibuktikan untuk record ini.", "External intelligence. No local match has been established for this record.")) : ""}${defenderNotice}`) + section("Context", `<dl class="findingFields">${fields}${field("Evidence confidence", row.confidence || r.detection?.confidence)}</dl>`) + sourceMap(row) + section(t("Klasifikasi / perilaku", "Classification / behavior"), `<div class="findingTags">${chips(row.crowd?.behaviors || row.types)}</div>`) + (row.category === "recon" ? section(t("Path sensitif yang diamati", "Observed sensitive paths"), `<div class="findingPaths">${labels(r.sensitive_paths).map(p => `<code>${esc(p)}</code>`).join("")}</div>`) : "") + iocFields + orgCve + section(t("Saran tindakan analis", "Analyst recommended actions"), `<ol class="findingActions">${recommendations(row).map(item => `<li>${esc(item)}</li>`).join("")}</ol><p class="findingMuted">${t("Panduan analisis. Tidak ada tindakan pemblokiran yang dijalankan.", "Analysis guidance. No blocking action has been executed.")}</p>`) + raw(r);
+    const defenderLink = row.category === "defender" && r.alert_url ? section("Defender portal", safeLink(r.alert_url, "Open alert in Microsoft Defender")) : "";
+    return section(t("Makna alert / alasan temuan", "Alert meaning / finding reason"), `<p>${esc(row.description || t("Sumber tidak memberikan deskripsi.", "Source did not provide a description."))}</p>${r.analysis ? `<p class="findingMuted">${esc(r.analysis.original)}</p><p>${esc(ax(r.analysis, "cve_context"))}</p>` : ""}${row.evidence === "intel" ? warning(t("Intelijen eksternal. Kecocokan lokal belum dibuktikan untuk record ini.", "External intelligence. No local match has been established for this record.")) : ""}${defenderNotice}`) + section("Context", `<dl class="findingFields">${fields}${field("Evidence confidence", row.confidence || r.detection?.confidence)}</dl>`) + defenderLink + sourceMap(row) + section(t("Klasifikasi / perilaku", "Classification / behavior"), `<div class="findingTags">${chips(row.crowd?.behaviors || row.types)}</div>`) + (row.category === "recon" ? section(t("Path sensitif yang diamati", "Observed sensitive paths"), `<div class="findingPaths">${labels(r.sensitive_paths).map(p => `<code>${esc(p)}</code>`).join("")}</div>`) : "") + iocFields + orgCve + section(t("Saran tindakan analis", "Analyst recommended actions"), `<ol class="findingActions">${recommendations(row).map(item => `<li>${esc(item)}</li>`).join("")}</ol><p class="findingMuted">${t("Panduan analisis. Tidak ada tindakan pemblokiran yang dijalankan.", "Analysis guidance. No blocking action has been executed.")}</p>`) + raw(r);
   }
 
   function sourceMap(row) {
@@ -299,30 +352,48 @@
   }
   function providerBlock(name, data, error = "", subtitle = "") {
     const details = data?.detail || data || {};
-    const failed = error || data?.error;
-    const skipped = details.skipped;
+    const intelStatus = data?.intel_status;
+    const failed = intelStatus ? intelStatus === "provider_error" ? (error || data?.error) : "" : error || data?.error;
+    const skipped = intelStatus === "skipped" ? (data?.intel_reason || details.skipped || "Provider was not queried") : details.skipped;
+    const notReported = intelStatus === "not_reported" ? (data?.intel_reason || "Aggregator did not report this provider") : "";
     const verdict = data?.reputation || data?.classification || data?.risk_level;
-    const status = failed ? /429|rate.limit/i.test(text(failed)) ? "API quota / rate limit" : "Unavailable" : skipped ? "Not applicable" : details.analysis_stats?.suspicious > 0 && !data?.is_malicious ? "Suspicious engine result" : verdict === "none" ? "No adverse verdict" : verdict || "Context returned";
+    const status = intelStatus === "match" ? t("Match", "Match") : intelStatus === "no_match" ? t("Checked · no match", "Checked · no match") : intelStatus === "skipped" ? t("Skipped", "Skipped") : intelStatus === "provider_error" || failed ? /429|rate.limit/i.test(text(failed)) ? "API quota / rate limit" : t("Provider error", "Provider error") : intelStatus === "not_tried" ? t("Not queried", "Not queried") : intelStatus === "not_reported" ? t("No provider result", "No provider result") : details.analysis_stats?.suspicious > 0 && !data?.is_malicious ? "Suspicious engine result" : verdict === "none" ? t("Checked · no match", "Checked · no match") : verdict || t("Result not classified", "Result not classified");
     const types = [...list(data?.behaviors), ...list(data?.classifications), ...list(data?.tags), ...list(data?.attack_techniques), ...list(data?.malware_families)];
     const core = Object.fromEntries(Object.entries(details).filter(([key]) => ["reputation", "classification", "confidence", "background_noise", "pulse_count", "match_count", "scanned", "last_seen", "as_name", "as_owner", "country", "message", "cve_id", "cvss_score", "severity", "components", "in_kev", "known_exploited", "risk_score", "risk_label", "urgency", "epss_probability", "description"].includes(key)));
-    return `<details class="findingProvider" open><summary><strong>${esc(name)}</strong>${pill(status, failed ? "medium" : data?.is_malicious || data?.reputation === "malicious" ? "high" : "unknown")}</summary><div class="findingProviderBody"><small>${esc(subtitle)}</small>${failed ? warning(text(failed)) : skipped ? warning(skipped) : `<p>${esc(data?.why || (name === "CrowdSec" && data?.reputation ? crowdReason(data) : data?.is_malicious === true ? t("Penyedia melaporkan konteks berbahaya untuk indikator ini. Validasi dampaknya pada bukti lokal.", "The provider reports adverse context for this indicator. Validate impact against local evidence.") : t("Tidak ada verdict berbahaya bukan jaminan aman. Periksa bukti, cakupan dan waktu data penyedia.", "No adverse verdict is not a safety guarantee. Check provider evidence, coverage and data timing.")))}</p><div class="findingTags">${chips(types)}</div><dl class="findingFields">${providerFacts(core)}</dl>${providerCollections(data, details)}${data?.mitre_techniques ? section("MITRE ATT&CK (provider)", chips(data.mitre_techniques)) : ""}${cveIds(data).length ? section("CVE references", cveButtons(cveIds(data))) : ""}<details class="findingRaw"><summary>${t("Detail penilaian penyedia", "Provider assessment detail")}</summary><dl class="findingFields">${providerFacts(details)}</dl></details>${raw(data)}`}</div></details>`;
+    const explanation = intelStatus === "no_match" ? t("Provider berhasil diperiksa dan tidak mengembalikan match untuk indikator ini. Ini bukan bukti indikator aman.", "Provider was queried and returned no match for this indicator. This does not prove the indicator is safe.") : data?.why || (name === "CrowdSec" && data?.reputation ? crowdReason(data) : data?.is_malicious === true ? t("Penyedia melaporkan konteks berbahaya untuk indikator ini. Validasi dampaknya pada bukti lokal.", "The provider reports adverse context for this indicator. Validate impact against local evidence.") : t("Hasil provider tersedia; verifikasi cakupan dan waktu data sebelum menyimpulkan.", "Provider data is available; verify scope and freshness before drawing conclusions."));
+    return `<details class="findingProvider" open><summary><strong>${esc(name)}</strong>${pill(status, intelStatus === "provider_error" || failed ? "medium" : intelStatus === "match" || data?.is_malicious || data?.reputation === "malicious" ? "high" : "unknown")}</summary><div class="findingProviderBody"><small>${esc(subtitle)}${data?.cache_status ? ` · ${t("status cache", "cache")}: ${esc(data.cache_status)}` : ""}</small>${failed ? warning(text(failed)) : skipped ? warning(skipped) : notReported ? warning(notReported) : `<p>${esc(explanation)}</p><div class="findingTags">${chips(types)}</div><dl class="findingFields">${providerFacts(core)}</dl>${providerCollections(data, details)}${data?.mitre_techniques ? section("MITRE ATT&CK (provider)", chips(data.mitre_techniques)) : ""}${cveIds(data).length ? section("CVE references", cveButtons(cveIds(data))) : ""}<details class="findingRaw"><summary>${t("Detail penilaian penyedia", "Provider assessment detail")}</summary><dl class="findingFields">${providerFacts(details)}</dl></details>${raw(data)}`}</div></details>`;
   }
 
   async function loadIntel(row, sequence) {
     const indicator = indicatorOf(row);
-    if (!indicator || (row.ip && !isPublicObservableIp(row.ip))) { q("#findingProviders").innerHTML = warning(row.ip ? t("IP internal atau tidak didukung. Lookup intelijen eksternal dilewati.", "Internal or unsupported IP. External intelligence lookup was skipped.") : t("Tidak ada indikator sumber yang didukung pada record ini. Review bukti lokal atau konteks CVE.", "No supported source indicator on this record. Review local evidence or CVE context.")); return; }
-    q("#findingProviders").innerHTML = `<div class="findingIntelTarget">${esc(indicator)}</div>${section(t("Konsensus lintas provider", "Cross-provider consensus"), `<p class="findingLoading">${t("Mengambil satu hasil agregat ter-cache...", "Fetching one cached aggregate result...")}</p>`)}`;
+    if (!indicator || (row.ip && !isPublicObservableIp(row.ip))) {
+      const status = row.ip ? "skipped" : "not_tried";
+      const message = row.ip ? t("IP internal atau tidak didukung; kebijakan melewati lookup eksternal.", "Internal or unsupported IP; policy skipped external lookup.") : t("Tidak ada indikator sumber yang didukung; belum ada provider yang dipanggil.", "No supported source indicator; no provider was queried.");
+      q("#findingProviders").innerHTML = section(t("Status Threat Intel indikator", "Indicator Threat Intel status"), `<div class="findingTags">${pill(status === "skipped" ? t("Skipped", "Skipped") : t("Not tried", "Not tried"), "unknown")}</div>${warning(message)}`);
+      return;
+    }
+    q("#findingProviders").innerHTML = `<div class="findingIntelTarget">${esc(indicator)}</div>${section(t("Konsensus lintas provider", "Cross-provider consensus"), `<p class="findingLoading">${t("Memeriksa cache lalu menghubungi provider yang tersedia...", "Checking cache, then querying eligible providers...")}</p>`)}`;
     try {
       const result = await intel("aggregate", indicator);
       if (sequence !== f.sequence) return;
       const data = result.data || {}, results = list(data.results).filter(item => item && typeof item === "object");
+      const providerStates = list(data.provider_statuses);
       row.providerResults = results.map(item => {
         const matched = Boolean(item.is_malicious || item.matched || list(item.matches).length || ["critical","high","malicious","suspicious"].includes(String(item.risk_level || item.risk || "").toLowerCase()));
-        return {provider: item.provider || "Unknown", status: item.error ? "error" : matched ? "matched" : "context", summary: text(item.summary || item.why || item.risk_level || item.classification || item.error || "Provider returned context")};
+        const state = providerStates.find(status => String(status.provider).toLowerCase() === String(item.provider || "").toLowerCase());
+        return {provider: item.provider || "Unknown", status: state?.status || (item.error ? "provider_error" : matched ? "match" : "no_match"), summary: text(state?.reason || item.summary || item.why || item.risk_level || item.classification || item.error || "Provider response received")};
       });
-      const subtitle = `${result.memory_reused ? t("Memori historis", "Historical memory") : result.cached ? t("Cache lokal", "Local cache") : t("Lookup baru", "New lookup")} · ${result.generated_at || "now"}`;
-      const blocks = results.map(item => providerBlock(item.provider || "Unknown", item, item.error, subtitle)).join("");
-      q("#findingProviders").innerHTML = `<div class="findingIntelTarget">${esc(indicator)}</div><div class="findingConsensusSummary"><div><span>${t("Hasil provider", "Provider results")}</span><strong>${fmt.format(results.length)}</strong></div><div><span>${t("Match berbahaya", "Adverse matches")}</span><strong>${fmt.format(row.providerResults.filter(item => item.status === "matched").length)}</strong></div><div><span>${t("Error / dilewati", "Errors / skipped")}</span><strong>${fmt.format(results.filter(item => item.error || item.detail?.skipped).length)}</strong></div><div><span>CYFIRMA</span><strong>${fmt.format(list(data.cyfirma_matches).length)}</strong></div></div>${blocks || providerBlock("Provider consensus", data, !result.ok ? result.error || result.text || "No provider result" : "", subtitle)}`;
+      const cacheStatus = data.lookup?.cache_status || result.cache?.status || (result.cached ? "hit" : "miss");
+      const subtitle = `${result.memory_reused ? t("Memori historis", "Historical memory") : cacheStatus === "hit" ? t("Cache lokal", "Local cache") : t("Lookup baru", "New lookup")} · ${result.generated_at || "now"}`;
+      const stateFor = item => providerStates.find(status => String(status.provider).toLowerCase() === String(item.provider || "").toLowerCase());
+      const represented = new Set(results.map(item => String(item.provider || "").toLowerCase()));
+      const blocks = results.map(item => { const state = stateFor(item); return providerBlock(item.provider || "Unknown", {...item, intel_status: state?.status, intel_reason: state?.reason, cache_status: cacheStatus}, item.error, subtitle); }).join("") + providerStates.filter(item => !represented.has(String(item.provider || "").toLowerCase())).map(item => providerBlock(item.provider, {intel_status: item.status, intel_reason: item.reason, cache_status: cacheStatus}, "", subtitle)).join("");
+      const matchedCount = providerStates.filter(item => item.status === "match").length;
+      const noMatchCount = providerStates.filter(item => item.status === "no_match").length;
+      const errorCount = providerStates.filter(item => item.status === "provider_error").length;
+      const skippedCount = providerStates.filter(item => item.status === "skipped").length;
+      const aggregateMessage = data.lookup?.status === "all_skipped" ? t("Tidak ada provider yang eligible/terkonfigurasi; belum ada pemeriksaan reputasi.", "No provider was eligible/configured; reputation was not checked.") : data.lookup?.status === "provider_results_unreported" ? t("Aggregator dipanggil, tetapi tidak mengembalikan status per provider. Hasil tidak dapat dianggap no-match.", "The aggregator was called but returned no per-provider status. This cannot be treated as a no-match.") : "";
+      q("#findingProviders").innerHTML = `<div class="findingIntelTarget">${esc(indicator)}</div><div class="findingConsensusSummary"><div><span>${t("Provider dilaporkan", "Providers reported")}</span><strong>${fmt.format(data.lookup?.providers_reported ?? providerStates.length ?? results.length)}</strong></div><div><span>${t("Match", "Matches")}</span><strong>${fmt.format(matchedCount)}</strong></div><div><span>${t("No match teruji", "Checked · no match")}</span><strong>${fmt.format(noMatchCount)}</strong></div><div><span>${t("Error / dilewati", "Errors / skipped")}</span><strong>${fmt.format(errorCount + skippedCount)}</strong></div></div>${aggregateMessage ? warning(aggregateMessage) : ""}${blocks || providerBlock("Provider consensus", data, !result.ok ? result.error || result.text || "Provider result unavailable" : "", subtitle)}`;
       const crowd = results.find(item => String(item.provider || "").toLowerCase() === "crowdsec");
       if (crowd && !crowd.error) {
         row.crowd = crowd.detail || crowd;
@@ -399,27 +470,56 @@
     const citations = list(result.source_fact_citations);
     const unverified = list(result.unverified_source_facts);
     const facts = list(result.source_facts);
-    const cited = citations.map(item => `<li>${esc(item.fact || "Source fact")}<small>${t("Evidence ID", "ID bukti")}: ${esc(list(item.evidence_ids).join(", ") || "-")}</small></li>`);
+    const cited = citations.map(item => `<li>${esc(item.fact || "Source fact")}<small>${t("Reference ID tersedia dalam konteks input", "Reference ID available in input context")}: ${esc(list(item.evidence_ids).join(", ") || "-")} · ${t("ini memvalidasi ketersediaan referensi saja; dukungan semantik belum dinilai", "this validates reference availability only; semantic support is not assessed")}</small></li>`);
     const uncited = unverified.map(item => `<li class="findingUnverifiedFact">${esc(item)}<small>${t("Belum diverifikasi: model tidak mengutip ID bukti yang tersedia", "Unverified: model did not cite an available evidence ID")}</small></li>`);
     const alreadyCited = new Set(citations.map(item => item.fact));
     facts.filter(item => !alreadyCited.has(item)).forEach(item => uncited.push(`<li class="findingUnverifiedFact">${esc(item)}<small>${t("Belum diverifikasi: sitasi tidak tersedia", "Unverified: citation unavailable")}</small></li>`));
     const rows = [...cited, ...uncited];
     return rows.length ? section(t("Fakta sumber", "Source facts"), `<ul class="findingAiList">${rows.join("")}</ul>`) : "";
   }
+  function relatedEvidenceSection(related) {
+    if (!related) return "";
+    const events = list(related.events);
+    const status = related.status === "available" ? t("Bukti terkait tersedia", "Related evidence available") :
+      related.status === "no_events" ? t("Tidak ada bukti terkait di entity graph untuk rentang ini", "No related evidence in the entity graph for this range") :
+      related.status === "unavailable" ? t("Entity graph tidak tersedia", "Entity graph unavailable") : t("Tidak ada entitas kanonis yang didukung", "No supported canonical entity");
+    const entities = list(related.query_entities).map(item => `${item.entity_type || item.type}: ${item.entity_value || item.value}`);
+    const rows = events.map(event => `<li><strong>${esc(event.timestamp || "Time unavailable")} · ${esc(event.source || "source unavailable")}</strong><span>${esc(event.title || "Related evidence")}</span><small>ID ${esc(event.evidence_id || "-")}${event.source_record_id ? ` · source record ${esc(event.source_record_id)}` : ""}${event.rule_id ? ` · rule ${esc(event.rule_id)}` : ""}</small>${list(event.attack_techniques).length ? `<small>ATT&amp;CK: ${esc(list(event.attack_techniques).map(item => item.id || item.technique || item).join(", "))}</small>` : ""}</li>`).join("");
+    return section(t("Bukti terkait dari entity graph", "Related evidence from entity graph"), `<p>${esc(status)} · ${events.length} ${t("event", "events")}${related.truncated ? ` · ${t("hasil dibatasi", "limited results")}` : ""}</p>${related.reason ? warning(related.reason) : ""}${entities.length ? `<p class="findingMuted">${t("Entitas pencarian", "Query entities")}: ${esc(entities.join(" · "))}</p>` : ""}${rows ? `<ol class="findingAiList">${rows}</ol>` : ""}<p class="findingMuted">${esc(related.interpretation || t("Urutan bukti terkait; bukan hubungan sebab-akibat atau attack path.", "Related evidence sequence; not causation or an attack path."))}</p>`);
+  }
   function renderFindingAiBody(payload) {
     const result = payload?.result || {}, verdict = result.verdict || {}, actions = result.actions || {};
     const providers = list(result.provider_consensus);
+    const assets = list(result.affected_assets);
     const cves = list(result.cves);
     const flow = result.network_flow || {};
     const flowSection = Object.keys(flow).length ? section(t("Arah serangan", "Attack direction"), `<dl class="findingFields">${field(t("Kategori", "Category"), result.attack_category)}${field("Source", flow.source)}${field("Destination", flow.destination)}${field("Direction", flow.direction)}${field("Protocol / ports", [flow.protocol, flow.ports].filter(Boolean).join(" / "))}${field("Action", flow.action)}${field("Evidence", list(flow.evidence).join(", "))}</dl>`) : "";
-    return `<div class="findingAiAssessment"><div class="findingAiVerdict"><div><span>${t("AI ANALYST · ADVISORY", "AI ANALYST · ADVISORY")}</span><strong>${esc(verdict.status || "needs_review")}</strong><small>${esc(`${verdict.severity || "unknown"} severity · ${verdict.confidence || "low"} confidence`)}</small></div><div><span>${t("MODEL", "MODEL")}</span><strong>${esc(payload.model || "local fallback")}</strong><small>${esc(payload.cache?.status === "hit" ? t("Hasil tersimpan", "Stored result") : `${payload.elapsed_seconds || 0}s`)}</small></div></div><p class="findingAiSummary">${esc(result.summary || t("Tidak ada ringkasan AI.", "No AI summary returned."))}</p>${verdict.reason ? warning(verdict.reason) : ""}${flowSection}${sourceFactsSection(result)}${aiList(t("Aktivitas identitas", "Identity activity"), result.identity_activity)}${aiList(t("Dampak data", "Data impact"), result.data_impact)}${section(t("Inferensi analis", "Analyst inference"), `<p>${esc(result.inference || "-")}</p>`)}${providers.length ? section(t("Konsensus provider", "Provider consensus"), `<div class="findingConsensus">${providers.map(p => `<article><strong>${esc(p.provider || "Unknown")}</strong>${pill(p.status || "unknown", /match|malicious/i.test(p.status || "") ? "high" : /error/i.test(p.status || "") ? "medium" : "unknown")}<p>${esc(p.signal || "No provider detail")}</p></article>`).join("")}</div>`) : ""}${cves.length ? section(t("Penilaian CVE", "CVE assessment"), `<div class="findingCveAi">${cves.map(c => `<article><strong>${esc(c.cve || "CVE")}</strong><span>${esc(c.relationship || "referenced")} · ${esc(c.local_exposure || "not verified")}</span><p>${esc(c.reason || "")}</p></article>`).join("")}</div>`) : ""}${["l1","l2","l3","response"].map(lane => aiList(`${lane.toUpperCase()} ${t("tindakan", "actions")}`, actions[lane])).join("")}${aiList(t("Quality checks", "Quality checks"), result.quality_checks)}${aiList(t("Kesenjangan bukti", "Evidence gaps"), result.gaps)}<p class="findingMuted">${t("Hasil AI bersifat advisory. Validasi bukti asli sebelum containment.", "AI output is advisory. Validate original evidence before containment.")}</p></div>`;
+    const assetSection = assets.length ? section(t("Entitas dan aset pada bukti", "Entities and assets in evidence"), `<div class="findingConsensus">${assets.map(a => `<article><strong>${esc(a.asset || "Unknown")}</strong>${pill(a.role || "unknown")}<p>${esc(a.evidence || "-")}</p><small>${t("Impact", "Impact")}: ${esc(a.impact_status || "not_established")} · ${esc(list(a.evidence_ids).join(", ") || "-")} · ${t("dukungan semantik belum dinilai", "semantic support not assessed")}</small></article>`).join("")}</div>`) : "";
+    return `<div class="findingAiAssessment"><div class="findingAiVerdict"><div><span>${t("AI ANALYST · ADVISORY", "AI ANALYST · ADVISORY")}</span><strong>${esc(verdict.status || "needs_review")}</strong><small>${esc(`${verdict.severity || "unknown"} severity · ${verdict.confidence || "low"} confidence`)}</small></div><div><span>${t("MODEL", "MODEL")}</span><strong>${esc(payload.model || "local fallback")}</strong><small>${esc(payload.cache?.status === "hit" ? t("Hasil tersimpan", "Stored result") : `${payload.elapsed_seconds || 0}s`)}</small></div></div><p class="findingAiSummary">${esc(result.summary || t("Tidak ada ringkasan AI.", "No AI summary returned."))}</p>${result.semantic_validation ? warning(result.semantic_validation.reason) : ""}${verdict.reason ? warning(verdict.reason) : ""}${relatedEvidenceSection(payload.related_evidence)}${flowSection}${sourceFactsSection(result)}${assetSection}${aiList(t("Aktivitas identitas", "Identity activity"), result.identity_activity)}${aiList(t("Dampak data", "Data impact"), result.data_impact)}${section(t("Inferensi analis", "Analyst inference"), `<p>${esc(result.inference || "-")}</p>`)}${providers.length ? section(t("Konsensus provider", "Provider consensus"), `<div class="findingConsensus">${providers.map(p => `<article><strong>${esc(p.provider || "Unknown")}</strong>${pill(p.status || "unknown", /match|malicious/i.test(p.status || "") ? "high" : /error|skip/i.test(p.status || "") ? "medium" : "unknown")}<p>${esc(p.signal || "No provider detail")}</p><small>${esc(p.scope || "scope unavailable")} · ${esc(list(p.evidence_ids).join(", ") || "-")}${p.not_local_activity_proof ? ` · ${t("bukan bukti aktivitas lokal", "not proof of local activity")}` : ""}</small></article>`).join("")}</div>`) : ""}${cves.length ? section(t("Penilaian CVE", "CVE assessment"), `<div class="findingCveAi">${cves.map(c => `<article><strong>${esc(c.cve || "CVE")}</strong><span>${esc(c.relationship || "referenced")} · ${esc(c.local_exposure || "not verified")}</span><p>${esc(c.reason || "")}</p></article>`).join("")}</div>`) : ""}${["l1","l2","l3","response"].map(lane => aiList(`${lane.toUpperCase()} ${t("tindakan", "actions")}`, actions[lane])).join("")}${aiList(t("Quality checks", "Quality checks"), result.quality_checks)}${aiList(t("Kesenjangan bukti", "Evidence gaps"), result.gaps)}<p class="findingMuted">${t("Hasil AI bersifat advisory. Validasi bukti asli sebelum containment.", "AI output is advisory. Validate original evidence before containment.")}</p></div>`;
   }
   function renderFindingAi(payload) {
     const profile = payload?.analysis_profile;
     const contract = payload?.contract || payload?.result?.contract;
     const memory = payload?.memory || {};
+    const audit = payload?.audit;
     const metadata = (profile || contract) ? `<p class="findingMuted"><strong>${t("Kontrak analis", "Analyst contract")}:</strong> ${esc(contract?.id || "senior-soc-ai")} · v${esc(contract?.version || payload?.contract_version || "unknown")} · ${esc(contract?.validation_status || "valid")}${profile ? ` · ${esc(profile.id)} / ${esc(profile.version)}` : ""} · ${t("memory", "memory")} ${Number(memory.previous_assessments || 0) + Number(memory.indicator_history || 0) + Number(memory.analyst_feedback || 0)}</p>` : "";
-    return metadata + renderFindingAiBody(payload) + findingFeedback(f.selected);
+    const auditView = audit ? `<details class="findingRaw"><summary>${t("Provenance dan audit AI", "AI provenance and audit")} · ${esc(audit.skill_version || "skill unknown")}</summary><dl class="findingFields">${field("Run ID", audit.run_id)}${field("Model", audit.model)}${field(t("Configured model", "Configured model"), audit.configured_model)}${field("Skill version", audit.skill_version)}${field("Contract version", audit.contract_version)}${field("Prompt SHA-256", audit.prompt_sha256)}${field("Input SHA-256", audit.input_sha256)}${field("Result SHA-256", audit.result_sha256)}${field(t("Provider yang disertakan", "Provider sources"), list(audit.provider_sources).join(", ") || "-")}</dl><p class="findingMuted">${t("Hash membuktikan integritas snapshot input, bukan bahwa setiap klaim didukung secara semantik.", "Hashes identify the input snapshot; they do not prove semantic support for each claim.")}</p><strong>${t("Evidence references", "Evidence references")} (${Number(audit.evidence_ref_count ?? list(audit.evidence_ids).length)})</strong><ul class="findingAiList">${list(audit.evidence_ids).slice(0, 50).map(id => `<li>${esc(id)}</li>`).join("") || `<li>${t("Tidak ada reference ID tersimpan", "No reference IDs recorded")}</li>`}</ul><button type="button" data-finding-ai-history="${esc(f.selected?.id || "")}">${t("Muat riwayat run", "Load run history")}</button><div id="findingAiRunHistory" class="findingAiHistory" aria-live="polite"></div></details>` : "";
+    return metadata + auditView + renderFindingAiBody(payload) + findingFeedback(f.selected);
+  }
+  async function loadFindingAiHistory(findingId, button) {
+    const panel = q("#findingAiRunHistory");
+    if (!panel || !findingId) return;
+    button.disabled = true;
+    panel.textContent = t("Memuat riwayat tersimpan...", "Loading stored run history...");
+    try {
+      const data = await postJson("/api/findings/ai-history", {finding_id: findingId, limit: 10});
+      const items = list(data.items);
+      panel.innerHTML = items.length ? `<ol class="findingFeedbackHistory">${items.map(run => `<li><strong>${esc(run.model)} · ${esc(run.skill_version)}</strong><span>${esc(new Date(Number(run.created) * 1000).toLocaleString())}</span><p>${t("Kontrak", "Contract")}: ${esc(run.contract_version)} · ${t("Run", "Run")}: ${esc(run.run_id)}</p><p>Prompt ${esc(String(run.prompt_sha256 || "").slice(0, 16))}… · Input ${esc(String(run.input_sha256 || "").slice(0, 16))}…</p><p>${t("Evidence", "Evidence")}: ${esc(list(run.evidence_ids).join(", ") || "-")}</p></li>`).join("")}</ol>` : `<p class="findingMuted">${t("Belum ada run sebelumnya.", "No prior runs recorded.")}</p>`;
+    } catch (error) {
+      panel.textContent = t(`Riwayat tidak dapat dimuat: ${error.message}`, `Could not load history: ${error.message}`);
+    } finally {
+      button.disabled = false;
+    }
   }
   function findingFeedback(row) {
     if (!row) return "";
@@ -428,7 +528,7 @@
     const options = [["needs_review", t("Perlu review", "Needs review")], ["true_positive", t("True positive", "True positive")], ["false_positive", t("False positive", "False positive")], ["expected_activity", t("Aktivitas wajar", "Expected activity")], ["escalated", t("Eskalasi ke insiden", "Escalate to incident")]];
     const history = items.length ? `<details class="findingRaw"><summary>${t("Riwayat keputusan analis", "Analyst decision history")} (${items.length})</summary><ol class="findingFeedbackHistory">${items.map(item => `<li><strong>${esc(item.disposition.replaceAll("_", " "))}</strong><span>${esc(new Date(Number(item.created) * 1000).toLocaleString())}</span><p>${esc(item.note || t("Tanpa catatan", "No note"))}</p></li>`).join("")}</ol></details>` : `<p class="findingMuted">${t("Belum ada keputusan analis untuk temuan ini.", "No analyst decision has been recorded for this finding.")}</p>`;
     const canSync = Boolean(row.ip || (row.category === "ip" && row.indicator));
-    return `<section class="findingSection findingFeedback"><h3>${t("Keputusan analis", "Analyst disposition")}</h3><form data-finding-feedback="${esc(row.id)}"><label>${t("Disposition", "Disposition")}<select name="disposition">${options.map(([value, label]) => `<option value="${value}" ${latest.disposition === value ? "selected" : ""}>${esc(label)}</option>`).join("")}</select></label><label>${t("Catatan bukti", "Evidence note")}<textarea name="note" maxlength="1000" rows="3" placeholder="${esc(t("Tuliskan alasan berdasarkan bukti, bukan asumsi", "Record evidence-based reasoning, not assumptions"))}"></textarea></label><label class="findingFeedbackSync"><input type="checkbox" name="sync_case" ${canSync ? "checked" : "disabled"}> <span>${canSync ? t("Sinkronkan ke persistent case dan investigation memory", "Sync to persistent case and investigation memory") : t("Sinkronisasi case memerlukan source IP", "Case synchronization requires a source IP")}</span></label><div><button type="submit">${t("Simpan keputusan", "Save decision")}</button><button type="button" data-finding-ai-rerun="${esc(row.id)}">${t("Analisis ulang dengan memory", "Re-run AI with memory")}</button></div><p role="status" aria-live="polite"></p></form>${history}</section>`;
+    return `<section class="findingSection findingFeedback"><h3>${t("Keputusan analis", "Analyst disposition")}</h3><form data-finding-feedback="${esc(row.id)}"><label>${t("Disposition", "Disposition")}<select name="disposition">${options.map(([value, label]) => `<option value="${value}" ${latest.disposition === value ? "selected" : ""}>${esc(label)}</option>`).join("")}</select></label><label>${t("Catatan bukti", "Evidence note")}<textarea name="note" maxlength="1000" rows="3" placeholder="${esc(t("Tuliskan alasan berdasarkan bukti, bukan asumsi", "Record evidence-based reasoning, not assumptions"))}"></textarea></label><label class="findingFeedbackSync"><input type="checkbox" name="sync_case" ${canSync ? "" : "disabled"}> <span>${canSync ? t("Saya menyetujui penyimpanan keputusan dan advisory AI (jika tersedia) ke persistent case", "I approve saving this disposition and AI advisory (if available) to a persistent case") : t("Penyimpanan case dari workflow ini memerlukan source IP", "Case save from this workflow requires a source IP")}</span></label><div><button type="submit">${t("Simpan keputusan", "Save decision")}</button><button type="button" data-finding-ai-rerun="${esc(row.id)}">${t("Analisis ulang dengan memory", "Re-run AI with memory")}</button></div><p role="status" aria-live="polite"></p></form>${history}</section>`;
   }
   async function loadFeedback(row, sequence) {
     try {
@@ -550,6 +650,8 @@
       postJson("/api/findings/ai-retry", {job_id: jobRetry.dataset.findingAiJobRetry}).then(loadAiOperations).catch(error => { q("#findingAiOperations").innerHTML = warning(error.message); });
       return;
     }
+    const aiHistory = event.target.closest("[data-finding-ai-history]");
+    if (aiHistory) { void loadFindingAiHistory(aiHistory.dataset.findingAiHistory, aiHistory); return; }
     const rerun = event.target.closest("[data-finding-ai-rerun]");
     if (rerun) { const row = f.rows.find(r => r.id === rerun.dataset.findingAiRerun); if (row) runFindingAi(row, rerun, true); return; }
     const ai = event.target.closest("[data-finding-ai]");
@@ -581,12 +683,15 @@
     if (!row) return;
     const submit = form.querySelector('button[type="submit"]');
     const status = form.querySelector('[role="status"]');
+    if (form.elements.sync_case?.checked && !window.confirm(t("Simpan keputusan analis dan advisory AI yang tersedia ke persistent case? Ini tidak menjalankan containment.", "Save the analyst disposition and available AI advisory to a persistent case? This will not execute containment."))) return;
     submit.disabled = true; status.textContent = t("Menyimpan keputusan...", "Saving decision...");
     try {
-      const aiResult = f.ai.get(row.id)?.result || {};
+      const aiRun = f.ai.get(row.id) || {};
+      const aiResult = aiRun.result || {};
       const data = await postJson("/api/findings/feedback", {finding_id: row.id, disposition: form.elements.disposition.value,
         note: form.elements.note.value, finding: findingAiPayload(row), sync_case: Boolean(form.elements.sync_case?.checked),
-        ai_advisory: {...aiResult, model: f.ai.get(row.id)?.model || ""}});
+        analyst_approved_case_sync: Boolean(form.elements.sync_case?.checked),
+        ai_advisory: {...aiResult, audit: aiRun.audit, model: aiRun.model || ""}});
       if (!data.ok) throw new Error(data.error || "Feedback was not saved");
       f.feedback.set(row.id, [data.feedback, ...(f.feedback.get(row.id) || [])].slice(0, 10));
       if (f.selected?.id === row.id) q("#findingAiResult").innerHTML = renderFindingAi(f.ai.get(row.id));
@@ -606,9 +711,12 @@
   for (const id of ["findingSearch", "findingEvidence", "findingSeverity"]) q(`#${id}`).addEventListener(id === "findingSearch" ? "input" : "change", () => { f.page = 0; renderList(); });
   q("#findingAiOperationsRefresh")?.addEventListener("click", loadAiOperations);
   const findingsActive = () => q("#findingsView")?.classList.contains("active");
-  document.addEventListener("soc:overview", e => {
-    f.data = e.detail;
+  function receiveOverview(data) {
+    if (!data) return;
+    f.data = data;
     f.coverage = null;
+    f.coverageStatus = state.view === "findings" ? "loading" : "idle";
+    f.coverageError = "";
     f.selected = null;
     f.pivots.clear();
     f.cache.clear();
@@ -617,9 +725,12 @@
       loadFeeds();
       loadAiOperations();
     }
-  });
+  }
+  document.addEventListener("soc:overview", e => receiveOverview(e.detail));
   document.addEventListener("soc:view", event => {
     if (event.detail.view !== "findings") return;
+    f.coverageStatus = f.coverage ? "ready" : "loading";
+    f.coverageError = "";
     if (f.data) buildRows();
     loadFeeds();
     loadAiOperations();
@@ -630,7 +741,8 @@
   viewTitles.findings = "Security Findings";
   window.SocFindings = {
     renderProvider: providerBlock,
-    setCoverage(data) { f.coverage = data; buildRows(); },
+    setCoverage(data) { f.coverage = data; f.coverageStatus = "ready"; f.coverageError = ""; buildRows(); },
+    setCoverageStatus(status, error = "") { f.coverageStatus = status; f.coverageError = String(error || "").slice(0, 220); renderList(); },
     open(kind, value, inventoryRecord = null) {
       let row = f.rows.find(r => kind === "rule" ? String(r.rule) === String(value) : kind === "recon" ? r.category === "recon" && r.ip === value : indicatorOf(r) === value);
       if (!row && kind === "rule") {
@@ -664,4 +776,7 @@
     const row = f.rows.find(item => item.id === selectedId) || f.selected;
     if (row) select(row);
   });
+  // The initial overview request may finish before this script registers listeners.
+  if (state.overview) receiveOverview(state.overview);
+  window.SocFindings.ready = true;
 })();

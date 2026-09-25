@@ -228,6 +228,10 @@ class AutomationTests(unittest.TestCase):
             self.assertEqual(analyzed['status'], 'completed')
             self.assertEqual(analyzed['contract_version'], CONTRACT_VERSION)
             self.assertEqual(analyzed['result']['contract']['scope'], 'window')
+            self.assertEqual(analyzed['audit']['skill_version'], soc.WINDOW_AI_SKILL_VERSION)
+            self.assertEqual(len(analyzed['audit']['prompt_sha256']), 64)
+            self.assertEqual(len(analyzed['audit']['input_sha256']), 64)
+            self.assertNotIn('input', analyzed['audit'])
             payload = request.call_args.args[1]
             self.assertNotIn('tools', payload)
             self.assertIn('UNTRUSTED DATA', payload['messages'][0]['content'])
@@ -257,11 +261,95 @@ class AutomationTests(unittest.TestCase):
         self.assertEqual(result['attack_categories'][0]['evidence'], ['event-1'])
         self.assertEqual(result['attack_categories'][0]['citation_status'], 'unverified')
         self.assertEqual(result['network_paths'][0]['citation_status'], 'verified_reference')
+        self.assertEqual(result['network_paths'][0]['reference_validation'], 'ids_available_in_context')
+        self.assertEqual(result['network_paths'][0]['semantic_support'], 'not_assessed')
         self.assertEqual(result['identities'][0]['citation_status'], 'unverified')
         self.assertEqual(result['attack_narrative'][0]['evidence'], [])
         self.assertEqual(result['verdict']['confidence'], 'low')
         self.assertEqual(result['verdict']['status'], 'needs_review')
         self.assertEqual(result['evidence_references'], ['5710', 'event-1'])
+
+    def test_window_asset_and_provider_claims_require_matching_provenance(self):
+        provider = soc._compact_provider_snapshot({
+            'provider': 'OTX', 'status': 'ok', 'matched': 1, 'context': 2, 'errors': 0,
+            'cves': [], 'tags': [],
+        })
+        context = {
+            'rules': [], 'provider_coverage': [provider], 'vulnerability_focus': [],
+            'top_findings': [{'evidence': [{
+                'event_id': 'event-1', 'rule_id': '5710', 'device': 'web-01',
+                'source_ip': '198.51.100.7', 'destination_ip': '10.0.0.8', 'user': 'analyst',
+            }]}],
+        }
+        parsed = {
+            'summary': 'Review the observed activity', 'assessment': 'Evidence needs review.',
+            'verdict': {'status': 'suspicious', 'severity': 'high', 'confidence': 'high'},
+            'affected_assets': [
+                {'asset': 'web-01', 'role': 'reporter', 'evidence_ids': ['event-1']},
+                {'asset': 'not-a-real-host', 'role': 'target', 'evidence_ids': ['event-1']},
+            ],
+            'provider_findings': [
+                {'provider': 'OTX', 'verdict': 'match', 'evidence_ids': [provider['evidence_id']]},
+                {'provider': 'UnknownProvider', 'verdict': 'match', 'evidence_ids': ['forged']},
+            ],
+            'action_plan': {'l1': [], 'l2': [], 'l3': [], 'response': []}, 'gaps': [],
+        }
+        result = soc.normalize_ai_result(parsed, {'limitations': []}, context)
+        self.assertEqual(result['affected_assets'][0]['citation_status'], 'verified_reference')
+        self.assertEqual(result['affected_assets'][0]['reference_validation'], 'entity_role_link_available')
+        self.assertEqual(result['affected_assets'][0]['semantic_support'], 'not_assessed')
+        self.assertEqual(result['affected_assets'][0]['role'], 'reporter')
+        self.assertEqual(result['affected_assets'][1]['citation_status'], 'unverified')
+        self.assertEqual(result['provider_findings'][0]['verdict'], 'match')
+        self.assertEqual(result['provider_findings'][0]['signal'], 'Stored aggregate: 1 match(es), 2 context record(s), 0 error(s).')
+        self.assertEqual(result['provider_findings'][0]['evidence_ids'], [provider['evidence_id']])
+        self.assertEqual(result['provider_findings'][0]['reference_validation'], 'stored_provider_snapshot_match')
+        self.assertEqual(result['provider_findings'][0]['semantic_support'], 'not_assessed')
+        self.assertEqual(len(result['provider_findings']), 1)
+        self.assertEqual(result['verdict']['confidence'], 'low')
+
+    def test_deterministic_window_fallback_exposes_reference_vs_semantic_state(self):
+        fallback = soc.local_ai_fallback({'intelligence_deck': {
+            'top_findings': [{'indicator': '198.51.100.1', 'attack_category': 'bruteforce',
+                'event_total': 1, 'risk_score': 30, 'evidence': [{'event_id': 'event-1', 'rule_id': '5710',
+                    'source_ip': '198.51.100.1', 'destination_ip': '10.0.0.5', 'device': 'web-01'}]}],
+            'vulnerability_focus': [{'cve': 'CVE-2024-1234', 'asset': 'web-01', 'severity': 'High',
+                'package': 'nginx', 'version': '1.2.3', 'score': {}}],
+            'provider_coverage': [{'provider': 'OTX', 'matched': 1, 'context': 0, 'errors': 0}],
+        }}, 'model unavailable')['result']
+        self.assertEqual(fallback['semantic_validation']['status'], 'analyst_review_required')
+        self.assertEqual(fallback['attack_narrative'][0]['semantic_support'], 'not_assessed')
+        self.assertEqual(fallback['provider_findings'][0]['reference_validation'], 'stored_provider_snapshot_match')
+        self.assertEqual(fallback['cve_priorities'][0]['reference_validation'], 'vulnerability_inventory_snapshot_match')
+
+    def test_finding_ai_audit_is_durable_and_cached_runs_do_not_duplicate(self):
+        self.config.update(AI_ANALYST_ENABLED='true', AI_PROVIDER_BASE_URL='http://model/v1', AI_MODEL='model')
+        finding = {'id': 'rule:5710', 'title': 'SSH authentication failures', 'rule': '5710',
+                   'provider_results': [{'provider': 'OTX', 'status': 'matched', 'matched': 1, 'summary': 'IOC match'}]}
+        self.worker.evidence.return_value = {'total': 1, 'events': [
+            {'id': 'event-1', 'rule': {'id': '5710'}, 'agent': {'name': 'linux-01'}}]}
+        model_result = {'status': 'completed', 'model': 'model', 'result': {'summary': 'Review evidence'}}
+        with patch.object(soc, 'analyze_finding_with_model', return_value=model_result):
+            first = self.worker.analyze_finding(finding)
+            second = self.worker.analyze_finding(finding)
+        audit = first['audit']
+        self.assertEqual(audit['scope'], 'finding')
+        self.assertEqual(audit['skill_version'], soc.FINDING_SKILL_VERSION)
+        self.assertIn('event-1', audit['evidence_ids'])
+        self.assertTrue(any(ref.startswith('finding-provider:') for ref in audit['evidence_ids']))
+        self.assertEqual(len(audit['input_sha256']), 64)
+        trusted = self.worker.finding_ai_advisory('rule:5710', audit['run_id'])
+        self.assertEqual(trusted['audit']['run_id'], audit['run_id'])
+        self.assertIn('event-1', trusted['audit']['evidence_ids'])
+        self.assertIsNone(self.worker.finding_ai_advisory('rule:5710', 'forged-run'))
+        self.assertEqual(second['cache']['status'], 'hit')
+        self.worker.evidence.reset_mock()
+        history = self.worker.finding_analysis_history('rule:5710')
+        self.worker.evidence.assert_not_called()
+        self.assertEqual(len(history['items']), 1)
+        self.assertEqual(history['items'][0]['run_id'], audit['run_id'])
+        self.assertEqual(history['items'][0]['result_sha256'], audit['result_sha256'])
+        self.assertNotIn('raw', history['items'][0])
 
     def test_finding_ai_citations_are_validated_against_supplied_evidence(self):
         context = {'id': 'finding-1', 'local_evidence': [{'event_id': 'event-1', 'rule': {'id': '5710'}}]}
@@ -276,12 +364,48 @@ class AutomationTests(unittest.TestCase):
             'inference': 'Could indicate credential guessing.', 'actions': {}, 'gaps': [],
         }, context)
         self.assertEqual(result['source_facts'], ['Repeated failures were observed.'])
-        self.assertEqual(result['source_fact_citations'], [{'fact': 'Repeated failures were observed.', 'evidence_ids': ['event-1']}])
+        self.assertEqual(result['source_fact_citations'], [{'fact': 'Repeated failures were observed.',
+            'evidence_ids': ['event-1'], 'reference_validation': 'ids_available_in_context',
+            'semantic_support': 'not_assessed'}])
         self.assertEqual(result['unverified_source_facts'], ['An unknown event was observed.', 'Legacy uncited claim'])
+
+    def test_finding_assets_and_provider_consensus_are_source_bound(self):
+        context = soc._finding_provenance_context({
+            'id': 'finding-entity-test',
+            'local_evidence': [{'event_id': 'event-1', 'rule': {'id': '5710'},
+                                'device': 'linux-01', 'source_ip': '198.51.100.5'}],
+            'provider_results': [{'provider': 'OTX', 'status': 'matched', 'matched': 1,
+                                  'summary': 'Stored match'}],
+            'asset_context': [{'asset': 'db-01', 'owner': 'payments', 'criticality': 'critical',
+                               'network_zone': 'restricted', 'cpe': 'cpe:2.3:a:vendor:db:1.0:*:*:*:*:*:*:*'}],
+        })
+        provider_id = context['provider_evidence'][0]['evidence_id']
+        result = soc.normalize_finding_ai_result({
+            'summary': 'Review local evidence',
+            'verdict': {'status': 'suspicious', 'severity': 'high', 'confidence': 'high'},
+            'source_facts': [{'fact': 'The event is present.', 'evidence_ids': ['event-1']}],
+            'affected_assets': [{'asset': 'linux-01', 'role': 'target', 'evidence_ids': ['event-1']}],
+            'provider_consensus': [{'provider': 'OTX', 'status': 'matched', 'evidence_ids': [provider_id]}],
+            'inference': 'Review required', 'actions': {}, 'gaps': [],
+        }, context)
+        self.assertEqual(result['affected_assets'][0]['role'], 'reporter')
+        self.assertEqual(result['affected_assets'][0]['impact_status'], 'not_established')
+        self.assertEqual(result['affected_assets'][0]['reference_validation'], 'entity_role_link_available')
+        self.assertEqual(result['affected_assets'][0]['semantic_support'], 'not_assessed')
+        cmdb_asset = next(asset for asset in result['affected_assets'] if asset['asset'] == 'db-01')
+        self.assertEqual(cmdb_asset['impact_status'], 'inventory_context_only')
+        self.assertEqual(cmdb_asset['owner'], 'payments')
+        self.assertTrue(any(ref.startswith('cmdb-asset:') for ref in cmdb_asset['evidence_ids']))
+        self.assertEqual(result['provider_consensus'][0]['evidence_ids'], [provider_id])
+        self.assertTrue(result['provider_consensus'][0]['not_local_activity_proof'])
+        self.assertEqual(result['provider_consensus'][0]['reference_validation'], 'stored_provider_snapshot_match')
+        self.assertEqual(result['provider_consensus'][0]['semantic_support'], 'not_assessed')
+        self.assertEqual(result['verdict']['confidence'], 'low')
+        self.assertTrue(any('role did not match' in gap for gap in result['gaps']))
         self.assertEqual(result['evidence_references'], ['event-1'])
         self.assertEqual(result['verdict']['confidence'], 'low')
         self.assertEqual(result['verdict']['status'], 'needs_review')
-        self.assertTrue(any('not present' in item for item in result['gaps']))
+        self.assertTrue(any('role did not match' in item for item in result['gaps']))
 
     def test_finding_ai_truncated_output_is_rejected_for_local_fallback(self):
         self.config.update(AI_ANALYST_ENABLED='true', AI_PROVIDER_BASE_URL='http://model/v1', AI_MODEL='model')
@@ -358,6 +482,7 @@ class AutomationTests(unittest.TestCase):
         with patch.object(soc, 'analyze_with_model', return_value={'status': 'completed', 'result': {'summary': 'verified'}}) as model:
             self.assertEqual(self.worker.test_ai()['status'], 'completed')
             self.assertEqual(self.worker.status()['latest']['ai']['result']['summary'], 'verified')
+            self.assertEqual(self.worker.status()['latest']['ai']['audit']['scope'], 'window')
             self.worker.running = True
             self.assertEqual(self.worker.test_ai()['status'], 'busy')
             self.assertEqual(model.call_count, 1)
@@ -410,6 +535,29 @@ class AutomationTests(unittest.TestCase):
         self.assertEqual(local['source_ip'], '198.51.100.10')
         self.assertEqual(local['destination_ip'], '10.0.0.8')
         self.assertEqual(local['user'], 'admin')
+
+    def test_finding_ai_uses_bounded_local_entity_timeline_with_citable_provenance(self):
+        self.config.update(AI_ANALYST_ENABLED='true', AI_PROVIDER_BASE_URL='http://model/v1', AI_MODEL='model')
+        finding = {'id': 'ip:198.51.100.25', 'title': 'Network alert', 'category': 'ip',
+                   'indicator': '198.51.100.25', 'range': '7d'}
+        self.worker.evidence.return_value = {'total': 0, 'events': []}
+        related = {'status': 'available', 'source': 'local durable entity graph', 'truncated': False,
+                   'interpretation': 'Chronological sequence; co-observation does not establish causality.',
+                   'events': [{'evidence_id': 'graph-evidence-1', 'source': 'defender_xdr',
+                               'source_record_id': 'dx-1', 'timestamp': '2026-09-24T10:00:00+00:00',
+                               'title': 'Risky sign-in', 'attack_techniques': [{'id': 'T1078'}],
+                               'matched_entities': [{'type': 'ip', 'value': '198.51.100.25'}]}]}
+        model_result = {'status': 'completed', 'model': 'model', 'result': {'summary': 'Review related identity activity'}}
+        with patch.object(self.worker, 'entity_timeline', return_value=related) as timeline, \
+             patch.object(soc, 'analyze_finding_with_model', return_value=model_result) as model:
+            result = self.worker.analyze_finding(finding)
+        self.assertEqual(timeline.call_args.args[0], [{'entity_type': 'ip', 'entity_value': '198.51.100.25'}])
+        self.assertEqual(timeline.call_args.kwargs['limit'], 10)
+        context = model.call_args.args[1]
+        self.assertEqual(context['related_evidence']['events'][0]['evidence_id'], 'graph-evidence-1')
+        self.assertIn('graph-evidence-1', result['audit']['evidence_ids'])
+        self.assertEqual(result['related_evidence']['source'], 'local durable entity graph')
+        self.assertIn('does not establish causality', result['related_evidence']['interpretation'])
 
     def test_cached_cve_intelligence_is_bounded_and_unexpired(self):
         self.worker.put("cve:CVE-2026-99999", {"cve": {"data": {"components": {"in_kev": True}}}}, 60)

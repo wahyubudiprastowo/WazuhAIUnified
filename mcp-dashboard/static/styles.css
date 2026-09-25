@@ -490,6 +490,51 @@ select option { color: #111827; }
   margin-bottom: 14px;
 }
 
+.situationPanel { margin-bottom: 14px; padding: 0 16px 16px; }
+.situationPanel > .panelHead { padding: 14px 0; }
+.situationPanel > .panelHead > div { display: grid; gap: 3px; }
+.situationPanel > .panelHead h2 { margin: 0; font-size: 16px; }
+.situationMetrics { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.situationMetric { display: grid; align-content: start; gap: 6px; min-height: 100px; padding: 12px; border-right: 1px solid var(--line); }
+.situationMetric:last-child { border-right: 0; }
+.situationMetric span, .situationMetric small, .situationCandidateHead small, .situationCandidateList small { color: var(--muted); }
+.situationMetric span { font-size: 12px; }
+.situationMetric strong { overflow-wrap: anywhere; font-size: 21px; line-height: 1.2; }
+.situationMetric small { font-size: 11px; line-height: 1.4; }
+.situationDecisionGrid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; margin-top: 12px; }
+.situationAttack, .situationNext { min-width: 0; padding: 12px; border: 1px solid var(--line); border-radius: 6px; background: rgba(255,255,255,.02); }
+.situationSubhead { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 4px 12px; margin-bottom: 7px; }
+.situationSubhead h3 { margin: 0; font-size: 14px; }
+.situationSubhead > span, .situationDecisionNote, .situationSource { color: var(--muted); font-size: 11px; }
+.situationDecisionNote { margin-bottom: 9px; line-height: 1.45; }
+.situationAttackRow { display: grid; gap: 4px; margin: 8px 0; }
+.situationAttackRow > div { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; text-transform: capitalize; }
+.situationAttackRow > div strong { overflow-wrap: anywhere; font-weight: 600; }
+.situationAttackRow progress { display: block; width: 100%; height: 8px; accent-color: var(--cyan); }
+.situationSource { display: block; margin-top: 9px; }
+.situationDecisionEmpty { padding: 12px 0; color: var(--muted); font-size: 12px; }
+.situationNext ol { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.situationNext li:not(.situationActionEmpty) { display: grid; grid-template-columns: 24px minmax(0, 1fr) auto; align-items: center; gap: 9px; padding: 7px 0; border-top: 1px solid var(--line); }
+.situationNext li > span { display: grid; place-items: center; width: 22px; aspect-ratio: 1; border: 1px solid var(--line-strong); border-radius: 50%; color: var(--cyan); font-size: 11px; }
+.situationNext li > div { display: grid; gap: 2px; min-width: 0; }
+.situationNext li strong { font-size: 12px; font-weight: 600; }
+.situationNext li small { color: var(--muted); font-size: 11px; }
+.situationNext li button { min-height: 34px; }
+.situationNext .situationActionEmpty { padding: 12px 0; color: var(--muted); font-size: 12px; }
+.situationCandidates { margin-top: 14px; }
+.situationCandidateHead { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 5px 16px; margin-bottom: 8px; }
+.situationCandidateHead strong { font-size: 13px; }
+.situationCandidateHead small { font-size: 11px; }
+.situationCandidateList { display: grid; gap: 6px; }
+.situationCandidateList article { display: grid; grid-template-columns: minmax(180px, 1.2fr) minmax(150px, .8fr) minmax(180px, 1fr); align-items: center; gap: 12px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 6px; background: rgba(255,255,255,.025); }
+.situationCandidateList article > div { display: grid; gap: 4px; min-width: 0; }
+.situationCandidateList article strong { overflow-wrap: anywhere; font-size: 13px; }
+.situationCandidateList article span, .situationCandidateList article small { overflow-wrap: anywhere; font-size: 11px; }
+.situationCandidateList details summary { min-height: 36px; display: flex; align-items: center; cursor: pointer; color: var(--cyan); font-size: 12px; }
+.situationCandidateList details ul { max-height: 150px; overflow: auto; padding-left: 18px; color: var(--muted); font-size: 11px; }
+.situationCandidateList code { overflow-wrap: anywhere; }
+.situationEmpty { color: var(--muted); font-size: 12px; }
+
 .insightCard {
   min-height: 112px;
   display: grid;
@@ -2162,6 +2207,64 @@ select option { color: #111827; }
   border-bottom: 1px solid rgba(159, 184, 216, 0.12);
 }
 
+.caseTimelineNote,
+.caseTimelineScope {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.entityEventList {
+  display: grid;
+  gap: 0;
+  max-height: 620px;
+  overflow: auto;
+  margin: 0;
+  padding: 0 0 0 22px;
+  border-left: 1px solid var(--line);
+  list-style: none;
+}
+
+.entityEventList > li {
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(145px, .32fr) minmax(0, 1fr);
+  gap: 10px 16px;
+  padding: 12px 10px 14px 0;
+  border-bottom: 1px solid rgba(159, 184, 216, 0.12);
+}
+
+.entityEventList > li::before {
+  position: absolute;
+  top: 17px;
+  left: -27px;
+  width: 9px;
+  height: 9px;
+  border: 2px solid var(--cyan);
+  border-radius: 50%;
+  background: var(--panel);
+  content: "";
+}
+
+.entityEventList time {
+  color: var(--muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.entityEventBody { min-width: 0; display: grid; gap: 7px; }
+.entityEventTitle { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.entityEventTitle strong { overflow-wrap: anywhere; }
+.entityEventTitle span, .entityEventBody > small, .entityEventBody details { color: var(--muted); font-size: 11px; line-height: 1.5; }
+.entityEventBody code { overflow-wrap: anywhere; }
+.entityEventEntities, .entityAttackMappings { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.entityEventEntities span, .entityAttackMappings span { max-width: 100%; padding: 3px 6px; border: 1px solid var(--line); border-radius: 4px; font-size: 11px; overflow-wrap: anywhere; }
+.entityAttackMappings b { width: 100%; color: var(--cyan); font-size: 11px; }
+.entityNoAttackMapping { color: var(--muted); font-size: 11px; }
+.entityEventBody details summary { cursor: pointer; width: fit-content; }
+.entityEventBody details ul { margin: 5px 0 0; padding-left: 18px; }
+
 .dangerButton {
   border-color: rgba(255, 107, 107, .55);
   color: #ffd5d5;
@@ -3404,6 +3507,11 @@ pre, .resultPane {
   .crowdList { grid-template-columns: 1fr; }
   .resultMetrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .insightStrip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .situationMetrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .situationMetric:nth-child(2n) { border-right: 0; }
+  .situationMetric:last-child { grid-column: 1 / -1; border-top: 1px solid var(--line); }
+  .situationCandidateList article { grid-template-columns: 1fr; }
+  .situationDecisionGrid { grid-template-columns: 1fr; }
   .flowBoard, .huntMatrix { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .reportGrid, .incidentSections { grid-template-columns: 1fr; }
   .caseWideForm { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -3451,7 +3559,11 @@ pre, .resultPane {
   .providerToolbar, .exposureLegend { align-items: stretch; flex-direction: column; }
   .resultMetrics, .jsonRow, .reportRow, .incidentCard, .settingField { grid-template-columns: 1fr; }
   .insightStrip, .flowBoard, .huntMatrix { grid-template-columns: 1fr; }
+  .situationMetrics { grid-template-columns: 1fr; }
+  .situationMetric, .situationMetric:nth-child(2n) { border-right: 0; border-bottom: 1px solid var(--line); }
+  .situationMetric:last-child { grid-column: auto; border-bottom: 0; border-top: 0; }
   .caseFormGrid, .caseWideForm, .caseEvidenceList article, .caseAuditList > div { grid-template-columns: 1fr; }
+  .entityEventList > li { grid-template-columns: 1fr; gap: 5px; }
   .caseFormGrid > form + form { border-left: 0; border-top: 1px solid var(--line); padding: 12px 0 0; }
   .nav { grid-template-columns: repeat(2, 1fr); }
 

@@ -1,17 +1,19 @@
 # SOC Platform Audit Priorities
 
-Audit baseline: 2026-09-21. The catalog contains 194 tools (58 GenSecAI and
-136 INFOKOM). Every tool now has one primary dashboard menu, an execution
-policy, and a dependency classification. A menu load never executes a tool.
+Audit baseline: 2026-09-24. The prior live catalog snapshot contained 203 tools
+(58 GenSecAI and 145 INFOKOM). Dashboard mappings and totals are derived from
+the discovered catalog; future unmapped entries are reported and default to
+approval-required. A menu load never executes a tool.
 
-The source audit resolves to 194 menu-mapped tools, 154 cached reads, 40
+The reviewed snapshot resolves to 203 mapped tools: 155 cached reads, 48
 approval-required operations, and 21 contextual Security Findings recipes.
 Only the bounded hot-path workflows are automatic. The remaining capabilities
 are intentionally analyst-triggered and read their retained result on reuse.
 
 ## Implemented in this change
 
-- 194/194 tools mapped: 154 cached reads and 40 operator-approved operations.
+- 203/203 tools mapped in the 2026-09-24 snapshot: 155 cached reads and 48
+  operator-approved operations. Runtime catalog drift is surfaced dynamically.
 - One persistent workflow worker, atomic request deduplication, 24-job backlog,
   12 Wazuh/local and 4 external-provider new runs per hour.
 - Successful provider reads cache for 6 hours; local/Wazuh reads cache for 15

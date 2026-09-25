@@ -3,6 +3,7 @@ from unittest.mock import patch
 from concurrent.futures import ThreadPoolExecutor
 import sqlite3
 import json
+import hashlib
 import os
 import tempfile
 import time
@@ -27,6 +28,17 @@ class FindingTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 server._finding_intel("wazuh_restart", "host")
             call.assert_not_called()
+
+    def test_overview_cache_schema_bump_does_not_reuse_legacy_snapshot_key(self):
+        window = {"requested": "24h", "bounds": {"gte": "now-24h", "lt": "now"}, "tool_range": "24h"}
+        legacy_payload = json.dumps({
+            "schema": 4,
+            "requested": window["requested"],
+            "bounds": window["bounds"],
+            "tool_range": window["tool_range"],
+        }, sort_keys=True, separators=(",", ":"))
+        legacy_key = hashlib.sha256(legacy_payload.encode("utf-8")).hexdigest()
+        self.assertNotEqual(server._overview_cache_key(window), legacy_key)
 
     def test_private_ip_skipped(self):
         with patch.object(server, "_safe_call") as call:
@@ -97,6 +109,8 @@ class FindingTests(unittest.TestCase):
                 results = list(pool.map(lambda _: server._finding_intel("crowdsec", "8.8.8.8"), range(3)))
             self.assertEqual(call.call_count, 1)
             self.assertEqual(sum(r["cached"] for r in results), 2)
+            cached = next(row for row in results if row["cached"])
+            self.assertEqual(cached["intel_cache_status"], "hit")
 
     def test_feed_errors_not_success(self):
         with patch.object(server, "_safe_call", return_value={"ok": True, "data": {"errors": {"global": "Unavailable"}}}):
@@ -115,6 +129,50 @@ class FindingTests(unittest.TestCase):
         with patch.object(server, "_safe_call", return_value={"ok": True, "data": data}):
             self.assertFalse(server._finding_intel("aggregate", "8.8.8.8")["ok"])
 
+    def test_aggregate_provider_status_is_explicit_and_does_not_call_skips_no_match(self):
+        data = {"results": [
+            {"provider": "otx", "is_malicious": False, "detail": {"pulse_count": 0}},
+            {"provider": "virustotal", "is_malicious": True, "risk_level": "high"},
+            {"provider": "crowdsec", "error": "not configured"},
+            {"provider": "threatfox", "error": "provider timeout"},
+            {"provider": "greynoise", "detail": {"skipped": "unsupported type"}},
+        ], "errors": ["crowdsec: not configured", "threatfox: provider timeout"]}
+        with patch.object(server, "_safe_call", return_value={"ok": True, "data": data}):
+            result = server._finding_intel("aggregate", "8.8.4.4")
+        statuses = {row["provider"]: row for row in result["data"]["provider_statuses"]}
+        self.assertEqual(statuses["otx"]["status"], "no_match")
+        self.assertTrue(statuses["otx"]["attempted"])
+        self.assertEqual(statuses["virustotal"]["status"], "match")
+        self.assertEqual(statuses["crowdsec"]["status"], "skipped")
+        self.assertFalse(statuses["crowdsec"]["attempted"])
+        self.assertEqual(statuses["threatfox"]["status"], "provider_error")
+        self.assertEqual(statuses["greynoise"]["status"], "skipped")
+        self.assertEqual(next(row["status"] for row in statuses.values()
+                              if row["provider"].lower() == "abuseipdb"), "not_reported")
+        self.assertEqual(result["data"]["lookup"]["providers_reported"], 5)
+        self.assertEqual(result["data"]["lookup"]["cache_status"], "miss")
+        self.assertFalse(result["no_match"])
+
+    def test_aggregate_without_provider_rows_is_not_reported_as_no_match(self):
+        result = server._annotate_finding_intel_status(
+            {"ok": True, "data": {"results": []}}, "aggregate", "miss")
+        self.assertEqual(result["data"]["lookup"]["status"], "provider_results_unreported")
+        self.assertFalse(result.get("no_match", False))
+
+    def test_aggregate_all_skipped_is_not_a_no_match(self):
+        rows = [{"provider": name, "error": "not configured"} for name in (
+            "crowdsec", "threatfox", "otx", "greynoise", "abuseipdb", "virustotal", "cyfirma")]
+        result = server._annotate_finding_intel_status({"ok": True, "data": {"results": rows}}, "aggregate", "hit")
+        self.assertEqual(result["lookup_status"], "all_skipped")
+        self.assertFalse(result["no_match"])
+        self.assertTrue(all(row["status"] == "skipped" for row in result["data"]["provider_statuses"]))
+
+    def test_private_indicator_is_explicitly_skipped_by_policy(self):
+        result = server._finding_intel("aggregate", "10.0.0.8")
+        self.assertEqual(result["intel_status"], "skipped")
+        self.assertFalse(result["attempted"])
+        self.assertIn("skipped", result["reason"])
+
     def test_aggregate_tolerates_non_object_provider_detail(self):
         data = {"results": [{"provider": "otx", "detail": ["legacy", "shape"]}]}
         with patch.object(server, "_safe_call", return_value={"ok": True, "data": data}):
@@ -132,6 +190,13 @@ class FindingTests(unittest.TestCase):
         self.assertIn('intel("aggregate", indicator)', intel_block)
         self.assertNotIn('intel("crowdsec"', intel_block)
         self.assertIn("findingWorkflowTools", source)
+        self.assertIn('name="sync_case"', source)
+        self.assertIn("window.confirm", source)
+        self.assertIn("analyst_approved_case_sync", source)
+        self.assertIn('"analyst_approved_case_sync") is True', Path(server.__file__).read_text())
+        self.assertIn("automation.finding_ai_advisory", Path(server.__file__).read_text())
+        self.assertIn('"Not tried"', source)
+        self.assertIn("Provider berhasil diperiksa", source)
 
     def test_feed_pagination(self):
         with patch.object(server, "_safe_call", return_value={"ok": True, "data": {"items": []}}) as call:
@@ -284,6 +349,26 @@ class FindingTests(unittest.TestCase):
         self.assertEqual(result["source"], "transactional_case_store")
         self.assertEqual(call.call_args.args[1], "blueteam_case_get")
         indexer.assert_not_called()
+
+    def test_incident_timeline_uses_case_entities_and_local_graph(self):
+        case = {"case_id": "case_12345", "entity_links": [
+            {"entity_type": "source_ip", "entity_value": "198.51.100.8"},
+            {"entity_type": "user", "entity_value": "analyst@example.test"},
+        ]}
+        with patch.object(server, "_incident_get", return_value={"ok": True, "case": case}) as get_case, \
+             patch.object(server.automation, "entity_timeline", return_value={
+                 "status": "available", "events": [], "source": "local durable entity graph",
+             }) as timeline:
+            result = server._incident_timeline({
+                "case_id": "case_12345", "range": "custom",
+                "start": "2026-09-24T09:00:00Z", "end": "2026-09-24T10:00:00Z", "limit": 30,
+            })
+        self.assertTrue(result["ok"])
+        self.assertEqual(get_case.call_args.args[0]["case_id"], "case_12345")
+        args = timeline.call_args.args
+        self.assertEqual(args[0], case["entity_links"])
+        self.assertEqual(args[3], 30)
+        self.assertAlmostEqual(args[1], server.datetime.fromisoformat("2026-09-24T09:00:00+00:00").timestamp())
 
     def test_incident_mutation_forwards_revision_and_server_actor(self):
         with patch.object(server, "_normalized_call", return_value={
@@ -506,8 +591,8 @@ class FindingTests(unittest.TestCase):
         search.assert_not_called()
 
     def test_local_alert_query_is_bounded_and_aggregation_only(self):
-        response = {"hits": {"total": {"value": 1}}, "aggregations": {
-                        "l1_alerts": {"sample": {"hits": {"hits": [{"_id": "event-1", "_index": "wazuh-alerts-4.x",
+        response = {"hits": {"total": {"value": 5000}}, "aggregations": {
+                        "l1_alerts": {"doc_count": 35, "sample": {"hits": {"hits": [{"_id": "event-1", "_index": "wazuh-alerts-4.x",
                             "_source": {"@timestamp": "2026-09-15T10:00:00Z", "rule": {"id": "100", "level": 12,
                             "description": "High risk alert"}, "agent": {"name": "server-1"},
                             "decoder": {"name": "fortigate"}, "data": {"srcip": "8.8.8.8", "dstip": "10.0.0.8"}}}]}}},
@@ -529,7 +614,23 @@ class FindingTests(unittest.TestCase):
         self.assertIn("operational_evidence", result)
         self.assertEqual(result["l1_queue"][0]["event_id"], "event-1")
         self.assertEqual(result["l1_queue"][0]["sla_minutes"], 30)
+        self.assertEqual(result["alert_data"]["total_alerts"], 5000)
+        self.assertEqual(result["alert_data"]["l1_alerts_total"], 35)
+        self.assertEqual(result["alert_data"]["alerts_sampled"], 1)
+        self.assertEqual(result["alert_data"]["sampled_limit"], 20)
+        self.assertTrue(result["alert_data"]["truncated"])
         self.assertEqual(result["cloud_m365"]["total"], 1)
+
+    def test_tool_catalog_reports_future_unmapped_live_tools(self):
+        catalog = {"tools": [{"name": "future_tool", "source": "infokom", "description": "test", "inputSchema": {}}],
+                   "errors": []}
+        with patch.object(server, "_tool_catalog", return_value=catalog):
+            result = server._tools_response()
+        self.assertEqual(result["summary"]["discovered"], 1)
+        self.assertEqual(result["summary"]["menu_mapped"], 0)
+        self.assertEqual(result["summary"]["menu_unmapped"], 1)
+        self.assertEqual(result["summary"]["menu_unmapped_names"], ["future_tool"])
+        self.assertEqual(result["tools"][0]["operational_mode"], "approval_required")
 
     def test_long_range_cache_miss_returns_materialized_summary_and_builds_async(self):
         placeholder = {"generated_at": "now", "materialization": {"status": "building"}}
@@ -554,16 +655,38 @@ class FindingTests(unittest.TestCase):
         finally:
             server._overview_refresh_errors.pop(key, None)
 
-    def test_complete_rollup_serves_long_range_without_indexer_refresh(self):
+    def test_complete_rollup_serves_fast_and_starts_bounded_detail_refresh(self):
         placeholder = {"generated_at": "now", "materialization": {"status": "rollup", "exact": True}}
         with patch.object(server, "_overview_cache_read", return_value=None), \
              patch.object(server, "_overview_refresh_async") as refresh, \
              patch.object(server, "_materialized_overview", return_value=placeholder), \
              patch.object(server, "_overview") as overview:
             result = server._overview_cached({"range": "30d"})
-        self.assertEqual(result["cache"]["status"], "rollup")
-        refresh.assert_not_called()
+        self.assertEqual(result["cache"]["status"], "building")
+        self.assertEqual(result["detail_materialization"]["status"], "building")
+        self.assertEqual(result["historical_detail"]["l1"]["status"], "materializing")
+        refresh.assert_called_once()
         overview.assert_not_called()
+
+    def test_historical_detail_refresh_failure_is_reported_without_repeated_auto_poll(self):
+        placeholder = {"generated_at": "now", "materialization": {"status": "rollup", "exact": True}}
+        key = server._overview_cache_key(server._window_from_payload({"range": "7d"}))
+        previous = server._overview_refresh_errors.get(key)
+        server._overview_refresh_errors[key] = "Background refresh failed; retaining the last valid snapshot."
+        try:
+            with patch.object(server, "_overview_cache_read", return_value=None), \
+                 patch.object(server, "_overview_refresh_async") as refresh, \
+                 patch.object(server, "_materialized_overview", return_value=placeholder):
+                result = server._overview_cached({"range": "7d"})
+            self.assertEqual(result["cache"]["status"], "rollup-error")
+            self.assertEqual(result["detail_materialization"]["status"], "error")
+            self.assertEqual(result["historical_detail"]["l1"]["status"], "unavailable")
+            refresh.assert_not_called()
+        finally:
+            if previous is None:
+                server._overview_refresh_errors.pop(key, None)
+            else:
+                server._overview_refresh_errors[key] = previous
 
     def test_materialized_overview_marks_decoder_coverage_as_unavailable(self):
         window = {"requested": "7d", "label": "7 days", "bounds": {"gte": "now-7d", "lt": "now"}}
@@ -582,6 +705,73 @@ class FindingTests(unittest.TestCase):
         self.assertEqual(quality["rollup_coverage_percent"], 12.43)
         self.assertIsNone(quality["decoder_coverage_percent"])
         self.assertTrue(quality["partial"])
+
+    def test_complete_rollup_shows_real_severity_and_marks_unretained_details_unknown(self):
+        window = {"requested": "30d", "label": "30 days", "bounds": {"gte": "now-30d", "lt": "now"}}
+        rollup = {
+            "coverage": {"complete": True, "rows": 8, "gaps": {"coverage_percent": 100, "missing": 0}},
+            "timeline": [{"key": "2026-09-20T00:00:00Z", "doc_count": 42}],
+            "dimensions": {
+                "severity": [
+                    {"value": "15", "count": 3}, {"value": "12", "count": 4},
+                    {"value": "7", "count": 10}, {"value": "6", "count": 25},
+                ],
+                "identity": [{"value": "analyst@example.test", "count": 2}],
+            },
+            "bucket_minutes": 5,
+        }
+        with patch.object(server.automation, "history_summary", return_value={"totals": {}}), \
+             patch.object(server.automation, "report_timeline", return_value=[]), \
+             patch.object(server.pipeline, "rollup_summary", return_value=rollup):
+            result = server._materialized_overview(window, {"range": "30d"})
+
+        self.assertEqual(result["alerts"]["severity"], {"critical": 3, "high": 4, "medium": 10, "low": 25})
+        self.assertEqual(result["alerts"]["severity_status"], "available")
+        self.assertIsNone(result["alerts"]["sampled"])
+        self.assertEqual(result["historical_detail"]["status"], "partial")
+        self.assertEqual(result["agents"]["status"], "unavailable")
+        self.assertIsNone(result["agents"]["total"])
+        self.assertFalse(result["cloud_m365"]["ok"])
+        self.assertIsNone(result["cloud_m365"]["total"])
+        self.assertEqual(result["operational_evidence"]["identity"]["status"], "aggregated_only")
+        self.assertIsNone(result["operational_evidence"]["data_quality"]["sampled_identity_events"])
+
+    def test_historical_placeholder_uses_materializing_not_zero_state(self):
+        window = {"requested": "custom", "label": "Custom", "bounds": {"gte": "2026-09-01", "lt": "2026-09-02"}}
+        result = server._historical_snapshot_placeholder(window)
+        self.assertEqual(result["build_id"], server.DASHBOARD_BUILD_ID)
+        self.assertEqual(result["alerts"]["severity_status"], "materializing")
+        self.assertIsNone(result["alerts"]["sampled"])
+        self.assertEqual(result["agents"]["status"], "materializing")
+        self.assertIsNone(result["three_sum"]["candidate_count"])
+        self.assertIsNone(result["ai_recon"]["ai_agent_sources"])
+        self.assertIsNone(result["operational_evidence"]["network"]["observed"])
+
+    def test_attack_activity_labels_rollup_signals_without_claiming_confirmed_attack(self):
+        complete = server._attack_activity_summary({
+            "ok": True,
+            "coverage": {"complete": True, "taxonomy": {"complete": True, "buckets_total": 3, "buckets_ready": 3}},
+            "dimensions": {"detection_family": [
+                {"value": "bruteforce", "count": 12, "max_level": 10, "last_seen": "2026-09-24T10:00:00Z"},
+                {"value": "web_attack.sqli", "count": 4, "max_level": 8},
+            ]},
+        })
+        self.assertEqual(complete["status"], "available")
+        self.assertEqual(complete["families"][0]["family"], "bruteforce")
+        self.assertIn("not proof", complete["interpretation"])
+
+        partial = server._attack_activity_summary({
+            "ok": True, "coverage": {"complete": False, "taxonomy": {"complete": True}},
+            "dimensions": {"detection_family": [{"value": "scan", "count": 2}]},
+        })
+        self.assertEqual(partial["status"], "partial")
+        taxonomy_pending = server._attack_activity_summary({
+            "ok": True, "coverage": {"complete": True, "taxonomy": {"complete": False}}, "dimensions": {},
+        })
+        self.assertEqual(taxonomy_pending["status"], "materializing")
+        empty = server._attack_activity_summary({"ok": True, "coverage": {
+            "complete": True, "taxonomy": {"complete": True}}, "dimensions": {}})
+        self.assertEqual(empty["status"], "no_classified_signals")
 
     def test_finding_case_sync_reuses_case_and_records_analyst_verdict(self):
         calls = []
@@ -603,12 +793,15 @@ class FindingTests(unittest.TestCase):
                     "inference": "Likely authorized scan", "gaps": ["No change ticket attached"],
                     "actions": {"l1": [], "l2": [], "l3": [], "response": []},
                     "verdict": {"status": "suspicious", "confidence": "high"},
+                    "audit": {"skill_version": "soc-finding-v6", "evidence_ids": ["graph-evidence-1"]},
                 })
         self.assertTrue(result["ok"])
         self.assertEqual(result["case_id"], "case_existing")
         evidence = next(call for call in calls if call[1] == "blueteam_case_add_evidence")
         self.assertEqual(evidence[2]["expected_revision"], 2)
         self.assertTrue(evidence[2]["payload"]["advisory_only"])
+        self.assertEqual(evidence[2]["payload"]["ai_evidence_reference_ids"], ["graph-evidence-1"])
+        self.assertEqual(evidence[2]["provenance"]["skill_version"], "soc-finding-v6")
         self.assertIn("gaps", evidence[2]["payload"]["advisory"])
         mark = next(call for call in calls if call[1] == "blueteam_mark_investigated")
         self.assertEqual(mark[2]["verdict"], "false_positive")

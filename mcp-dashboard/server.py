@@ -37,6 +37,7 @@ from telemetry_contract import summary as telemetry_contract_summary
 
 ROOT = Path(__file__).resolve().parent
 STATIC = ROOT / "static"
+DASHBOARD_BUILD_ID = "2026-09-25-patch10"
 CONFIG_FILE = Path(os.environ.get("DASHBOARD_CONFIG_FILE", ROOT / "dashboard.env"))
 HOST = os.environ.get("DASHBOARD_HOST", "0.0.0.0")
 PORT = int(os.environ.get("DASHBOARD_PORT", "8088"))
@@ -1186,9 +1187,10 @@ def _tools_response() -> dict[str, Any]:
         "infokom": sum(1 for tool in tools if tool.get("source") == "infokom"),
         "catalog_errors": len(catalog["errors"]),
         "menu_mapped": sum(1 for tool in tools if tool["workflow"]["mapped"]),
+        "menu_unmapped": sum(1 for tool in tools if not tool["workflow"]["mapped"]),
+        "menu_unmapped_names": sorted({tool["name"] for tool in tools if not tool["workflow"]["mapped"]}),
         "guided_findings": sum(1 for tool in tools if "findings" in tool["workflow"].get("surfaces", [])),
         "cached_read": sum(1 for tool in tools if tool["workflow"]["mode"] == "cached_read"),
-        "approval_required": sum(1 for tool in tools if tool["workflow"]["mode"] == "approval"),
     }
     return {"tools": tools, "errors": catalog["errors"], "categories": categories, "lanes": lanes, "summary": summary}
 
@@ -1441,6 +1443,27 @@ def _incident_get(payload: dict[str, Any]) -> dict[str, Any]:
             "source": "transactional_case_store"}
 
 
+def _incident_timeline(payload: dict[str, Any]) -> dict[str, Any]:
+    case_id = str(payload.get("case_id") or "").strip()
+    if not re.fullmatch(r"case_[A-Za-z0-9_-]{4,58}", case_id):
+        raise ValueError("Invalid case ID")
+    case_result = _incident_get({"case_id": case_id})
+    if not case_result.get("ok"):
+        return {"ok": False, "error": case_result.get("error", "Case unavailable"),
+                "status_code": case_result.get("status_code", 503)}
+    case = case_result.get("case") or {}
+    range_payload = _history_payload(payload)
+    start_text, end_text = soc_pipeline.bounds(range_payload)
+    start = datetime.fromisoformat(start_text.replace("Z", "+00:00")).timestamp()
+    end = datetime.fromisoformat(end_text.replace("Z", "+00:00")).timestamp()
+    try:
+        limit = max(1, min(int(payload.get("limit", 100)), 200))
+    except (TypeError, ValueError):
+        limit = 100
+    timeline = automation.entity_timeline(case.get("entity_links") or [], start, end, limit)
+    return {"ok": True, "case_id": case_id, **timeline}
+
+
 _INCIDENT_ACTIONS: dict[str, tuple[str, tuple[str, ...]]] = {
     "assign": ("blueteam_case_assign", ("owner", "sla_due")),
     "status": ("blueteam_case_update_status", ("status", "reason")),
@@ -1551,6 +1574,9 @@ def _sync_finding_case(finding: dict[str, Any], disposition: str, note: str = ""
     if not case_id:
         return {"ok": False, "error": "Case store returned no case ID"}
     advisory = ai_advisory if isinstance(ai_advisory, dict) else {}
+    ai_audit = advisory.get("audit") if isinstance(advisory.get("audit"), dict) else {}
+    ai_evidence_refs = ai_audit.get("evidence_ids") if isinstance(ai_audit.get("evidence_ids"), list) else []
+    ai_evidence_refs = [str(value)[:300] for value in ai_evidence_refs[:100] if isinstance(value, (str, int))]
     verdict_data = advisory.get("verdict") if isinstance(advisory.get("verdict"), dict) else {}
     details = [str(note or "").strip()]
     if verdict_data:
@@ -1564,7 +1590,8 @@ def _sync_finding_case(finding: dict[str, Any], disposition: str, note: str = ""
     ai_contract = advisory.get("contract") if isinstance(advisory.get("contract"), dict) else {}
     if ai_summary and ai_contract.get("id") == "senior-soc-ai" and ai_contract.get("version"):
         report_fields = (
-            "contract", "summary", "verdict", "source_facts", "inference", "gaps", "actions",
+            "contract", "summary", "verdict", "source_facts", "source_fact_citations",
+            "evidence_references", "unverified_source_facts", "inference", "gaps", "actions",
             "action_plan", "network_flow", "identity_activity", "data_impact", "cves",
             "confidence_drivers", "quality_checks",
         )
@@ -1580,8 +1607,11 @@ def _sync_finding_case(finding: dict[str, Any], disposition: str, note: str = ""
             "summary": ai_summary[:4000], "source": "senior_soc_ai", "source_ref": finding_id,
             "observed_at": finding.get("timestamp"),
             "payload": {"advisory": report, "advisory_only": True,
-                        "finding_id": finding_id, "source_evidence_ref": finding_id},
+                        "finding_id": finding_id, "source_evidence_ref": finding_id,
+                        "ai_evidence_reference_ids": ai_evidence_refs},
             "provenance": {"contract": report.get("contract"), "model": advisory.get("model"),
+                           "skill_version": ai_audit.get("skill_version"),
+                           "evidence_reference_ids": ai_evidence_refs,
                            "use": "analyst_advisory_not_primary_evidence"},
             "entities": [], "idempotency_key": f"finding-ai:{finding_id}:{digest}",
         })
@@ -1853,6 +1883,7 @@ def _platform_overview_status() -> dict[str, Any]:
         ai_jobs = {}
     v = _runtime_config_values()
     return {
+        "build_id": DASHBOARD_BUILD_ID,
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "platforms": {
             "gensecai": {
@@ -2048,7 +2079,7 @@ def _overview_cache_ttl(window: dict[str, Any]) -> int:
 
 def _overview_cache_key(window: dict[str, Any]) -> str:
     payload = json.dumps({
-        "schema": 4,
+        "schema": 5,
         "requested": window.get("requested"),
         "bounds": window.get("bounds"),
         "tool_range": window.get("tool_range"),
@@ -2697,7 +2728,7 @@ def _cache_stats() -> dict[str, Any]:
 
 
 def _automation_db_stats() -> dict[str, Any]:
-    stats = {"reports": 0, "report_summaries": 0, "ai_runs": 0, "finding_ai": 0,
+    stats = {"reports": 0, "report_summaries": 0, "ai_runs": 0, "finding_ai": 0, "finding_ai_runs": 0,
              "ioc_queue": 0, "scan_batches": 0, "rollup_windows": 0,
              "cyfirma_observations": 0, "cyfirma_feed_runs": 0, "cyfirma_feed_cursor": 0,
              "cyfirma_connector_cursor": 0, "db_bytes": 0}
@@ -2705,7 +2736,7 @@ def _automation_db_stats() -> dict[str, Any]:
         if AUTOMATION_DB.exists():
             stats["db_bytes"] = AUTOMATION_DB.stat().st_size
         with _sqlite_db(AUTOMATION_DB) as db:
-            for table in ("reports", "report_summaries", "ai_runs", "finding_ai", "ioc_queue",
+            for table in ("reports", "report_summaries", "ai_runs", "finding_ai", "finding_ai_runs", "ioc_queue",
                           "scan_batches", "rollup_windows", "cyfirma_observations", "cyfirma_feed_runs",
                           "cyfirma_feed_cursor", "cyfirma_connector_cursor"):
                 try:
@@ -2775,7 +2806,8 @@ def _overview_refresh_worker(cache_key: str, window: dict[str, Any], payload: An
 
 def _overview_refresh_async(cache_key: str, window: dict[str, Any], payload: Any, ttl: int) -> None:
     with _overview_cache_lock:
-        if cache_key in _overview_refreshing:
+        historical = window.get("requested") in {"7d", "30d", "custom"}
+        if cache_key in _overview_refreshing or (historical and _overview_refreshing):
             return
         _overview_refreshing.add(cache_key)
     thread = threading.Thread(
@@ -2786,15 +2818,56 @@ def _overview_refresh_async(cache_key: str, window: dict[str, Any], payload: Any
     thread.start()
 
 
+def _attack_activity_summary(rollup: dict[str, Any] | None) -> dict[str, Any]:
+    """Expose bounded rule/taxonomy signal counts without calling them confirmed attacks."""
+    rollup = rollup if isinstance(rollup, dict) else {}
+    coverage = rollup.get("coverage") if isinstance(rollup.get("coverage"), dict) else {}
+    dimensions = rollup.get("dimensions") if isinstance(rollup.get("dimensions"), dict) else {}
+    families = []
+    for row in dimensions.get("detection_family") or []:
+        if not isinstance(row, dict) or not row.get("value"):
+            continue
+        try:
+            count = max(0, int(row.get("count") or 0))
+            max_level = max(0, int(row.get("max_level") or 0))
+        except (TypeError, ValueError):
+            count, max_level = 0, 0
+        families.append({
+            "family": str(row["value"])[:100],
+            "count": count,
+            "last_seen": row.get("last_seen"),
+            "max_rule_level": max_level,
+        })
+    taxonomy = coverage.get("taxonomy") if isinstance(coverage.get("taxonomy"), dict) else {}
+    taxonomy_complete = taxonomy.get("complete") is True
+    complete = coverage.get("complete") is True and taxonomy_complete
+    status = "unavailable" if not rollup.get("ok") else (
+        "available" if families and complete else "partial" if families else
+        "no_classified_signals" if complete else "materializing")
+    return {
+        "status": status,
+        "families": sorted(families, key=lambda item: (-item["count"], item["family"]))[:12],
+        "coverage_complete": complete,
+        "taxonomy_coverage": taxonomy,
+        "source": "Local detection rollups (Wazuh rule and taxonomy labels)",
+        "interpretation": "Classified alert signals; not proof that an attack succeeded or an asset is compromised.",
+    }
+
+
 def _materialized_overview(window: dict[str, Any], payload: Any) -> dict[str, Any]:
     """Return retained SOC summaries while an exact long-range snapshot builds."""
     history: dict[str, Any] = {}
     timeline_rows: list[dict[str, Any]] = []
     rollup: dict[str, Any] = {}
+    telemetry_start = telemetry_end = None
+    telemetry_as_of = None
     try:
         normalized = _history_payload(payload)
-        start = datetime.fromisoformat(str(normalized["start"]).replace("Z", "+00:00")).isoformat()
-        end = datetime.fromisoformat(str(normalized["end"]).replace("Z", "+00:00")).isoformat()
+        start_dt = datetime.fromisoformat(str(normalized["start"]).replace("Z", "+00:00"))
+        end_dt = datetime.fromisoformat(str(normalized["end"]).replace("Z", "+00:00"))
+        start, end = start_dt.isoformat(), end_dt.isoformat()
+        telemetry_start, telemetry_end = start, end
+        telemetry_as_of = end_dt.timestamp()
         history = automation.history_summary(start, end)
         timeline_rows = automation.report_timeline(start, end)
         rollup = pipeline.rollup_summary(start, end)
@@ -2833,16 +2906,29 @@ def _materialized_overview(window: dict[str, Any], payload: Any) -> dict[str, An
     decoder_rows = dimensions.get("decoder") or []
     mitre_rows = dimensions.get("mitre") or []
     forti_security_rows = dimensions.get("forti_security") or []
+    identity_rows = dimensions.get("identity") or []
+    severity_counts = {"critical": 0, "high": 0, "medium": 0, "low": 0}
+    for row in dimensions.get("severity") or []:
+        try:
+            level = int(row.get("value"))
+            count = int(row.get("count") or 0)
+        except (TypeError, ValueError):
+            continue
+        bucket = "critical" if level >= 15 else "high" if level >= 12 else "medium" if level >= 7 else "low"
+        severity_counts[bucket] += count
+    severity_status = "available" if dimensions.get("severity") else "unavailable"
     try:
-        external_intelligence = automation.external_intelligence_status()
+        external_intelligence = automation.external_intelligence_status(telemetry_start, telemetry_end)
     except Exception:
         external_intelligence = {}
     telemetry_contract = telemetry_contract_summary(
         dimensions, 0,
         external_intelligence.get("defender_xdr") if isinstance(external_intelligence, dict) else {},
         materialization_complete=rollup_complete,
+        now=telemetry_as_of,
     )
     return {
+        "build_id": DASHBOARD_BUILD_ID,
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "requested_range": window.get("requested"),
         "window": {"label": window.get("label"), "range": window.get("requested"), "bounds": window.get("bounds")},
@@ -2854,7 +2940,7 @@ def _materialized_overview(window: dict[str, Any], payload: Any) -> dict[str, An
                      if rollup_complete else "An exact Indexer snapshot is building in the background; available rollups and summaries remain visible meanwhile."),
         },
         "historical_detail": {
-            "status": "available" if rollup_complete else "materializing",
+            "status": "partial" if rollup_complete else "materializing",
             "l1": {"status": "unavailable" if rollup_complete else "materializing",
                     "message": ("Individual historical L1 alerts are not retained in the rollup." if rollup_complete
                                  else "Historical L1 detail is materializing in the background.")},
@@ -2867,12 +2953,14 @@ def _materialized_overview(window: dict[str, Any], payload: Any) -> dict[str, An
             "infokom": sum(1 for row in cached_tools if row.get("source") == "infokom"), "capabilities": tool_caps,
         },
         "analysis_funnel": {"indexed_events": indexed, "pipeline_status": "materializing", "ai_strategy": "case_and_rollup"},
-        "alerts": {"time_range": window.get("label"), "total_alerts": indexed, "sampled": 0, "truncated": False,
-                   "groups": {}, "severity": {"critical": 0, "high": 0, "medium": 0, "low": 0}, "hourly": []},
+        "alerts": {"time_range": window.get("label"), "total_alerts": indexed, "sampled": None, "truncated": False,
+                   "groups": {}, "severity": severity_counts, "severity_status": severity_status, "hourly": []},
         "threats": threats, "source_ips": source_ips, "l1_queue": [],
+        "attack_activity": _attack_activity_summary(rollup),
         "timeline": {"ok": bool(timeline_source), "bucket_interval": "materialized", "total_alerts": indexed,
                      "buckets": _timeline_buckets({"buckets": timeline_source})},
-        "cloud_m365": {"ok": True, "total": 0, "workloads": [], "operations": [], "client_ips": [], "events": []},
+        "cloud_m365": {"ok": False, "status": "unavailable", "total": None, "workloads": [], "operations": [], "client_ips": [], "events": [],
+                       "message": "M365 event detail is not retained in the historical alert rollup."},
         "telemetry_contract": telemetry_contract,
         "detection_layers": [],
         "operational_evidence": {
@@ -2881,8 +2969,8 @@ def _materialized_overview(window: dict[str, Any], payload: Any) -> dict[str, An
                 "decoder_named_events": None,
                 "decoder_unmatched_events": None,
                 "decoder_coverage_percent": None,
-                "sampled_network_events": 0,
-                "sampled_identity_events": 0,
+                "sampled_network_events": None,
+                "sampled_identity_events": None,
                 "sampled_limit_per_surface": 0,
                 "bounded": True,
                 "partial": not rollup_complete,
@@ -2892,12 +2980,17 @@ def _materialized_overview(window: dict[str, Any], payload: Any) -> dict[str, An
                          if rollup_complete else "Historical rollup is partial; missing buckets are being backfilled in the background."),
             },
             "network": {
+                "status": "aggregated_only" if forti_security_rows else "unavailable",
                 "events": [],
                 "observed": sum(int(row.get("count") or 0) for row in forti_security_rows),
+                "sample_count": 0,
                 "profiles": [{"name": row.get("label") or row.get("value"), "count": row.get("count"),
                               "max_level": row.get("max_level"), "historical": True}
                              for row in forti_security_rows],
-            }, "identity": {"events": [], "observed": 0},
+            }, "identity": {"status": "aggregated_only" if identity_rows else "unavailable",
+                            "events": [], "observed": sum(int(row.get("count") or 0) for row in identity_rows),
+                            "sample_count": 0,
+                            "note": "Historical identity samples are not retained; only bounded identity aggregates are available."},
             "mitre": {"techniques": [{"technique": row.get("value"), "count": row.get("count")}
                                       for row in mitre_rows], "timeline": [], "observed": len(mitre_rows)},
             "decoders": {"items": [{"name": row.get("value"), "count": row.get("count"),
@@ -2909,21 +3002,30 @@ def _materialized_overview(window: dict[str, Any], payload: Any) -> dict[str, An
             "telemetry": {"indexer": {"health": "materializing", "scope": "Exact historical aggregation is building."}},
         },
         "provider_freshness": _provider_freshness(),
-        "fim": {"total": 0, "top_paths": [], "top_agents": []}, "auth": {"ok": True, "events": 0},
-        "web": {"ok": True, "events": 0},
+        "fim": {"status": "unavailable", "total": None, "top_paths": [], "top_agents": [],
+                "message": "FIM detail is not retained in the historical detection rollup."},
+        "auth": {"ok": False, "status": "unavailable", "events": None,
+                 "message": "Authentication log detail is not retained in the historical detection rollup."},
+        "web": {"ok": False, "status": "unavailable", "events": None,
+                "message": "Web log detail is not retained in the historical detection rollup."},
         "attack_surface": {
             "sources": source_ips, "web_recon": [],
             "targets": [{"name": row.get("value"), "alerts": row.get("count"), "rules": []}
                         for row in asset_rows], "destinations": destination_rows, "cities": [],
         },
-        "agents": {"total": 0, "counts": {}, "platforms": {}, "items": [], "context": [], "context_coverage": {}},
-        "three_sum": {"ok": True, "categories": [], "candidate_count": 0},
-        "ai_recon": {"ok": True, "ai_agent_sources": 0, "sources": []},
-        "vulnerabilities": {"total": critical, "affected_agents": 0, "critical": critical, "high": 0,
-                            "medium": 0, "low": 0, "by_severity": {}, "critical_items": [],
+        "agents": {"status": "unavailable", "total": None, "counts": {}, "platforms": {}, "items": [], "context": [], "context_coverage": {},
+                   "message": "Agent inventory is current-state data and is not stored as a date-versioned historical snapshot."},
+        "three_sum": {"ok": False, "status": "unavailable", "categories": [], "candidate_count": None,
+                      "message": "Historical correlation candidates are not retained in the rollup."},
+        "ai_recon": {"ok": False, "status": "unavailable", "ai_agent_sources": None, "sources": [],
+                     "message": "Historical AI recon detail is not replayed from the bounded rollup."},
+        "vulnerabilities": {"status": "partial" if "critical_cves" in totals else "unavailable",
+                            "total": critical if "critical_cves" in totals else None, "affected_agents": None,
+                            "critical": critical if "critical_cves" in totals else None, "high": None,
+                            "medium": None, "low": None, "by_severity": {}, "critical_items": [],
                             "evidence_coverage": {"wazuh_inventory": bool(critical)}},
-        "soc_lanes": {"l1": {"open_alerts": indexed, "active_agents": 0, "queue": threats[:6]},
-                      "l2": {"ai_recon_sources": 0, "critical_vulnerabilities": critical, "correlation_categories": []},
+        "soc_lanes": {"l1": {"open_alerts": indexed, "active_agents": None, "queue": threats[:6]},
+                      "l2": {"ai_recon_sources": None, "critical_vulnerabilities": critical if "critical_cves" in totals else None, "correlation_categories": []},
                       "l3": {"hunting_tools": tool_caps.get("l3_hunting", {}), "response_tools": tool_caps.get("response", {}),
                              "compliance_tools": tool_caps.get("compliance", {})}},
         "errors": {},
@@ -2934,6 +3036,7 @@ def _historical_snapshot_placeholder(window: dict[str, Any]) -> dict[str, Any]:
     """Return a truthful, bounded response while the first long-range snapshot builds."""
     cached_tools = list(_tools_cache.get("tools") or [])
     return {
+        "build_id": DASHBOARD_BUILD_ID,
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "requested_range": window.get("requested"),
         "window": {"label": window.get("label"), "range": window.get("requested"), "bounds": window.get("bounds")},
@@ -2948,26 +3051,31 @@ def _historical_snapshot_placeholder(window: dict[str, Any]) -> dict[str, Any]:
                   "infokom": sum(1 for row in cached_tools if row.get("source") == "infokom"),
                   "capabilities": _tool_capabilities(cached_tools)},
         "analysis_funnel": {"indexed_events": None, "pipeline_status": "materializing", "ai_strategy": "case_and_rollup"},
-        "alerts": {"time_range": window.get("label"), "total_alerts": None, "sampled": 0, "truncated": False,
-                   "groups": {}, "severity": {}, "hourly": []},
+        "alerts": {"time_range": window.get("label"), "status": "materializing", "total_alerts": None, "sampled": None, "truncated": False,
+                   "groups": {}, "severity": {}, "severity_status": "materializing", "hourly": []},
         "threats": [], "source_ips": [], "l1_queue": [],
+        "attack_activity": {"status": "materializing", "families": [], "coverage_complete": False,
+                             "source": "Background historical materializer",
+                             "interpretation": "Attack-family signals are unavailable until the selected range is materialized."},
         "timeline": {"ok": False, "bucket_interval": "pending", "total_alerts": None, "buckets": []},
         "cloud_m365": {"ok": False, "status": "materializing", "total": None, "workloads": [], "operations": [], "client_ips": [], "events": []},
         "detection_layers": [],
         "operational_evidence": {"data_quality": {"indexed_events": None, "partial": True, "source": "background historical materializer",
                                                    "note": "Exact decoder and telemetry detail is not available until materialization completes."},
-                                 "network": {"events": [], "observed": 0}, "identity": {"events": [], "observed": 0},
+                                 "network": {"status": "materializing", "events": [], "observed": None, "sample_count": None},
+                                 "identity": {"status": "materializing", "events": [], "observed": None, "sample_count": None},
                                  "mitre": {"techniques": [], "timeline": [], "observed": 0},
                                  "decoders": {"items": [], "observed": 0, "named_events": None, "coverage_percent": None, "unmatched_events": None},
                                  "telemetry": {"indexer": {"health": "materializing", "scope": "Background historical aggregation is running."}}},
-        "provider_freshness": _provider_freshness(), "fim": {"total": 0, "top_paths": [], "top_agents": []},
+        "provider_freshness": _provider_freshness(), "fim": {"status": "materializing", "total": None, "top_paths": [], "top_agents": []},
         "auth": {"ok": False, "status": "materializing", "events": None}, "web": {"ok": False, "status": "materializing", "events": None},
         "attack_surface": {"sources": [], "web_recon": [], "targets": [], "destinations": [], "cities": []},
-        "agents": {"total": None, "counts": {}, "platforms": {}, "items": [], "context": [], "context_coverage": {}},
-        "three_sum": {"ok": False, "status": "materializing", "categories": [], "candidate_count": 0},
-        "ai_recon": {"ok": False, "status": "materializing", "ai_agent_sources": 0, "sources": []},
+        "agents": {"status": "materializing", "total": None, "counts": {}, "platforms": {}, "items": [], "context": [], "context_coverage": {},
+                   "message": "Current inventory has not been loaded for this snapshot."},
+        "three_sum": {"ok": False, "status": "materializing", "categories": [], "candidate_count": None},
+        "ai_recon": {"ok": False, "status": "materializing", "ai_agent_sources": None, "sources": []},
         "vulnerabilities": {"total": None, "affected_agents": None, "critical": None, "high": None, "medium": None, "low": None,
-                            "by_severity": {}, "critical_items": [], "evidence_coverage": {"wazuh_inventory": False}},
+                            "status": "materializing", "by_severity": {}, "critical_items": [], "evidence_coverage": {"wazuh_inventory": False}},
         "soc_lanes": {"l1": {"open_alerts": None, "active_agents": None, "queue": []},
                       "l2": {"ai_recon_sources": None, "critical_vulnerabilities": None, "correlation_categories": []},
                       "l3": {"hunting_tools": {}, "response_tools": {}, "compliance_tools": {}}},
@@ -3023,7 +3131,18 @@ def _overview_cached(payload: Any = "24h") -> dict[str, Any]:
         }
         _overview_refresh_async(cache_key, window, payload, ttl)
         return data
-    if not cached and not force_refresh and window.get("requested") in {"7d", "30d", "custom"}:
+    if window.get("requested") in {"7d", "30d", "custom"} and (not cached or force_refresh):
+        if force_refresh:
+            with _overview_cache_lock:
+                _overview_refresh_errors.pop(cache_key, None)
+            _overview_refresh_async(cache_key, window, payload, ttl)
+            if cached:
+                data = dict(cached["data"])
+                data["cache"] = {
+                    **(data.get("cache") or {}), "status": "stale-refreshing",
+                    "age_seconds": int(now - cached["created_at"]), "ttl_seconds": ttl,
+                }
+                return data
         result: dict[str, Any] = {}
         completed = threading.Event()
         def materialize_fast() -> None:
@@ -3034,11 +3153,25 @@ def _overview_cached(payload: Any = "24h") -> dict[str, Any]:
         threading.Thread(target=materialize_fast, daemon=True).start()
         completed.wait(0.05)
         data = result.get("data") or _historical_snapshot_placeholder(window)
-        if data.get("materialization", {}).get("exact"):
-            data["cache"] = {"status": "rollup", "age_seconds": 0, "ttl_seconds": ttl}
-            return data
-        _overview_refresh_async(cache_key, window, payload, ttl)
-        data["cache"] = {"status": "building", "age_seconds": 0, "ttl_seconds": ttl}
+        with _overview_cache_lock:
+            refresh_error = _overview_refresh_errors.get(cache_key)
+        if not refresh_error:
+            _overview_refresh_async(cache_key, window, payload, ttl)
+        detail_status = "materializing" if not refresh_error else "unavailable"
+        detail_message = ("Bounded historical detail query is running or queued in the background."
+                          if not refresh_error else refresh_error)
+        data["detail_materialization"] = {
+            "status": "building" if not refresh_error else "error",
+            "message": detail_message,
+            "scope": "bounded Indexer aggregation; L1 and M365 details are samples, not full event exports",
+        }
+        data["historical_detail"] = {
+            "status": detail_status,
+            "l1": {"status": detail_status, "message": detail_message},
+            "l2": {"status": detail_status, "message": detail_message},
+        }
+        data["cache"] = {"status": "building" if not refresh_error else "rollup-error",
+                          "age_seconds": 0, "ttl_seconds": ttl}
         return data
     data = _overview(payload)
     try:
@@ -3344,8 +3477,11 @@ def _local_alert_window(window: dict[str, Any]) -> dict[str, Any]:
         "alert_data": {
             "time_range": window["label"],
             "total_alerts": total,
-            "alerts_sampled": min(total, 1000),
-            "truncated": total > 1000,
+            "l1_alerts_total": int((aggs.get("l1_alerts") or {}).get("doc_count") or 0),
+            "alerts_sampled": len(l1_queue),
+            "sampled_limit": 20,
+            "sampled_scope": "latest alerts with rule.level >= 7",
+            "truncated": int((aggs.get("l1_alerts") or {}).get("doc_count") or 0) > len(l1_queue),
             "groups": severity,
         },
         "threats": threats,
@@ -3815,25 +3951,27 @@ def _overview(payload: Any = "24h") -> dict[str, Any]:
         stream_status = pipeline.status()
     except Exception as exc:
         stream_status = {"enabled": False, "error": str(exc), "scan_status": "unavailable"}
-    indexed_events = int(alert_data.get("total_alerts", 0) or 0)
+    alerts_available = bool(alert_summary.get("ok"))
+    indexed_events = int(alert_data.get("total_alerts", 0) or 0) if alerts_available else None
     operational_evidence = local_alerts.get("operational_evidence") or {
         "network": {"events": [], "observed": 0}, "identity": {"events": [], "observed": 0},
         "mitre": {"techniques": [], "observed": 0}, "decoders": {"items": [], "observed": 0, "unmatched_events": 0},
         "telemetry": {"indexer": {"health": "unavailable", "scope": "Local aggregation was unavailable."}},
     }
-    try:
-        external_intelligence = automation.external_intelligence_status()
-    except Exception:
-        external_intelligence = {}
     # Telemetry readiness is a local, time-scoped rollup view. Do not infer
     # source coverage from whichever small decoder sample happened to be in the
     # live overview aggregation, and never add another Indexer query here.
     telemetry_dimensions = {"decoder": operational_evidence.get("decoders", {}).get("items", [])}
+    telemetry_start = telemetry_end = None
+    telemetry_as_of = None
     try:
         telemetry_history_window = _history_payload(payload)
+        telemetry_start = datetime.fromisoformat(str(telemetry_history_window["start"]).replace("Z", "+00:00")).isoformat()
+        telemetry_end_dt = datetime.fromisoformat(str(telemetry_history_window["end"]).replace("Z", "+00:00"))
+        telemetry_end = telemetry_end_dt.isoformat()
+        telemetry_as_of = telemetry_end_dt.timestamp()
         telemetry_rollup = pipeline.rollup_summary(
-            datetime.fromisoformat(str(telemetry_history_window["start"]).replace("Z", "+00:00")).isoformat(),
-            datetime.fromisoformat(str(telemetry_history_window["end"]).replace("Z", "+00:00")).isoformat(),
+            telemetry_start, telemetry_end,
         )
         if telemetry_rollup.get("dimensions"):
             telemetry_dimensions = dict(telemetry_rollup["dimensions"])
@@ -3842,11 +3980,16 @@ def _overview(payload: Any = "24h") -> dict[str, Any]:
             telemetry_dimensions.setdefault("decoder", operational_evidence.get("decoders", {}).get("items", []))
     except Exception:
         telemetry_rollup = {}
+    try:
+        external_intelligence = automation.external_intelligence_status(telemetry_start, telemetry_end)
+    except Exception:
+        external_intelligence = {}
     telemetry_contract = telemetry_contract_summary(
         telemetry_dimensions,
         int((cloud_m365 or {}).get("total") or 0),
         external_intelligence.get("defender_xdr") if isinstance(external_intelligence, dict) else {},
         materialization_complete=bool((telemetry_rollup.get("coverage") or {}).get("complete")),
+        now=telemetry_as_of,
     )
     telemetry_contract["materialization"] = {
         "source": "local detection rollups",
@@ -3878,8 +4021,31 @@ def _overview(payload: Any = "24h") -> dict[str, Any]:
             external_intelligence["defender_xdr"]["correlations"] = {
                 "total": 0, "items": [], "source": "local correlation unavailable", "provider_calls": 0,
             }
+    try:
+        correlation_groups = automation.correlation_candidate_summary(
+            telemetry_start, telemetry_end, limit=12)
+    except Exception as exc:
+        correlation_groups = {"status": "unavailable", "total": None, "items": [],
+                              "source": "local entity graph", "error": automation.clean_error(exc)}
     vuln_encoded = json.dumps(critical_items, default=str).lower()
+    l1_detail_status = ("available" if not historical_window else "partial") if local_alerts.get("ok") else "unavailable"
+    if not local_alerts.get("ok"):
+        l1_detail_message = "Alert detail query is unavailable for this window; check the local aggregation error and source health."
+    elif historical_window:
+        l1_detail_message = (
+            f"Showing {len(local_alerts.get('l1_queue') or [])} latest L1 rows from "
+            f"{int(alert_data.get('l1_alerts_total') or 0)} matching alerts; use Event History for paged event review."
+        )
+    else:
+        l1_detail_message = "Live L1 alert detail is available."
+    l2_detail_status = "available" if not historical_window else "partial"
+    l2_detail_message = (
+        "Live L2 correlation and AI recon are available."
+        if not historical_window else
+        "Historical correlation uses stored entity-graph candidates only where the rolling window overlaps; 3-SUM and AI recon are not replayed for the full selected range."
+    )
     return {
+        "build_id": DASHBOARD_BUILD_ID,
         "generated_at": generated_at,
         "requested_range": window["requested"],
         "materialization": {
@@ -3888,13 +4054,9 @@ def _overview(payload: Any = "24h") -> dict[str, Any]:
             "historical_retention_days": OVERVIEW_HISTORY_RETENTION_DAYS,
         },
         "historical_detail": {
-            "status": "available" if not historical_window else "partial",
-            "l1": {"status": "available" if not historical_window else "unavailable",
-                    "message": ("Live L1 alert detail is available." if not historical_window else
-                                 "Historical individual L1 alerts are not replayed by the bounded overview query.")},
-            "l2": {"status": "available" if not historical_window else "unavailable",
-                    "message": ("Live L2 correlation and AI recon are available." if not historical_window else
-                                 "Historical L2 correlation and AI recon are not replayed by the bounded overview query.")},
+            "status": "unavailable" if l1_detail_status == "unavailable" else "available" if not historical_window else "partial",
+            "l1": {"status": l1_detail_status, "message": l1_detail_message},
+            "l2": {"status": l2_detail_status, "message": l2_detail_message},
         },
         "window": {
             "label": window["label"],
@@ -3922,16 +4084,22 @@ def _overview(payload: Any = "24h") -> dict[str, Any]:
         },
         "alerts": {
             "time_range": alert_data.get("time_range", "24h"),
-            "total_alerts": alert_data.get("total_alerts", 0),
+            "status": "available" if alerts_available else "unavailable",
+            "total_alerts": alert_data.get("total_alerts", 0) if alerts_available else None,
             "sampled": alert_data.get("alerts_sampled", 0),
+            "l1_total": alert_data.get("l1_alerts_total", 0),
+            "sampled_limit": alert_data.get("sampled_limit", 0),
+            "sampled_scope": alert_data.get("sampled_scope", ""),
             "truncated": alert_data.get("truncated", False),
             "groups": alert_data.get("groups", {}),
-            "severity": _severity_buckets(alert_data.get("groups", {}) or {}),
+            "severity": _severity_buckets(alert_data.get("groups", {}) or {}) if alerts_available else {},
+            "severity_status": "available" if alerts_available else "unavailable",
             "hourly": _hourly_series(stats_data),
         },
         "threats": threats,
         "source_ips": source_ips,
         "l1_queue": local_alerts.get("l1_queue") or [],
+        "attack_activity": _attack_activity_summary(telemetry_rollup),
         "crowdsec_watchlist_ips": _public_ip_list(CROWDSEC_WATCHLIST_IPS),
         "timeline": {
             "ok": local_alerts.get("ok") or timeline["ok"],
@@ -3945,6 +4113,7 @@ def _overview(payload: Any = "24h") -> dict[str, Any]:
         },
         "cloud_m365": cloud_m365,
         "external_intelligence": external_intelligence,
+        "correlation_groups": correlation_groups,
         "telemetry_contract": telemetry_contract,
         "detection_layers": layers,
         "operational_evidence": operational_evidence,
@@ -3962,7 +4131,8 @@ def _overview(payload: Any = "24h") -> dict[str, Any]:
         },
         "attack_surface": _attack_surface(threats, source_ips, ai_data, geo),
         "agents": {
-            "total": len(agent_items),
+            "status": "available" if agents.get("ok") else "unavailable",
+            "total": len(agent_items) if agents.get("ok") else None,
             "counts": agent_counts,
             "platforms": platforms,
             "items": agent_items[:20],
@@ -3983,14 +4153,16 @@ def _overview(payload: Any = "24h") -> dict[str, Any]:
             "ai_agent_sources": ai_data.get("ai_agent_sources", 0) if isinstance(ai_data, dict) else 0,
             "sources": ai_data.get("sources", [])[:10] if isinstance(ai_data, dict) else [],
             "window": ai_data.get("window", {}) if isinstance(ai_data, dict) else {},
+            **({"message": "AI bot recon historical detail is not replayed for this selected range."} if historical_window else {}),
         },
         "vulnerabilities": {
-            "total": vuln_data.get("total_vulnerabilities", 0) if isinstance(vuln_data, dict) else 0,
-            "affected_agents": vuln_data.get("affected_agents", 0) if isinstance(vuln_data, dict) else 0,
-            "critical": vuln_data.get("critical", 0) if isinstance(vuln_data, dict) else 0,
-            "high": vuln_data.get("high", 0) if isinstance(vuln_data, dict) else 0,
-            "medium": vuln_data.get("medium", 0) if isinstance(vuln_data, dict) else 0,
-            "low": vuln_data.get("low", 0) if isinstance(vuln_data, dict) else 0,
+            "status": "available" if vuln_summary.get("ok") else "unavailable",
+            "total": vuln_data.get("total_vulnerabilities", 0) if isinstance(vuln_data, dict) and vuln_summary.get("ok") else None,
+            "affected_agents": vuln_data.get("affected_agents", 0) if isinstance(vuln_data, dict) and vuln_summary.get("ok") else None,
+            "critical": vuln_data.get("critical", 0) if isinstance(vuln_data, dict) and vuln_summary.get("ok") else None,
+            "high": vuln_data.get("high", 0) if isinstance(vuln_data, dict) and vuln_summary.get("ok") else None,
+            "medium": vuln_data.get("medium", 0) if isinstance(vuln_data, dict) and vuln_summary.get("ok") else None,
+            "low": vuln_data.get("low", 0) if isinstance(vuln_data, dict) and vuln_summary.get("ok") else None,
             "by_severity": vuln_data.get("by_severity", {}) if isinstance(vuln_data, dict) else {},
             "critical_items": critical_items[:10],
             "evidence_coverage": {
@@ -4121,7 +4293,8 @@ def _finding_intel(kind: str, indicator: str = "", observed_at: Any = None) -> d
                 raise ValueError("Invalid IP address")
             address = None
         if address is not None and not address.is_global:
-            return {"ok": False, "error": "Private/reserved IP: external lookup skipped"}
+            return {"ok": False, "intel_status": "skipped", "attempted": False,
+                    "reason": "Private/reserved IP: external lookup skipped"}
     key = f"{kind}:{indicator}"
     cache_payload = {"kind": kind, "indicator": indicator}
     disk_cached = _api_cache_read("finding_intel", cache_payload, _runtime_int("SOC_PROVIDER_OK_CACHE_SECONDS", 21600))
@@ -4134,6 +4307,7 @@ def _finding_intel(kind: str, indicator: str = "", observed_at: Any = None) -> d
     if disk_cached:
         disk_cached["cached"] = True
         disk_cached = _merge_finding_history(kind, indicator, disk_cached)
+        disk_cached = _annotate_finding_intel_status(disk_cached, kind, "hit")
         _provider_history_write("finding_intel", cache_payload, disk_cached, observed_at)
         return disk_cached
     # Share in-flight calls between browser tabs to avoid duplicate quota usage.
@@ -4147,7 +4321,8 @@ def _finding_intel(kind: str, indicator: str = "", observed_at: Any = None) -> d
         slot = _finding_cache.setdefault(key, {"lock": threading.Lock(), "expires": 0})
     with slot["lock"]:
         if slot["expires"] > time.time():
-            return dict(slot["result"], cached=True)
+            cached_result = dict(slot["result"], cached=True)
+            return _annotate_finding_intel_status(cached_result, kind, "hit")
         name, arguments = requests[kind]
         provider = provider_for_kind.get(kind)
         if provider:
@@ -4157,6 +4332,8 @@ def _finding_intel(kind: str, indicator: str = "", observed_at: Any = None) -> d
                 result = {"ok": False, "name": name, "source": "infokom", "data": None,
                           "error": f"{provider} provider is in backoff; retry after {retry_at}",
                           "provider": provider, "health": health, "cached": False}
+                result["intel_status"] = "provider_error"
+                result["reason"] = result["error"]
                 result = _api_cache_write("finding_intel", cache_payload, result,
                                           _runtime_int("SOC_PROVIDER_ERROR_BACKOFF_SECONDS", 14400))
                 _provider_history_write("finding_intel", cache_payload, result, observed_at)
@@ -4168,14 +4345,15 @@ def _finding_intel(kind: str, indicator: str = "", observed_at: Any = None) -> d
             result["partial"] = bool(data.get("errors"))
             if result["partial"]:
                 result["warnings"] = data["errors"]
-            if not any(not row.get("error") and not (
-                row.get("detail") if isinstance(row.get("detail"), dict) else {}
-            ).get("skipped") for row in data["results"] if isinstance(row, dict)):
-                if any(row.get("error") for row in data["results"] if isinstance(row, dict)) or data.get("errors"):
-                    result["ok"] = False
-                    result["error"] = "No provider returned usable context for this indicator"
-                else:
-                    result["no_match"] = True
+            states = _finding_provider_states(data["results"])
+            attempted = [row for row in states if row["status"] not in {"skipped", "not_reported"}]
+            failures = [row for row in attempted if row["status"] == "provider_error"]
+            usable = [row for row in attempted if row["status"] in {"match", "no_match"}]
+            if not usable and failures:
+                result["ok"] = False
+                result["error"] = "No provider returned usable context for this indicator"
+            elif not attempted:
+                result["lookup_status"] = "all_skipped"
         if isinstance(data, dict) and (data.get("error") or (data.get("errors") and not data.get("results")) or data.get("ok") is False):
             result["ok"] = False
             result["error"] = data.get("error") or data.get("errors") or "Provider returned an error"
@@ -4193,11 +4371,91 @@ def _finding_intel(kind: str, indicator: str = "", observed_at: Any = None) -> d
                 _provider_health_record(provider_name, not bool(row.get("error")), row.get("error"))
         result.update(generated_at=datetime.now(timezone.utc).isoformat(), cached=False)
         result = _merge_finding_history(kind, indicator, result)
+        result = _annotate_finding_intel_status(result, kind, "miss")
         ttl = _runtime_int("SOC_PROVIDER_OK_CACHE_SECONDS", 21600) if result.get("ok") and not result.get("partial") else _runtime_int("SOC_PROVIDER_ERROR_BACKOFF_SECONDS", 14400)
         result = _api_cache_write("finding_intel", cache_payload, result, ttl)
         _provider_history_write("finding_intel", cache_payload, result, observed_at)
         slot.update(result=result, expires=time.time() + (600 if result.get("ok") else 60))
         return result
+
+
+def _finding_provider_states(rows: Any) -> list[dict[str, Any]]:
+    """Classify only what a provider response proves; absence is not a no-match."""
+    def positive_count(value: Any) -> int:
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    states = []
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        detail = row.get("detail") if isinstance(row.get("detail"), dict) else {}
+        error = str(row.get("error") or "").strip()
+        skipped_reason = detail.get("skipped")
+        if error.lower() == "not configured":
+            skipped_reason = skipped_reason or "Provider credentials are not configured"
+        elif "unsupported type" in error.lower():
+            skipped_reason = skipped_reason or error
+        if skipped_reason:
+            status, reason = "skipped", str(skipped_reason)
+        elif error:
+            status, reason = "provider_error", error
+        else:
+            risk = str(row.get("risk_level") or row.get("risk") or "").lower()
+            matched = bool(row.get("is_malicious") is True or row.get("matched") is True or
+                           row.get("matches") or detail.get("matches") or
+                           risk in {"critical", "high", "malicious", "suspicious"} or
+                           positive_count(detail.get("match_count")) > 0 or
+                           positive_count(detail.get("pulse_count")) > 0)
+            status, reason = ("match", "Provider returned matching/adverse context") if matched else (
+                "no_match", "Provider was queried and returned no matching/adverse context")
+        states.append({"provider": str(row.get("provider") or "Unknown"), "status": status,
+                       "attempted": status not in {"skipped", "not_reported"}, "reason": reason})
+    return states
+
+
+def _annotate_finding_intel_status(result: dict[str, Any], kind: str, cache_status: str) -> dict[str, Any]:
+    """Attach stable per-provider state without changing provider payload semantics."""
+    if not isinstance(result, dict):
+        return result
+    data = result.get("data") if isinstance(result.get("data"), dict) else None
+    if kind == "aggregate" and data is not None:
+        rows = data.get("results") if isinstance(data.get("results"), list) else []
+        states = _finding_provider_states(rows)
+        expected = {"crowdsec": "CrowdSec", "threatfox": "ThreatFox", "otx": "AlienVault OTX",
+                    "greynoise": "GreyNoise", "abuseipdb": "AbuseIPDB",
+                    "virustotal": "VirusTotal", "cyfirma": "CYFIRMA"}
+        reported = {str(row.get("provider") or "").strip().lower() for row in states}
+        states.extend({"provider": name, "status": "not_reported", "attempted": False,
+                       "reason": "Aggregator returned no result for this provider"}
+                      for key, name in expected.items() if key not in reported)
+        data["provider_statuses"] = [dict(row, cache_status=cache_status) for row in states]
+        attempted = sum(row["attempted"] for row in states)
+        matches = sum(row["status"] == "match" for row in states)
+        lookup_status = "completed" if attempted else "all_skipped" if len(rows) == len(expected) and all(
+            row["status"] == "skipped" for row in states) else "provider_results_unreported"
+        data["lookup"] = {"status": lookup_status,
+                           "cache_status": cache_status, "providers_reported": len(rows),
+                           "providers_expected": len(expected),
+                           "providers_attempted": attempted, "matches": matches}
+        result["lookup_status"] = lookup_status
+        if lookup_status != "completed":
+            result["no_match"] = False
+        elif len(rows) == len(expected) and matches == 0 and all(row["status"] == "no_match" for row in states):
+            result["no_match"] = True
+        else:
+            result["no_match"] = False
+    elif result.get("intel_status") == "not_tried":
+        pass
+    elif not result.get("ok"):
+        result["intel_status"] = "provider_error"
+    else:
+        data = result.get("data") if isinstance(result.get("data"), dict) else {}
+        result["intel_status"] = "match" if data.get("is_malicious") or data.get("matched") else "no_match"
+    result["intel_cache_status"] = cache_status
+    return result
 
 
 def _finding_evidence(payload: dict[str, Any]) -> dict[str, Any]:
@@ -4492,6 +4750,10 @@ class Handler(SimpleHTTPRequestHandler):
                 result = _incident_get(payload)
                 _json_response(self, int(result.pop("status_code", 200)), result)
                 return
+            if self.path == "/api/incidents/timeline":
+                result = _incident_timeline(payload)
+                _json_response(self, int(result.pop("status_code", 200)), result)
+                return
             if self.path == "/api/incidents/action":
                 result = _incident_mutate(payload)
                 _json_response(self, int(result.pop("status_code", 200)), result)
@@ -4531,6 +4793,10 @@ class Handler(SimpleHTTPRequestHandler):
             if self.path == "/api/findings/ai-status":
                 _json_response(self, 200, automation.finding_analysis_job(payload.get("job_id")))
                 return
+            if self.path == "/api/findings/ai-history":
+                _json_response(self, 200, automation.finding_analysis_history(
+                    payload.get("finding_id"), payload.get("limit", 10)))
+                return
             if self.path == "/api/findings/ai-jobs":
                 _json_response(self, 200, automation.finding_analysis_jobs(payload.get("limit", 10)))
                 return
@@ -4541,13 +4807,22 @@ class Handler(SimpleHTTPRequestHandler):
             if self.path == "/api/findings/feedback":
                 result = automation.save_finding_feedback(payload.get("finding_id"), payload.get("disposition"),
                     payload.get("note"), payload.get("finding"))
-                if result.get("ok") and payload.get("sync_case"):
+                if result.get("ok") and payload.get("sync_case") and payload.get("analyst_approved_case_sync") is True:
                     try:
+                        submitted = payload.get("ai_advisory") if isinstance(payload.get("ai_advisory"), dict) else {}
+                        submitted_audit = submitted.get("audit") if isinstance(submitted.get("audit"), dict) else {}
+                        trusted_advisory = automation.finding_ai_advisory(
+                            payload.get("finding_id"), submitted_audit.get("run_id"))
                         result["case_sync"] = _sync_finding_case(
                             dict(payload.get("finding") or {}), payload.get("disposition"),
-                            payload.get("note"), payload.get("ai_advisory"))
+                            payload.get("note"), trusted_advisory)
+                        if submitted.get("summary") and not trusted_advisory:
+                            result["case_sync"]["ai_advisory_status"] = "not_linked_unverified_or_expired_run"
                     except Exception as exc:
                         result["case_sync"] = {"ok": False, "error": str(exc)}
+                elif result.get("ok") and payload.get("sync_case"):
+                    result["case_sync"] = {"ok": False, "skipped": True,
+                                           "reason": "Explicit analyst approval is required for case synchronization"}
                 _json_response(self, 200 if result.get("ok") else 400, result)
                 return
             if self.path == "/api/findings/feedback/history":

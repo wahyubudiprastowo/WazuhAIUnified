@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import Mock
 
 from soc_workflows import (
-    APPROVAL_TOOLS, AUTOMATIC_TOOLS,
+    APPROVAL_TOOLS, AUTOMATIC_TOOLS, CASE_LIFECYCLE_TOOLS,
     BINDINGS,
     FINDING_TOOLS,
     MENU_TOOLS,
@@ -28,10 +28,10 @@ class WorkflowTests(unittest.TestCase):
     def submit(self, **args):
         return self.worker.submit('gensecai', 'get_wazuh_alerts', args)
 
-    def test_catalog_all_194_have_one_primary_menu(self):
+    def test_catalog_mappings_are_unique_and_case_lifecycle_is_approval_gated(self):
         names = [name for group in MENU_TOOLS.values() for name in group.split()]
-        self.assertEqual(len(names), 194)
-        self.assertEqual(len(set(names)), 194)
+        self.assertEqual(len(set(names)), len(names))
+        self.assertEqual(len(BINDINGS), len(names))
         self.assertTrue(APPROVAL_TOOLS <= set(BINDINGS))
         self.assertTrue(FINDING_TOOLS <= set(BINDINGS))
         self.assertTrue(all('findings' in policy({'name': name})['surfaces'] for name in FINDING_TOOLS))
@@ -41,6 +41,12 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(policy({'name': 'blueteam_attack_chain'})['execution_class'], 'guided')
         self.assertEqual(policy({'name': 'otx_lookup'})['execution_class'], 'on_demand')
         self.assertEqual(policy({'name': 'wazuh_block_ip'})['execution_class'], 'approval_required')
+        self.assertEqual(BINDINGS['blueteam_asset_resolve'], 'assets')
+        self.assertEqual(policy({'name': 'blueteam_asset_resolve'})['execution_class'], 'on_demand')
+        self.assertEqual(CASE_LIFECYCLE_TOOLS, APPROVAL_TOOLS & CASE_LIFECYCLE_TOOLS)
+        for name in CASE_LIFECYCLE_TOOLS:
+            self.assertEqual(BINDINGS[name], 'incidents')
+            self.assertEqual(policy({'name': name})['execution_class'], 'approval_required')
 
     def test_atomic_deduplication_and_persistent_cache(self):
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:

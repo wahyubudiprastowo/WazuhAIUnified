@@ -9,6 +9,7 @@ MIN_FIELD_COVERAGE = 0.8
 
 SOURCES = (
     ("fortigate", "FortiGate firewall", ("source_ip", "destination_ip", "destination_port", "action", "firewall_policy", "application", "direction"), ("bruteforce", "scan", "dos", "exploit_attempt")),
+    ("sangfor_firewall", "Sangfor firewall", ("source_ip", "destination_ip", "destination_port", "action", "firewall_policy", "application", "direction"), ("bruteforce", "scan", "dos", "exploit_attempt")),
     ("fortiweb", "FortiWeb WAF", ("source_ip", "destination_ip", "destination_port", "url", "action", "host", "firewall_policy"), ("web_attack.sqli", "web_attack.xss", "exploit_attempt")),
     ("waf_web", "WAF / web access", ("source_ip", "url", "action", "host"), ("web_attack.sqli", "web_attack.xss", "exploit_attempt")),
     ("windows_sysmon", "Windows / Sysmon", ("host", "identity", "process", "parent_process", "hash", "destination_ip"), ("malware", "bruteforce", "exploit_attempt")),
@@ -46,6 +47,7 @@ def _latest(rows: list[dict[str, Any]], terms: tuple[str, ...]) -> str | None:
 
 SOURCE_TERMS = {
     "fortigate": ("fortigate",),
+    "sangfor_firewall": ("sangfor",),
     "fortiweb": ("fortiweb",),
     "waf_web": ("modsecurity", "waf", "nginx", "apache", "iis"),
     "windows_sysmon": ("sysmon",),

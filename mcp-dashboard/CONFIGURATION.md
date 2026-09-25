@@ -123,26 +123,26 @@ DEFENDER_XDR_ENABLED=true
 DEFENDER_XDR_TENANT_ID=<tenant-guid>
 DEFENDER_XDR_CLIENT_ID=<defender-app-client-id>
 DEFENDER_XDR_CLIENT_SECRET=<defender-app-client-secret>
-DEFENDER_XDR_API_PROVIDER=defender
-DEFENDER_XDR_COLLECTION_MODE=incidents
+DEFENDER_XDR_API_PROVIDER=graph
+DEFENDER_XDR_COLLECTION_MODE=both
 DEFENDER_XDR_POLL_INTERVAL_SECONDS=900
 DEFENDER_XDR_BATCH_SIZE=50
 ```
 
 Defender uses a separate checkpoint and local observation ledger. It does not
 query Wazuh and it performs no request while disabled or incompletely configured.
-The default `incidents` mode needs **Microsoft Threat Protection** application
-permission `Incident.Read.All` and administrator consent. Use `alerts` only
-when the tenant has approved the legacy `Alert.ReadWrite.All` permission.
-Collected records appear in **Event History -> Defender XDR** and every date
-selection reads SQLite, not the Microsoft API.
+For Microsoft Graph, `incidents` requires application permission
+`SecurityIncident.Read.All`; `alerts` uses `GET /v1.0/security/alerts_v2` and
+requires `SecurityAlert.Read.All`. Both permissions need administrator consent
+when `DEFENDER_XDR_COLLECTION_MODE=both`. If only `SecurityAlert.Read.All` is
+granted, set the mode to `alerts`; otherwise the alert collector will work but
+the incident collector will report its own permission error.
 
-If the Entra app instead has **Microsoft Graph** application permission
-`SecurityIncident.Read.All`, set `DEFENDER_XDR_API_PROVIDER=graph`. The
-collector then uses bounded `GET /v1.0/security/incidents?$expand=alerts` and the
-Graph token audience; related alert entities are retained so the dashboard can
-correlate IPs, users, mailboxes, and devices against bounded Wazuh evidence.
-Keep `DEFENDER_XDR_COLLECTION_MODE=incidents`. Do not set Graph mode to alerts.
+Each collection has an independent checkpoint and bounded page size. Pending
+Graph pages resume from the validated `@odata.nextLink`; results are retained
+in the local Defender ledger. Alerts appear in **Security Findings** and both
+record types appear in **Event History -> Defender XDR**. Date selection reads
+SQLite and does not make a Microsoft API call.
 
 ## 6. CYFIRMA TAXII 2.1
 

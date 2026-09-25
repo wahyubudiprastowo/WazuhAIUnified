@@ -723,6 +723,16 @@ class Pipeline:
                 (query_start, end)).fetchall()
             coverage = db.execute("SELECT MIN(bucket),MAX(bucket),COUNT(*) FROM detection_rollups WHERE bucket>=? AND bucket<?",
                                   (query_start, end)).fetchone()
+            taxonomy_coverage = db.execute('''SELECT COUNT(DISTINCT total.bucket),
+                COUNT(DISTINCT CASE WHEN EXISTS (
+                    SELECT 1 FROM detection_rollups family
+                    WHERE family.bucket=total.bucket AND family.dimension='detection_family'
+                ) OR EXISTS (
+                    SELECT 1 FROM taxonomy_rollup_buckets marker WHERE marker.bucket=total.bucket
+                ) THEN total.bucket END)
+                FROM detection_rollups total
+                WHERE total.dimension='total' AND total.bucket>=? AND total.bucket<?''',
+                (query_start, end)).fetchone()
             backfill_cursor = db.execute('SELECT cursor FROM rollup_backfill_state WHERE id=1').fetchone()
             stream_checkpoint = db.execute('SELECT checkpoint FROM stream_state WHERE id=1').fetchone()
         span_hours = (datetime.fromisoformat(end) - datetime.fromisoformat(start)).total_seconds() / 3600
@@ -750,7 +760,11 @@ class Pipeline:
                 'dimensions': result,
                 'coverage': {'first_bucket': coverage[0], 'last_bucket': coverage[1], 'rows': int(coverage[2] or 0),
                              'complete': start_covered and end_covered and gaps['missing'] == 0,
-                             'gaps': gaps}}
+                             'gaps': gaps,
+                             'taxonomy': {'buckets_total': int(taxonomy_coverage[0] or 0),
+                                          'buckets_ready': int(taxonomy_coverage[1] or 0),
+                                          'complete': bool(taxonomy_coverage[0]) and
+                                          int(taxonomy_coverage[0] or 0) == int(taxonomy_coverage[1] or 0)}}}
 
     def materialize_taxonomy_once(self, limit=120):
         """Backfill compact attack labels from existing local rule rollups.

@@ -252,10 +252,13 @@
     const actionPlan = result.action_plan || {};
     const lanes = ['l1', 'l2', 'l3', 'response'];
     const citationGroups = ['attack_narrative', 'attack_categories', 'network_paths', 'identities', 'data_impact', 'cve_priorities'];
-    const claimRows = citationGroups.flatMap(key => result[key] || []);
-    const verifiedClaims = claimRows.filter(row => row.citation_status === 'verified_reference').length;
-    const unverifiedClaims = claimRows.length - verifiedClaims;
+    const claimRows = [...citationGroups.flatMap(key => result[key] || []), ...(result.affected_assets || [])];
+    const referencedClaims = claimRows.filter(row => ['verified_reference', 'verified_provider_snapshot'].includes(row.citation_status)).length;
+    const unreferencedClaims = claimRows.length - referencedClaims;
+    const audit = ai.audit || {};
+    const auditPanel = audit.run_id ? `<details class="findingRaw"><summary>${tr('AI provenance', 'AI provenance')} · ${esc(audit.skill_version || 'unknown')}</summary><p>${tr('Run', 'Run')}: ${esc(audit.run_id)} · ${tr('Model', 'Model')}: ${esc(audit.model || 'unknown')} · ${tr('Configured model', 'Configured model')}: ${esc(audit.configured_model || 'unknown')} · ${tr('Contract', 'Contract')}: ${esc(audit.contract_version || 'unknown')}</p><p>Prompt SHA-256: ${esc(audit.prompt_sha256 || '-')}<br>Input SHA-256: ${esc(audit.input_sha256 || '-')}<br>Result SHA-256: ${esc(audit.result_sha256 || '-')}</p><small>${tr('Hash mengidentifikasi snapshot; tidak membuktikan dukungan semantik klaim.', 'Hashes identify the snapshot; they do not prove semantic support for claims.')}</small><ul>${(audit.evidence_ids || []).slice(0,50).map(id=>`<li>${esc(id)}</li>`).join('')}</ul></details>` : '';
     return `<section class="reportAiPanel analystV2">
+      ${auditPanel}
       <article class="aiVerdictCard ${severityTone(verdict.severity || verdict.status)}">
         <span>Verdict</span>
         <strong>${esc(verdict.severity || label(ai.status || 'not_configured'))}</strong>
@@ -269,8 +272,8 @@
       </article>
       <article>
         <span>${tr('Validasi evidence AI', 'AI evidence validation')}</span>
-        <p>${verifiedClaims} ${tr('klaim dengan ID event/rule yang tervalidasi', 'claims with validated event/rule IDs')}</p>
-        <small>${unverifiedClaims} ${tr('klaim belum terverifikasi; jangan perlakukan sebagai observasi', 'claims unverified; do not treat as observations')}</small>
+        <p>${referencedClaims} ${tr('klaim memiliki referensi evidence atau snapshot provider yang cocok', 'claims have a matching evidence or provider-snapshot reference')}</p>
+        <small>${unreferencedClaims} ${tr('klaim tidak memiliki referensi yang cocok', 'claims have no matching reference')} · ${tr('Validasi referensi memeriksa keberadaan ID dan relasi yang tersedia, bukan apakah isi bukti mendukung makna klaim.', 'Reference validation checks ID availability and available relationships, not whether evidence meaning supports the claim.')} ${esc(result.semantic_validation?.reason || '')} ${tr('Dukungan semantik belum dinilai otomatis; tinjau bukti asli sebelum menetapkan kesimpulan.', 'Semantic support is not automatically assessed; review original evidence before concluding.')}</small>
       </article>
       <article>
         <span>${tr('Eskalasi', 'Escalation')}</span>
@@ -287,19 +290,19 @@
       </article>
       <article>
         <span>${tr('Alur serangan', 'Attack narrative')}</span>
-        ${(result.attack_narrative || []).map(row => `<p><b>${esc(row.stage || 'Stage')}</b>: ${esc(row.detail || '-')}<br><small>${esc(row.citation_status === 'verified_reference' ? (row.evidence || []).join(', ') : tr('Unverified: no matching event/rule citation', 'Unverified: no matching event/rule citation'))}</small></p>`).join('') || `<p>${tr('No attack narrative returned yet.', 'No attack narrative returned yet.')}</p>`}
+        ${(result.attack_narrative || []).map(row => `<p><b>${esc(row.stage || 'Stage')}</b>: ${esc(row.detail || '-')}<br><small>${esc(row.citation_status === 'verified_reference' ? `${tr('Referensi tersedia', 'Reference available')}: ${(row.evidence || []).join(', ')} · ${tr('dukungan semantik belum dinilai', 'semantic support not assessed')}` : tr('Tidak ada referensi event/rule yang cocok', 'No matching event/rule reference'))}</small></p>`).join('') || `<p>${tr('No attack narrative returned yet.', 'No attack narrative returned yet.')}</p>`}
       </article>
       <article>
-        <span>${tr('Aset terdampak', 'Affected assets')}</span>
-        ${(result.affected_assets || []).map(row => `<p><b>${esc(row.asset || '-')}</b> · ${esc(row.role || 'unknown')}<br><small>${esc(row.evidence || '-')}</small></p>`).join('') || `<p>${tr('No affected asset assertion returned.', 'No affected asset assertion returned.')}</p>`}
+        <span>${tr('Aset dan entitas teramati', 'Observed assets and entities')}</span>
+        ${(result.affected_assets || []).map(row => `<p><b>${esc(row.asset || '-')}</b> · ${esc(row.role || 'unknown')}<br><small>${esc(row.evidence || '-')} · ${tr('Impact', 'Impact')}: ${esc(row.impact_status || 'not_established')} · ${tr('Refs', 'Refs')}: ${esc((row.evidence_ids || []).join(', ') || '-')} · ${tr('dukungan semantik belum dinilai', 'semantic support not assessed')}</small></p>`).join('') || `<p>${tr('No affected asset assertion returned yet.', 'No affected asset assertion returned yet.')}</p>`}
       </article>
       <article>
         <span>${tr('Provider intelligence', 'Provider intelligence')}</span>
-        ${(result.provider_findings || []).map(row => `<p><b>${esc(row.provider || '-')}</b> · ${esc(row.verdict || 'unknown')}<br><small>${esc(row.signal || '-')}</small></p>`).join('') || `<p>${tr('No provider synthesis returned.', 'No provider synthesis returned.')}</p>`}
+        ${(result.provider_findings || []).map(row => `<p><b>${esc(row.provider || '-')}</b> · ${esc(row.verdict || 'unknown')}<br><small>${esc(row.signal || '-')} · ${esc(row.scope || 'scope unavailable')} · ${tr('Snapshot reference', 'Snapshot reference')}: ${esc((row.evidence_ids || []).join(', ') || '-')} · ${tr('agregat provider, bukan bukti aktivitas lokal', 'provider aggregate, not evidence of local activity')}</small></p>`).join('') || `<p>${tr('No provider synthesis returned.', 'No provider synthesis returned.')}</p>`}
       </article>
       <article>
         <span>CVE</span>
-        ${(result.cve_priorities || []).map(row => `<p><b>${esc(row.cve || '-')}</b> · ${esc(row.priority || 'verify_only')}<br><small>${esc(row.asset || '-')} · ${esc(row.reason || '-')}</small></p>`).join('') || `<p>${tr('No CVE priority returned.', 'No CVE priority returned.')}</p>`}
+        ${(result.cve_priorities || []).map(row => `<p><b>${esc(row.cve || '-')}</b> · ${esc(row.priority || 'verify_only')}<br><small>${esc(row.asset || '-')} · ${esc(row.reason || '-')} · ${tr('Refs', 'Refs')}: ${esc((row.evidence_ids || row.evidence || []).join(', ') || '-')} · ${tr('dukungan semantik belum dinilai', 'semantic support not assessed')}</small></p>`).join('') || `<p>${tr('No CVE priority returned.', 'No CVE priority returned.')}</p>`}
       </article>
       <article class="aiActionPlan">
         <span>${tr('Rencana tindakan', 'Action plan')}</span>

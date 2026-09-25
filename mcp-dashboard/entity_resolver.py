@@ -23,6 +23,7 @@ MATCH_WEIGHTS = {
     "hostname": 65, "url": 60, "ip": 45, "domain": 25,
     "hostname_alias": 20, "cve": 15, "cpe": 10, "package": 10,
 }
+CANDIDATE_LOOKBACK_HOURS = 24
 
 _CVE = re.compile(r"\bCVE-\d{4}-\d{4,}\b", re.I)
 _HEX = re.compile(r"^[0-9a-f]+$", re.I)
@@ -97,6 +98,25 @@ def ensure_schema(db) -> None:
         evidence_id TEXT PRIMARY KEY, batch_key TEXT NOT NULL, payload TEXT NOT NULL,
         queued_at REAL NOT NULL)''')
     db.execute("CREATE INDEX IF NOT EXISTS entity_graph_queue_time ON entity_graph_queue(queued_at,evidence_id)")
+    db.execute('''CREATE TABLE IF NOT EXISTS correlation_candidates (
+        candidate_id TEXT PRIMARY KEY, candidate_key TEXT NOT NULL UNIQUE,
+        primary_entity_type TEXT NOT NULL, primary_entity_value TEXT NOT NULL,
+        first_seen REAL NOT NULL, last_seen REAL NOT NULL, evidence_count INTEGER NOT NULL,
+        source_count INTEGER NOT NULL, confidence INTEGER NOT NULL,
+        classification TEXT NOT NULL DEFAULT 'candidate', updated_at REAL NOT NULL)''')
+    db.execute("CREATE INDEX IF NOT EXISTS correlation_candidates_time ON correlation_candidates(last_seen DESC)")
+    db.execute('''CREATE TABLE IF NOT EXISTS correlation_candidate_state (
+        singleton INTEGER PRIMARY KEY CHECK(singleton=1), last_run REAL NOT NULL,
+        observations_considered INTEGER NOT NULL, candidates INTEGER NOT NULL,
+        truncated INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL,
+        error TEXT)''')
+    db.execute('''CREATE TABLE IF NOT EXISTS correlation_candidate_evidence (
+        candidate_id TEXT NOT NULL, evidence_id TEXT NOT NULL, source TEXT NOT NULL,
+        source_record_id TEXT NOT NULL, observed_at REAL NOT NULL, confidence INTEGER NOT NULL,
+        PRIMARY KEY(candidate_id,evidence_id),
+        FOREIGN KEY(candidate_id) REFERENCES correlation_candidates(candidate_id),
+        FOREIGN KEY(evidence_id) REFERENCES entity_evidence(evidence_id))''')
+    db.execute("CREATE INDEX IF NOT EXISTS correlation_candidate_evidence_ref ON correlation_candidate_evidence(evidence_id)")
 
 
 def _compact(key: Any) -> str:
@@ -292,6 +312,36 @@ def _digest(*parts: Any) -> str:
     return hashlib.sha256("\x1f".join(str(part) for part in parts).encode()).hexdigest()
 
 
+def _attack_mappings(document: Any) -> list[dict[str, str]]:
+    """Extract only explicit ATT&CK technique IDs from structured fields."""
+    mappings: dict[str, dict[str, str]] = {}
+    stack = [document]
+    keys = {"mitretechniques", "attacktechniques", "techniqueids", "mitretechniqueid"}
+    while stack:
+        value = stack.pop()
+        if isinstance(value, dict):
+            for key, item in value.items():
+                compact = _compact(key)
+                if compact in keys:
+                    candidates = item if isinstance(item, list) else [item]
+                    for candidate in candidates[:12]:
+                        details = candidate if isinstance(candidate, dict) else {"id": candidate}
+                        technique_id = str(details.get("techniqueId") or details.get("technique_id") or details.get("id") or "").strip().upper()
+                        if not re.fullmatch(r"T\d{4}(?:\.\d{3})?", technique_id):
+                            continue
+                        mappings[technique_id] = {
+                            "id": technique_id,
+                            "name": str(details.get("techniqueName") or details.get("name") or "")[:160],
+                            "tactic": str(details.get("tactic") or details.get("tacticName") or "")[:100],
+                            "mapping_source": "source_event_field",
+                        }
+                if isinstance(item, (dict, list)):
+                    stack.append(item)
+        elif isinstance(value, list):
+            stack.extend(value[:100])
+    return [mappings[key] for key in sorted(mappings)[:12]]
+
+
 def prepare_evidence(source: str, source_record_id: str, observed_at: Any, document: Any,
                      title: str = "", severity: str = "", confidence: int = 80,
                      occurrence_count: int = 1, evidence_key: str | None = None) -> dict[str, Any] | None:
@@ -303,12 +353,14 @@ def prepare_evidence(source: str, source_record_id: str, observed_at: Any, docum
     observed = _epoch(observed_at)
     payload_hash = _digest(json.dumps(document, sort_keys=True, default=str, ensure_ascii=True))
     evidence_id = "ev-" + _digest(source, evidence_key or source_record_id)
+    attack_mappings = _attack_mappings(document)
     return {
         "evidence_id": evidence_id, "source": source, "source_record_id": source_record_id,
         "observed_at": observed, "last_seen": observed, "title": str(title or "")[:500],
         "severity": str(severity or "unknown")[:40], "confidence": max(1, min(int(confidence), 100)),
         "payload_hash": payload_hash, "occurrence_count": max(1, int(occurrence_count)),
         "entities": entities,
+        "data": {"attack_techniques": attack_mappings} if attack_mappings else {},
     }
 
 
@@ -328,9 +380,116 @@ def prepare_wazuh_evidence(event: dict[str, Any], record_id: str, index: str = "
         second=0, microsecond=0).isoformat()
     signature = ",".join(sorted(f'{row["type"]}:{row["value"]}' for row in prepared["entities"]))
     prepared["evidence_id"] = "ev-" + _digest("wazuh", bucket, rule.get("id") or "", signature)
-    prepared["data"] = {"rule_id": str(rule.get("id") or "")[:80], "bucket": bucket,
-                        "representative_record_id": str(record_id)[:300]}
+    mitre = rule.get("mitre") if isinstance(rule.get("mitre"), dict) else {}
+    raw_techniques = mitre.get("id") or []
+    if isinstance(raw_techniques, str):
+        raw_techniques = [raw_techniques]
+    techniques = []
+    for technique in raw_techniques[:12] if isinstance(raw_techniques, list) else []:
+        technique_id = str(technique).strip().upper()
+        if re.fullmatch(r"T\d{4}(?:\.\d{3})?", technique_id):
+            tactics = mitre.get("tactic") or []
+            names = mitre.get("technique") or []
+            techniques.append({
+                "id": technique_id,
+                "tactic": str(tactics[0] if isinstance(tactics, list) and tactics else tactics or "")[:100],
+                "name": str(names[0] if isinstance(names, list) and names else names or "")[:160],
+                "mapping_source": "wazuh_rule.mitre",
+            })
+    prepared["data"] = {
+        "rule_id": str(rule.get("id") or "")[:80], "bucket": bucket,
+        "representative_record_id": str(record_id)[:300],
+        "decoder": str((event.get("decoder") or {}).get("name") or "")[:120]
+        if isinstance(event.get("decoder"), dict) else "",
+        "attack_techniques": techniques or prepared.get("data", {}).get("attack_techniques", []),
+    }
     return prepared
+
+
+def entity_timeline(db, entities: Iterable[dict[str, Any]], start: float, end: float,
+                    limit: int = 100) -> dict[str, Any]:
+    """Return timestamped evidence related to canonical case entities.
+
+    This reads only the local evidence graph. It intentionally returns an
+    evidence sequence, not inferred edges or an attack path.
+    """
+    ensure_schema(db)
+    aliases = {"source_ip": "ip", "srcip": "ip", "ip_address": "ip",
+               "host": "hostname", "fqdn": "hostname", "asset": "device",
+               "asset_id": "device", "agent_id": "device", "endpoint": "device",
+               "upn": "user", "mailbox": "user", "identity": "user"}
+    selected: list[tuple[str, str]] = []
+    for entity in list(entities or [])[:50]:
+        if not isinstance(entity, dict):
+            continue
+        kind = str(entity.get("entity_type") or entity.get("type") or "").lower().strip()
+        value = entity.get("entity_value") or entity.get("value")
+        kind = aliases.get(kind, kind)
+        if kind not in {"ip", "hostname", "user", "device", "domain", "url", "hash", "cve", "cpe", "package", "cloud_resource"}:
+            continue
+        canonical = canonicalize(kind, value)
+        if canonical and (kind, canonical) not in selected:
+            selected.append((kind, canonical))
+    if not selected:
+        return {"status": "no_entities", "events": [], "entities": [], "source": "local entity graph"}
+    start, end = float(start), float(end)
+    if start >= end or end - start > 186 * 86400:
+        raise ValueError("Timeline range must be positive and no longer than 186 days")
+    match_sql = " OR ".join("(n.entity_type=? AND n.canonical_value=?)" for _ in selected)
+    match_params = [part for pair in selected for part in pair]
+    event_rows = db.execute(f'''SELECT e.evidence_id,e.source,e.source_record_id,e.observed_at,
+            e.last_seen,e.title,e.severity,e.confidence,e.occurrence_count,e.data
+        FROM entity_evidence e WHERE e.observed_at>=? AND e.observed_at<? AND EXISTS (
+            SELECT 1 FROM entity_observations o JOIN entity_nodes n ON n.entity_id=o.entity_id
+            WHERE o.evidence_id=e.evidence_id AND ({match_sql}))
+        ORDER BY e.observed_at,e.evidence_id LIMIT ?''',
+        [start, end, *match_params, max(1, min(int(limit), 200))]).fetchall()
+    observations_by_evidence: dict[str, list[tuple[Any, ...]]] = {}
+    evidence_ids = [row[0] for row in event_rows]
+    if evidence_ids:
+        placeholders = ",".join("?" for _ in evidence_ids)
+        for item in db.execute(f'''SELECT o.evidence_id,n.entity_type,n.canonical_value,o.role,
+                o.field_path,o.confidence FROM entity_observations o
+            JOIN entity_nodes n ON n.entity_id=o.entity_id
+            WHERE o.evidence_id IN ({placeholders})
+            ORDER BY o.evidence_id,n.entity_type,n.canonical_value''', evidence_ids).fetchall():
+            bucket = observations_by_evidence.setdefault(item[0], [])
+            if len(bucket) < 48:
+                bucket.append(item[1:])
+    events = []
+    related_entities: set[tuple[str, str]] = set()
+    for row in event_rows:
+        evidence_id = row[0]
+        observations = observations_by_evidence.get(evidence_id, [])
+        event_entities = [{"type": item[0], "value": item[1], "role": item[2],
+                           "field_path": item[3], "confidence": item[4]} for item in observations]
+        matched_entities = [{"type": kind, "value": value} for kind, value in selected
+                           if (kind, value) in {(item[0], item[1]) for item in observations}]
+        related_entities.update((item[0], item[1]) for item in observations)
+        try:
+            metadata = json.loads(row[9]) if row[9] else {}
+        except (TypeError, ValueError, json.JSONDecodeError):
+            metadata = {}
+        techniques = metadata.get("attack_techniques", []) if isinstance(metadata, dict) else []
+        events.append({
+            "evidence_id": evidence_id, "timestamp": datetime.fromtimestamp(row[3], timezone.utc).isoformat(),
+            "last_seen": datetime.fromtimestamp(row[4], timezone.utc).isoformat(),
+            "source": row[1], "source_record_id": row[2], "title": row[5] or "Evidence event",
+            "severity": row[6] or "unknown", "confidence": row[7], "occurrence_count": row[8],
+            "rule_id": metadata.get("rule_id") if isinstance(metadata, dict) else None,
+            "decoder": metadata.get("decoder") if isinstance(metadata, dict) else None,
+            "attack_techniques": techniques if isinstance(techniques, list) else [],
+            "attack_mapping_status": "mapped" if techniques else "not_mapped_in_source_evidence",
+            "matched_entities": matched_entities, "entities": event_entities,
+        })
+    return {"status": "available" if events else "no_events", "events": events,
+            "entities": [{"type": kind, "value": value} for kind, value in sorted(related_entities)],
+            "range": {"start": datetime.fromtimestamp(start, timezone.utc).isoformat(),
+                      "end": datetime.fromtimestamp(end, timezone.utc).isoformat()},
+            "returned": len(events), "limit": max(1, min(int(limit), 200)),
+            "truncated": len(event_rows) >= max(1, min(int(limit), 200)),
+            "source": "local durable entity graph",
+            "interpretation": "Chronological evidence sequence; co-observation does not establish causality or attack path."}
 
 
 def prepare_context(context: dict[str, Any]) -> list[dict[str, Any]]:
@@ -552,6 +711,176 @@ def correlate_evidence(db, defender_evidence: dict[str, Any], incident_id: str, 
     }
 
 
+def materialize_correlation_candidates(db, *, lookback_hours: int = 24,
+                                       window_minutes: int = 60,
+                                       row_limit: int = 10000) -> dict[str, int]:
+    """Persist bounded, evidence-linked candidates from the local entity graph.
+
+    Candidates are hypotheses only. CMDB rows and weak shared values (CVE,
+    package, domain, CPE) cannot create a group by themselves. This is SQLite-
+    only work and does not query Wazuh, Defender, or intelligence providers.
+    """
+    ensure_schema(db)
+    lookback_hours = max(1, min(int(lookback_hours), 24 * 30))
+    window_seconds = max(5, min(int(window_minutes), 240)) * 60
+    row_limit = max(100, min(int(row_limit), 20000))
+    cutoff = time.time() - lookback_hours * 3600
+    rows = db.execute('''SELECT n.entity_type,n.canonical_value,o.role,o.evidence_id,
+            e.source,e.source_record_id,e.observed_at,e.confidence
+        FROM entity_observations o
+        JOIN entity_nodes n ON n.entity_id=o.entity_id
+        JOIN entity_evidence e ON e.evidence_id=o.evidence_id
+        WHERE e.observed_at>=? AND e.source IN ('wazuh','m365','defender_xdr')
+          AND (n.entity_type IN ('user','device','hostname','hash','cloud_resource')
+               OR (n.entity_type='ip' AND lower(o.role) IN
+                   ('source','attacker','client','remote','sender','external_source')))
+        ORDER BY e.observed_at,o.evidence_id LIMIT ?''', (cutoff, row_limit)).fetchall()
+    by_entity: dict[tuple[str, str], list[tuple[Any, ...]]] = {}
+    for row in rows:
+        by_entity.setdefault((str(row[0]), str(row[1])), []).append(row)
+
+    desired: dict[str, dict[str, Any]] = {}
+    for (kind, value), observations in by_entity.items():
+        observations.sort(key=lambda row: (float(row[6]), str(row[3])))
+        start = 0
+        while start < len(observations):
+            first_seen = float(observations[start][6])
+            end = start + 1
+            while end < len(observations) and float(observations[end][6]) - first_seen <= window_seconds:
+                end += 1
+            group = observations[start:end]
+            unique: dict[str, tuple[Any, ...]] = {str(row[3]): row for row in group}
+            if len(unique) >= 2:
+                sources = {str(row[4]) for row in unique.values()}
+                # Repeated same-source signals need at least three evidence
+                # records; a two-record group must have independent sources.
+                if len(sources) >= 2 or len(unique) >= 3:
+                    members = list(unique.values())
+                    last_seen = max(float(row[6]) for row in members)
+                    time_slot = int(first_seen // window_seconds)
+                    key = _digest("candidate", kind, value, time_slot)
+                    candidate_id = "cand-" + key[:24]
+                    source_count = len(sources)
+                    type_weight = MATCH_WEIGHTS.get(kind, 10)
+                    confidence = min(85, 30 + min(20, (len(unique) - 2) * 5)
+                                     + min(20, (source_count - 1) * 15)
+                                     + min(15, type_weight // 6))
+                    current = desired.get(candidate_id)
+                    combined = {str(row[3]): row for row in (current["members"] if current else [])}
+                    combined.update(unique)
+                    combined_source_count = len({str(row[4]) for row in combined.values()})
+                    all_members = sorted(combined.values(), key=lambda row: float(row[6]))[:100]
+                    confidence = min(85, 30 + min(20, (len(combined) - 2) * 5)
+                                     + min(20, (combined_source_count - 1) * 15)
+                                     + min(15, type_weight // 6))
+                    desired[candidate_id] = {
+                        "candidate_id": candidate_id, "candidate_key": key,
+                        "primary_entity_type": kind, "primary_entity_value": value,
+                        "first_seen": min(first_seen, current["first_seen"] if current else first_seen),
+                        "last_seen": max(last_seen, current["last_seen"] if current else last_seen),
+                        "evidence_count": len(combined), "source_count": combined_source_count,
+                        "confidence": confidence,
+                        "members": all_members,
+                    }
+            # Consume this bounded window once; overlapping windows would
+            # repeat work for high-volume entities without adding provenance.
+            start = end
+
+    now = time.time()
+    for item in desired.values():
+        db.execute('''INSERT INTO correlation_candidates
+            (candidate_id,candidate_key,primary_entity_type,primary_entity_value,
+             first_seen,last_seen,evidence_count,source_count,confidence,classification,updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,'candidate',?)
+            ON CONFLICT(candidate_key) DO UPDATE SET
+              last_seen=MAX(correlation_candidates.last_seen,excluded.last_seen),
+              evidence_count=MAX(correlation_candidates.evidence_count,excluded.evidence_count),
+              source_count=MAX(correlation_candidates.source_count,excluded.source_count),
+              confidence=MAX(correlation_candidates.confidence,excluded.confidence),
+              updated_at=excluded.updated_at''',
+            (item["candidate_id"], item["candidate_key"], item["primary_entity_type"],
+             item["primary_entity_value"], item["first_seen"], item["last_seen"],
+             item["evidence_count"], item["source_count"], item["confidence"], now))
+        db.executemany('''INSERT INTO correlation_candidate_evidence
+            (candidate_id,evidence_id,source,source_record_id,observed_at,confidence)
+            VALUES (?,?,?,?,?,?) ON CONFLICT(candidate_id,evidence_id) DO UPDATE SET
+              observed_at=MAX(correlation_candidate_evidence.observed_at,excluded.observed_at),
+              confidence=MAX(correlation_candidate_evidence.confidence,excluded.confidence)''',
+            [(item["candidate_id"], row[3], row[4], row[5], row[6], row[7])
+             for row in item["members"]])
+    db.execute("DELETE FROM correlation_candidate_evidence WHERE candidate_id IN (SELECT candidate_id FROM correlation_candidates WHERE last_seen<?)", (cutoff,))
+    db.execute("DELETE FROM correlation_candidates WHERE last_seen<?", (cutoff,))
+    result = {"candidates": len(desired), "observations_considered": len(rows),
+              "truncated": int(len(rows) >= row_limit)}
+    db.execute('''INSERT INTO correlation_candidate_state
+        (singleton,last_run,observations_considered,candidates,truncated,status,error)
+        VALUES (1,?,?,?,?,'ok',NULL) ON CONFLICT(singleton) DO UPDATE SET
+        last_run=excluded.last_run,observations_considered=excluded.observations_considered,
+        candidates=excluded.candidates,truncated=excluded.truncated,status='ok',error=NULL''',
+        (now, result["observations_considered"], result["candidates"], result["truncated"]))
+    return result
+
+
+def correlation_candidates(db, start: float | None = None, end: float | None = None,
+                           limit: int = 20) -> dict[str, Any]:
+    ensure_schema(db)
+    limit = max(1, min(int(limit), 100))
+    filters, params = [], []
+    if start is not None:
+        filters.append("last_seen>=?"); params.append(float(start))
+    if end is not None:
+        filters.append("first_seen<?"); params.append(float(end))
+    where = " WHERE " + " AND ".join(filters) if filters else ""
+    total = int(db.execute("SELECT COUNT(*) FROM correlation_candidates" + where, params).fetchone()[0] or 0)
+    state = db.execute('''SELECT last_run,observations_considered,candidates,truncated,status,error
+        FROM correlation_candidate_state WHERE singleton=1''').fetchone()
+    candidates = []
+    for row in db.execute("""SELECT candidate_id,primary_entity_type,primary_entity_value,
+            first_seen,last_seen,evidence_count,source_count,confidence,classification
+        FROM correlation_candidates""" + where + " ORDER BY last_seen DESC,confidence DESC LIMIT ?",
+        [*params, limit]).fetchall():
+        evidence = db.execute('''SELECT evidence_id,source,source_record_id,observed_at,confidence
+            FROM correlation_candidate_evidence WHERE candidate_id=? ORDER BY observed_at LIMIT 100''', (row[0],)).fetchall()
+        candidates.append({
+            "candidate_id": row[0], "classification": row[8], "confirmed": False,
+            "primary_entity": {"type": row[1], "value": row[2]},
+            "first_seen": datetime.fromtimestamp(row[3], timezone.utc).isoformat(),
+            "last_seen": datetime.fromtimestamp(row[4], timezone.utc).isoformat(),
+            "evidence_count": row[5], "source_count": row[6], "confidence": row[7],
+            "evidence_sampled": int(row[5]) > len(evidence),
+            "sources": sorted({item[1] for item in evidence}),
+            "evidence": [{"evidence_id": item[0], "source": item[1],
+                          "source_record_id": item[2],
+                          "observed_at": datetime.fromtimestamp(item[3], timezone.utc).isoformat(),
+                          "confidence": item[4]} for item in evidence],
+            "reason": "Shared canonical entity in a bounded time window; this is a correlation candidate, not a confirmed incident.",
+        })
+    state_status = str(state[4]) if state else "materializing"
+    range_covered = start is None or float(start) >= time.time() - CANDIDATE_LOOKBACK_HOURS * 3600
+    status = ("unavailable" if state_status == "error" else
+              "materializing" if state_status != "ok" else
+              "partial" if not range_covered else
+              "available" if candidates else "no_candidates")
+    return {"status": status,
+            "total": total, "items": candidates, "limit": limit,
+            "observations_considered": int(state[1]) if state else None,
+            "last_materialized_at": datetime.fromtimestamp(state[0], timezone.utc).isoformat() if state else None,
+            "lookback_hours": CANDIDATE_LOOKBACK_HOURS,
+            "range_covered": range_covered,
+            "truncated": bool(state[3]) if state else False,
+            "error": state[5] if state and state[5] else None,
+            "source": "local durable entity graph"}
+
+
+def record_candidate_materialization_error(db, error: str) -> None:
+    ensure_schema(db)
+    db.execute('''INSERT INTO correlation_candidate_state
+        (singleton,last_run,observations_considered,candidates,truncated,status,error)
+        VALUES (1,?,0,0,0,'error',?) ON CONFLICT(singleton) DO UPDATE SET
+        last_run=excluded.last_run,status='error',error=excluded.error''',
+        (time.time(), str(error)[:500]))
+
+
 def cluster_id(incident_id: str) -> str:
     return "cluster-" + _digest("defender:" + str(incident_id))[:24]
 
@@ -564,12 +893,14 @@ def cleanup(db, retention_days: int = 30) -> dict[str, int]:
     for offset in range(0, len(expired), 500):
         batch = expired[offset:offset + 500]
         placeholders = ",".join("?" for _ in batch)
+        db.execute(f"DELETE FROM correlation_candidate_evidence WHERE evidence_id IN ({placeholders})", batch)
         db.execute(f"DELETE FROM entity_cluster_members WHERE evidence_id IN ({placeholders})", batch)
         db.execute(f"DELETE FROM entity_relations WHERE evidence_id IN ({placeholders})", batch)
         db.execute(f"DELETE FROM entity_observations WHERE evidence_id IN ({placeholders})", batch)
         db.execute(f"DELETE FROM entity_evidence WHERE evidence_id IN ({placeholders})", batch)
     nodes = db.execute("DELETE FROM entity_nodes WHERE entity_id NOT IN (SELECT entity_id FROM entity_observations)").rowcount
     db.execute("DELETE FROM entity_clusters WHERE cluster_id NOT IN (SELECT cluster_id FROM entity_cluster_members)")
+    db.execute("DELETE FROM correlation_candidates WHERE last_seen<? OR candidate_id NOT IN (SELECT candidate_id FROM correlation_candidate_evidence)", (cutoff,))
     db.execute("DELETE FROM entity_graph_batches WHERE committed_at<?", (cutoff,))
     return {"evidence": len(expired), "entities": nodes}
 

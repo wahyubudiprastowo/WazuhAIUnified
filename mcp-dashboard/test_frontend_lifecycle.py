@@ -8,6 +8,28 @@ ROOT = Path(__file__).resolve().parent
 
 
 class FrontendLifecycleTests(unittest.TestCase):
+    def test_ai_provenance_is_visible_without_claiming_semantic_validation(self):
+        automation = (ROOT / "static" / "automation.js").read_text(encoding="utf-8")
+        findings = (ROOT / "static" / "findings.js").read_text(encoding="utf-8")
+        server = (ROOT / "server.py").read_text(encoding="utf-8")
+        self.assertIn("not whether evidence meaning supports the claim", automation)
+        self.assertIn("semantic support is not assessed", findings)
+        self.assertIn("semantic support not assessed", automation)
+        self.assertIn("row.evidence_ids || row.evidence || []", automation)
+        self.assertIn("reference_validation", (ROOT / "soc_automation.py").read_text(encoding="utf-8"))
+        self.assertIn("Reference ID available in input context", findings)
+        self.assertIn("/api/findings/ai-history", findings)
+        self.assertIn('self.path == "/api/findings/ai-history"', server)
+
+    def test_defender_alerts_are_collected_and_rendered_as_alert_records(self):
+        collector = (ROOT / "defender_xdr.py").read_text(encoding="utf-8")
+        findings = (ROOT / "static" / "findings.js").read_text(encoding="utf-8")
+        history = (ROOT / "static" / "history.js").read_text(encoding="utf-8")
+        self.assertIn('"alerts": {"path": "/v1.0/security/alerts_v2"', collector)
+        self.assertIn("recent_alerts", findings)
+        self.assertIn("Open alert in Microsoft Defender", findings)
+        self.assertIn("record_type === 'alert'", history)
+
     def test_coverage_is_limited_to_evidence_views(self):
         source = (ROOT / "static" / "analysis-workspace.js").read_text(encoding="utf-8")
         self.assertIn('const coverageViews = new Set(["findings", ...areas]);', source)
@@ -43,6 +65,44 @@ class FrontendLifecycleTests(unittest.TestCase):
         source = (ROOT / "static" / "findings.js").read_text(encoding="utf-8")
         self.assertIn("if (findingsActive())", source)
         self.assertIn('if (event.detail.view !== "findings") return;', source)
+
+    def test_findings_and_coverage_hydrate_overview_if_initial_event_was_missed(self):
+        findings = (ROOT / "static" / "findings.js").read_text(encoding="utf-8")
+        workspace = (ROOT / "static" / "analysis-workspace.js").read_text(encoding="utf-8")
+        html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
+        self.assertIn("if (state.overview) receiveOverview(state.overview);", findings)
+        self.assertIn("if (state.overview && coverageEnabled(state.view)) setTimeout(loadCoverage, 0);", workspace)
+        self.assertIn("findings.js?v=20260925-3", html)
+        self.assertIn("analysis-workspace.js?v=20260925-2", html)
+
+    def test_findings_renderer_surfaces_bad_payload_instead_of_sticking_on_loading(self):
+        findings = (ROOT / "static" / "findings.js").read_text(encoding="utf-8")
+        app = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
+        self.assertIn("function buildRowsFromData()", findings)
+        self.assertIn("Findings could not be rendered", findings)
+        self.assertIn("Security Findings module failed", app)
+        self.assertIn("Unable to load ${scriptUrl}", app)
+        self.assertIn('findings: "Security Findings"', app)
+        self.assertIn("app.js?v=20260925-7", html)
+        self.assertIn("findings.js?v=20260925-3", html)
+
+    def test_findings_fall_back_to_available_overview_and_show_coverage_state(self):
+        findings = (ROOT / "static" / "findings.js").read_text(encoding="utf-8")
+        workspace = (ROOT / "static" / "analysis-workspace.js").read_text(encoding="utf-8")
+        html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
+        self.assertIn("f.coverage?.rules?.length ? f.coverage.rules : d.threats", findings)
+        self.assertIn("d.operational_evidence?.decoders?.items", findings)
+        self.assertIn('setCoverageStatus("error", e.message)', workspace)
+        self.assertIn('id="findingsScope"', html)
+        self.assertIn('alertCount == null ? "-"', findings)
+        self.assertIn('d.detail_materialization?.status === "building"', findings)
+        self.assertIn('overview.detail_materialization?.status === "building"', (ROOT / "static" / "app.js").read_text(encoding="utf-8"))
+        server = (ROOT / "server.py").read_text(encoding="utf-8")
+        self.assertIn('"l1": {"status": l1_detail_status, "message": l1_detail_message}', server)
+        self.assertIn('correlation_groups', (ROOT / "static" / "app.js").read_text(encoding="utf-8"))
+        self.assertIn("Candidates are not confirmed incidents or attack paths", (ROOT / "static" / "app.js").read_text(encoding="utf-8"))
+        self.assertIn('DASHBOARD_BUILD_ID = "2026-09-25-patch10"', server)
 
     def test_workflow_runner_is_centralized_in_tool_console(self):
         source = (ROOT / "static" / "workflows.js").read_text(encoding="utf-8")
@@ -93,6 +153,28 @@ class FrontendLifecycleTests(unittest.TestCase):
         self.assertIn('data-case-page="next"', source)
         self.assertIn('offset, limit: state.casePagination.limit', source)
 
+    def test_command_situation_uses_case_store_entity_contract_and_marks_unknowns(self):
+        source = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
+        self.assertIn('entity.entity_type', source)
+        self.assertIn('entity.entity_value', source)
+        self.assertIn('groups.status === "partial"', source)
+        self.assertIn('"Not configured"', source)
+        self.assertIn('"Unknown"', source)
+        self.assertIn('id="situationDecision"', html)
+        self.assertIn('data.attack_activity', source)
+        self.assertIn('data-view-link="${esc(item.view)}"', source)
+        self.assertIn('not proof that an attack succeeded', source)
+
+    def test_case_timeline_is_evidence_sequence_not_attack_path(self):
+        source = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        server = (ROOT / "server.py").read_text(encoding="utf-8")
+        self.assertIn('postJson("/api/incidents/timeline"', source)
+        self.assertIn("Chronological evidence linked to case entities", source)
+        self.assertIn("This is not an attack path", source)
+        self.assertIn("No explicit ATT&amp;CK technique mapping stored", source)
+        self.assertIn('self.path == "/api/incidents/timeline"', server)
+
     def test_incident_detail_is_an_editable_versioned_workspace(self):
         source = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
         for action in ("assign", "status", "note", "evidence", "containment", "resolve", "reopen", "close"):
@@ -111,6 +193,25 @@ class FrontendLifecycleTests(unittest.TestCase):
         for status in ("ready", "observed_incomplete", "degraded", "stale", "not_observed"):
             self.assertIn(status, source)
             self.assertIn(f".telemetrySource.{status}", styles)
+
+    def test_historical_unknowns_are_not_rendered_as_zero_or_empty_findings(self):
+        source = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        server = (ROOT / "server.py").read_text(encoding="utf-8")
+        self.assertIn('data.agents?.status === "unavailable"', source)
+        self.assertIn('data.alerts?.severity_status === "unavailable"', source)
+        self.assertIn('cloud.status === "unavailable"', source)
+        self.assertIn('vulns.status === "partial"', source)
+        self.assertIn('"sampled": None', server)
+        self.assertIn('"total": None, "workloads": [], "operations": [], "client_ips": [], "events": []', server)
+
+    def test_runtime_build_identity_is_visible_for_deployment_verification(self):
+        source = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        server = (ROOT / "server.py").read_text(encoding="utf-8")
+        deploy_check = (ROOT.parent / "tools" / "check_dashboard_deploy.sh").read_text(encoding="utf-8")
+        self.assertIn('build ${overview.build_id || "unknown"}', source)
+        self.assertIn('DASHBOARD_BUILD_ID = "2026-09-25-patch10"', server)
+        self.assertIn("Shared dashboard/materializer code parity", deploy_check)
+        self.assertIn("mcp-dashboard mcp-materializer", deploy_check)
 
 
 if __name__ == "__main__":

@@ -15,7 +15,7 @@ owning view, but panels must not repeat the same table, chart, or tool catalog.
 | Threat Hunting | Hunt hypothesis, ATT&CK/decoder coverage, historical provider result, analyst pivots | Tool counts, response catalog | Rollups and retained workflow/provider results |
 | Vulnerabilities | Asset exposure graph, CVE priority, patch state, CYFIRMA intelligence updates | Generic threat findings | Wazuh inventory, CVE observations/cache, CYFIRMA ledger |
 | Assets | CMDB identity, owner, criticality, zone, vendor/version/CPE | Vulnerability list copy | CMDB and Wazuh inventory |
-| Tool Console | 194-tool discovery, manual invocation, raw execution diagnostics | Operational findings | MCP catalogs and saved workflow jobs |
+| Tool Console | Live tool discovery, manual invocation, raw execution diagnostics | Operational findings | MCP catalogs and saved workflow jobs |
 | Settings | Dependency health, freshness, quota/backlog, storage and policy | Finding data | Local configuration and health snapshots |
 
 ## Collection Policy

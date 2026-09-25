@@ -8,8 +8,11 @@ const state = {
   incidents: [],
   l1Queue: [],
   persistentCases: [],
+  caseLoadStatus: "not_loaded",
   caseDetails: {},
+  caseTimelines: {},
   caseDetailLoading: "",
+  caseTimelineLoading: {},
   caseMutationError: "",
   caseMutationBusy: false,
   casePagination: {offset: 0, limit: 25, total: 0, next_offset: null},
@@ -47,6 +50,7 @@ const newNames = new Set([
 ]);
 
 const viewTitles = {
+  findings: "Security Findings",
   history: "Event History",
   command: "Command",
   workbench: "SOC Workbench",
@@ -116,6 +120,23 @@ function esc(value) {
     "'": "&#039;",
   }[char]));
 }
+
+function showFindingsModuleError(message) {
+  if (state.view !== "findings") return;
+  const detail = String(message || "Browser failed to load findings.js.").slice(0, 300);
+  const visible = `Security Findings module failed: ${detail}`;
+  if (q("#findingsCount")) q("#findingsCount").textContent = "Findings module error";
+  if (q("#findingsScope")) q("#findingsScope").textContent = visible;
+  if (q("#findingsRows")) q("#findingsRows").innerHTML = `<div class="findingEmpty">${esc(visible)}</div>`;
+  if (q("#findingDetail")) q("#findingDetail").innerHTML = `<div class="findingEmpty">${esc(visible)}</div>`;
+  console.error("[SOC Findings] Module load/runtime error:", detail);
+}
+
+window.addEventListener("error", (event) => {
+  const scriptUrl = event.target instanceof HTMLScriptElement ? event.target.src : event.filename;
+  if (!/\/static\/findings\.js(?:[?#]|$)/i.test(String(scriptUrl || ""))) return;
+  showFindingsModuleError(event.message || `Unable to load ${scriptUrl}`);
+}, true);
 
 function setText(selector, value) {
   const el = q(selector);
@@ -460,13 +481,17 @@ function renderTools() {
   if (!els.list) return;
   const tools = visibleTools();
   const summary = state.toolSummary || {};
+  const unmappedNames = summary.menu_unmapped_names || [];
+  const catalogNote = number(summary.menu_unmapped) > 0
+    ? `${fmt.format(number(summary.menu_unmapped))} discovered tool(s) have no owning menu and remain approval-only: ${unmappedNames.map(esc).join(", ")}`
+    : "All discovered tools have a menu mapping and execution policy. Opening a page never runs a tool.";
   setHtml("#toolReadiness", `
     <span><strong>${fmt.format(number(summary.discovered || state.tools.length))}</strong> discovered</span>
     <span><strong>${fmt.format(number(summary.automatic))}</strong> automatic reads</span>
     <span><strong>${fmt.format(number(summary.guided))}</strong> guided pivots</span>
     <span><strong>${fmt.format(number(summary.cached_read))}</strong> cached reads</span>
     <span><strong>${fmt.format(number(summary.approval_required))}</strong> approval required</span>
-    <small>All discovered tools have a menu and execution policy. Opening a page never runs a tool.</small>
+    <small>${catalogNote}</small>
   `);
   els.list.innerHTML = tools.map((tool) => `
     <button class="toolItem ${state.selected?.name === tool.name && state.selected?.source === tool.source ? "active" : ""}" type="button" data-tool="${esc(tool.source)}:${esc(tool.name)}">
@@ -540,6 +565,9 @@ function applyToolPivot(tool, pivot = {}) {
 }
 
 function computeRisk(data) {
+  if (!data?.alerts || data.alerts.total_alerts == null || data.materialization?.status === "building" ||
+      Object.keys(data.errors || {}).length || data.agents?.status === "unavailable" ||
+      data.vulnerabilities?.critical == null || data.alerts?.severity_status === "unavailable") return null;
   const sev = data.alerts?.severity || {};
   const vulns = data.vulnerabilities || {};
   const agents = data.agents || {};
@@ -557,19 +585,30 @@ function computeRisk(data) {
 
 function renderPosture(data) {
   const risk = computeRisk(data);
+  if (risk == null) {
+    setText("#riskScore", "—");
+    setText("#postureTitle", ui("Cakupan belum cukup untuk menilai", "Coverage insufficient to assess"));
+    setText("#postureBadge", ui("Status parsial", "Partial status"));
+    setText("#riskMeta", ui("Tekanan operasional", "Operational pressure"));
+    setText("#postureCopy", ui("Satu atau lebih sumber utama tidak tersedia. Angka risiko tidak dihitung dari data yang tidak lengkap.", "One or more primary sources are unavailable. No score is calculated from incomplete data."));
+    setHtml("#riskFactors", `<span class="riskFactor">${esc(ui("Sumber utama tidak lengkap", "Primary source coverage incomplete"))}</span>`);
+    const dialUnknown = q("#riskDial");
+    if (dialUnknown) dialUnknown.style.background = "conic-gradient(rgba(255,255,255,.12) 0deg 360deg)";
+    return;
+  }
   const color = risk >= 70 ? "#ff6b8a" : risk >= 40 ? "#f7c76c" : "#4de2a6";
   const range = data.requested_range || data.alerts?.time_range || "24h";
   const rangeLabel = currentRangeLabel(data);
   setText("#riskScore", String(risk));
   setText("#postureTitle", risk >= 70 ? ui("Perlu perhatian tinggi", "High Attention Required") : risk >= 40 ? ui("Beban SOC meningkat", "Elevated SOC Load") : ui("SOC stabil", "SOC Stable"));
   setText("#postureBadge", risk >= 70 ? ui("Respons prioritas", "Priority response") : risk >= 40 ? ui("Investigasi hari ini", "Investigate today") : ui("Monitor", "Monitor"));
-  setText("#riskMeta", ui("Risiko SOC", "SOC Risk"));
+  setText("#riskMeta", ui("Tekanan operasional*", "Operational pressure*"));
   setText(
     "#postureCopy",
     ui(
-      `Tampilan ${humanRange(range)}: ${fmt.format(number(data.alerts?.sampled))} alert terbaru disampel dari ${fmt.format(number(data.alerts?.total_alerts))} alert terindeks, ${fmt.format(number(data.vulnerabilities?.critical))} CVE kritis, ${fmt.format(number(data.ai_recon?.ai_agent_sources))} sumber AI recon.`,
-      `${rangeLabel} view: ${fmt.format(number(data.alerts?.sampled))} latest alerts sampled from ${fmt.format(number(data.alerts?.total_alerts))} indexed alerts, ${fmt.format(number(data.vulnerabilities?.critical))} critical CVEs, ${fmt.format(number(data.ai_recon?.ai_agent_sources))} AI recon source(s).`
-    )
+      `Tampilan ${humanRange(range)}: ${fmt.format(number(data.alerts?.sampled))} detail L1 dari ${fmt.format(number(data.alerts?.l1_total))} alert level 7+ (batas ${number(data.alerts?.sampled_limit)}), ${fmt.format(number(data.alerts?.total_alerts))} alert terindeks, ${fmt.format(number(data.vulnerabilities?.critical))} CVE kritis, ${fmt.format(number(data.ai_recon?.ai_agent_sources))} sumber AI recon.`,
+      `${rangeLabel} view: ${fmt.format(number(data.alerts?.sampled))} L1 detail rows from ${fmt.format(number(data.alerts?.l1_total))} level 7+ alerts (limit ${number(data.alerts?.sampled_limit)}), ${fmt.format(number(data.alerts?.total_alerts))} indexed alerts, ${fmt.format(number(data.vulnerabilities?.critical))} critical CVEs, ${fmt.format(number(data.ai_recon?.ai_agent_sources))} AI recon source(s).`
+    ) + ` ${ui("Skor adalah indikator beban, bukan probabilitas kompromi.", "Score is an operational signal, not compromise probability.")}`
   );
   renderRiskFactors(data);
   const dial = q("#riskDial");
@@ -586,7 +625,7 @@ function renderRiskFactors(data) {
     [`${fmt.format(number(data.vulnerabilities?.critical))}`, ui("CVE kritis", "critical CVEs")],
     [`${fmt.format(number(data.vulnerabilities?.high))}`, ui("CVE high", "high CVEs")],
     [`${fmt.format(number(data.ai_recon?.ai_agent_sources))}`, ui("sumber AI recon", "AI recon sources")],
-    [`${fmt.format(number(sev.medium) + number(sev.high) + number(sev.critical))}`, ui("sampel alert non-low", "non-low alert sample")],
+    [`${fmt.format(number(sev.medium) + number(sev.high) + number(sev.critical))}`, ui("alert non-low terindeks", "indexed non-low alerts")],
     [`${fmt.format(active)}/${fmt.format(total)}`, ui("agent aktif", "agents active")],
   ];
   setHtml("#riskFactors", factors.map(([value, label]) => `
@@ -594,13 +633,101 @@ function renderRiskFactors(data) {
   `).join(""));
 }
 
+function renderSituation(data) {
+  const summary = q("#situationSummary");
+  const decisionRoot = q("#situationDecision");
+  const candidatesRoot = q("#situationCandidates");
+  if (!summary || !decisionRoot || !candidatesRoot) return;
+  const cases = state.persistentCases || [];
+  const caseTotal = number(state.casePagination.total);
+  const completeCaseSet = state.caseLoadStatus === "ok" && caseTotal <= cases.length;
+  const active = cases.filter(item => !["resolved", "closed"].includes(String(item.status || "open").toLowerCase()));
+  const latestVerdict = item => {
+    const verdicts = [...(item.verdicts || [])].sort((a, b) => Date.parse(a.ts || 0) - Date.parse(b.ts || 0));
+    return item.latest_verdict?.verdict || (verdicts.length ? verdicts[verdicts.length - 1].verdict : "") || item.verdict || "";
+  };
+  const confirmed = active.filter(item => latestVerdict(item) === "true_positive");
+  const assetRows = data.agents?.context || [];
+  let assetLinkageComplete = true;
+  const criticalAssets = new Set();
+  const identities = new Set();
+  for (const item of confirmed) {
+    const entities = item.entities || item.entity_links || [];
+    const linkedAssets = entities.filter(entity => /asset|device|host|machine|agent|endpoint/i.test(String(entity.type || entity.entity_type || "")));
+    if (linkedAssets.length === 0) assetLinkageComplete = false;
+    for (const entity of entities) {
+      const value = String(entity.value || entity.entity_value || "").toLowerCase();
+      const entityType = String(entity.type || entity.entity_type || "");
+      if (/user|identity|upn|mailbox/i.test(entityType) && value) identities.add(value);
+    }
+    for (const entity of linkedAssets) {
+      const value = String(entity.value || entity.entity_value || "").toLowerCase();
+      if (!value) { assetLinkageComplete = false; continue; }
+      const asset = assetRows.find(row => [row.id, row.agent_id, row.name, row.host, row.hostname, row.fqdn, row.ip, row.address].some(v => String(v || "").toLowerCase() === value));
+      if (!asset?.criticality) assetLinkageComplete = false;
+      else if (/critical|high/i.test(String(asset.criticality))) criticalAssets.add(String(asset.id || asset.name || asset.ip));
+    }
+  }
+  const criticalityKnown = confirmed.length === 0 || (assetRows.length > 0 && assetLinkageComplete);
+  const now = Date.now();
+  const slaCases = active.filter(item => item.sla_due && !Number.isNaN(new Date(item.sla_due).getTime()));
+  const overdue = slaCases.filter(item => new Date(item.sla_due).getTime() < now).length;
+  const caseReady = state.caseLoadStatus === "ok";
+  const slaAvailable = caseReady && (active.length === 0 || slaCases.length > 0);
+  const value = (count, available, lowerBound = false) => !available ? "Unavailable" : `${lowerBound ? ">= " : ""}${fmt.format(count)}`;
+  const metrics = [
+    ["Confirmed active cases", value(confirmed.length, caseReady, !completeCaseSet), completeCaseSet ? "Persistent case with true-positive verdict" : "Lower bound from loaded case page"],
+    ["Open cases", value(active.length, caseReady, !completeCaseSet), completeCaseSet ? `${fmt.format(caseTotal)} cases in selected range` : "Case list is paginated"],
+    ["Critical assets in confirmed cases", criticalityKnown ? value(criticalAssets.size, caseReady, !completeCaseSet) : "Unknown", criticalityKnown ? "Entity match against loaded CMDB context" : "CMDB criticality missing or not loaded"],
+    ["Identities in confirmed cases", value(identities.size, caseReady, !completeCaseSet), "Distinct identities in true-positive cases; not an identity risk score"],
+    ["SLA overdue", slaAvailable ? value(overdue, true, !completeCaseSet) : "Not configured", slaAvailable ? `${fmt.format(slaCases.length)} active cases have an SLA due time` : "No SLA due time is configured on active cases"],
+  ];
+  summary.innerHTML = metrics.map(([label, metric, note]) => `<div class="situationMetric"><span>${esc(label)}</span><strong>${esc(metric)}</strong><small>${esc(note)}</small></div>`).join("");
+
+  const groups = data.correlation_groups || {};
+  const candidates = groups.items || [];
+  const activity = data.attack_activity || {};
+  const families = Array.isArray(activity.families) ? activity.families.slice(0, 8) : [];
+  const maxFamilyCount = Math.max(1, ...families.map(item => number(item.count)));
+  const activityStatus = activity.status === "available" ? "Materialized for selected range" :
+    activity.status === "partial" ? "Partial rollup coverage" :
+    activity.status === "no_classified_signals" ? "No classified signal in complete rollup" :
+    activity.status === "materializing" ? "Rollup is still materializing" : "Signal summary unavailable";
+  const familyRows = families.map(item => {
+    const count = Math.max(0, number(item.count));
+    const width = Math.min(100, Math.max(0, count / maxFamilyCount * 100));
+    const label = String(item.family || "other").replace(/[._-]+/g, " ");
+    return `<div class="situationAttackRow"><div><strong>${esc(label)}</strong><span>${fmt.format(count)}</span></div><progress max="100" value="${width}" aria-label="${esc(label)}: ${fmt.format(count)} classified alert signals"></progress></div>`;
+  }).join("");
+  const actions = [];
+  if (!caseReady) actions.push({label: "Load persistent case state before assigning incident status", view: "incidents", reason: "Case store unavailable"});
+  else if (confirmed.length) actions.push({label: "Review true-positive cases, owners, and overdue SLA", view: "incidents", reason: `${fmt.format(confirmed.length)} active confirmed case(s)`});
+  if (candidates.length) actions.push({label: "Validate linked evidence before promoting a correlation candidate", view: "incidents", reason: `${fmt.format(number(groups.total) || candidates.length)} candidate group(s)`});
+  if (number(data.vulnerabilities?.critical) > 0) actions.push({label: "Check critical CVE exposure against asset ownership and patch state", view: "vuln", reason: `${fmt.format(number(data.vulnerabilities.critical))} critical inventory finding(s)`});
+  if (!actions.length && families.length) actions.push({label: "Triage the highest-volume signal family; verify evidence before declaring an attack", view: "l1", reason: `${fmt.format(families.reduce((sum, item) => sum + Math.max(0, number(item.count)), 0))} classified signals`});
+  const actionRows = actions.length ? actions.slice(0, 4).map((item, index) => `<li><span>${index + 1}</span><div><strong>${esc(item.label)}</strong><small>${esc(item.reason)}</small></div><button type="button" data-view-link="${esc(item.view)}">Open</button></li>`).join("") : `<li class="situationActionEmpty">${caseReady ? "No prioritized action can be derived from the current case and rollup evidence." : "Situation actions are unavailable until case state loads."}</li>`;
+  decisionRoot.innerHTML = `<section class="situationAttack" aria-labelledby="situationAttackTitle"><div class="situationSubhead"><h3 id="situationAttackTitle">Observed attack signals</h3><span>${esc(activityStatus)}</span></div><p class="situationDecisionNote">${esc(activity.interpretation || "Classified alert signals are not proof that an attack succeeded.")}</p>${familyRows || `<div class="situationDecisionEmpty">${activity.status === "no_classified_signals" ? "No classified family signal in the complete selected-range rollup." : "No family counts are available for this range."}</div>`}<small class="situationSource">${esc(activity.source || "Source unavailable")}${activity.coverage_complete ? " · coverage complete" : " · coverage incomplete"}</small></section><section class="situationNext" aria-labelledby="situationNextTitle"><div class="situationSubhead"><h3 id="situationNextTitle">Next analyst actions</h3><span>Evidence-led</span></div><ol>${actionRows}</ol></section>`;
+
+  const candidateStatus = groups.status === "unavailable" ? "Candidate grouping unavailable" :
+    groups.status === "materializing" ? "Candidate grouping has not completed yet" :
+    groups.status === "partial" ? `Partial coverage · rolling ${fmt.format(number(groups.lookback_hours) || 24)}h only` :
+    groups.status === "no_candidates" ? "No candidate groups in the selected window" :
+    `${fmt.format(number(groups.total))} candidate group(s) · local entity graph`;
+  const materializedAt = groups.last_materialized_at ? ` · updated ${groups.last_materialized_at}` : "";
+  const coverageNote = groups.truncated ? "Input limit reached; groups may be incomplete." : "";
+  const scopeNote = groups.status === "partial" ? "The selected historical range is not fully materialized; candidate groups cover only the rolling window." : "Candidate is not a confirmed incident. Review evidence before creating a case or taking action.";
+  candidatesRoot.innerHTML = `<div class="situationCandidateHead"><strong>${esc(candidateStatus)}</strong><small>${esc(scopeNote)}${esc(materializedAt)} ${esc(coverageNote)}</small></div>${candidates.length ? `<div class="situationCandidateList">${candidates.slice(0, 6).map(row => `<article><div><span class="pill medium">Candidate</span><strong>${esc(row.primary_entity?.type || "entity")}: ${esc(row.primary_entity?.value || "not returned")}</strong><small>${esc(row.first_seen || "-")} to ${esc(row.last_seen || "-")}</small></div><div><b>${fmt.format(number(row.evidence_count))} evidence</b><span>${fmt.format(number(row.source_count))} sources · ${fmt.format(number(row.confidence))}% heuristic confidence</span><small>${esc((row.sources || []).join(", ") || "Source unavailable")}</small></div><details><summary>Evidence references (${fmt.format((row.evidence || []).length)}${row.evidence_sampled ? ` of ${fmt.format(number(row.evidence_count))}` : ""})</summary><ul>${(row.evidence || []).slice(0, 12).map(item => `<li><code>${esc(item.evidence_id)}</code> · ${esc(item.source)} · ${esc(item.observed_at)}</li>`).join("") || "<li>Evidence references unavailable</li>"}</ul></details></article>`).join("")}</div>` : `<p class="situationEmpty">${esc(groups.error || (groups.status === "unavailable" ? "Entity graph could not be read." : groups.status === "materializing" ? "Waiting for the first successful local materialization." : groups.status === "partial" ? "No groups are available for the older selected range; only the rolling window has been materialized." : "No qualifying repeated entity evidence has been materialized."))}</p>`}`;
+}
+
 function renderLanes(data) {
   const caps = data.tools?.capabilities || {};
+  const alertAvailable = data.alerts?.status !== "unavailable" && data.alerts?.total_alerts != null;
+  const assetAvailable = data.agents?.status !== "unavailable" && data.agents?.total != null;
   const l1Load = number(data.alerts?.sampled) || number(data.threats?.length);
   const l2Load = number(data.three_sum?.candidate_count) + number(data.ai_recon?.ai_agent_sources) + number(data.vulnerabilities?.critical);
   const l3Load = capCount(caps, "hunt") + capCount(caps, "threat_intel");
-  setText("#laneL1", fmt.format(l1Load));
-  setText("#laneL2", fmt.format(l2Load));
+  setText("#laneL1", alertAvailable ? fmt.format(l1Load) : "—");
+  setText("#laneL2", assetAvailable && data.vulnerabilities?.critical != null ? fmt.format(l2Load) : "—");
   setText("#laneL3", fmt.format(l3Load));
 }
 
@@ -610,13 +737,18 @@ function renderMetrics(data) {
   const activeAgents = number(data.agents?.counts?.active);
   const totalAgents = number(data.agents?.total);
   setText("#metricAlertsLabel", `${ui("Alert", "Alerts")} ${range === "custom" ? "" : range}`);
-  setText("#metricAlerts", fmt.format(number(data.alerts?.total_alerts)));
-  setText("#metricSample", ui(`${rangeLabel} window, ${fmt.format(number(data.alerts?.sampled))} disampel`, `${rangeLabel} window, ${fmt.format(number(data.alerts?.sampled))} sampled`));
-  setText("#metricAgents", fmt.format(activeAgents));
-  setText("#metricAgentTotal", `${fmt.format(totalAgents)} ${ui("total", "total")}`);
-  setText("#metricCriticalCves", fmt.format(number(data.vulnerabilities?.critical)));
-  setText("#metricVulnTotal", `${fmt.format(number(data.vulnerabilities?.total))} ${ui("total", "total")}`);
-  setText("#metricAiSources", fmt.format(number(data.ai_recon?.ai_agent_sources)));
+  setText("#metricAlerts", data.alerts?.status === "unavailable" || data.alerts?.total_alerts == null ? "—" : fmt.format(number(data.alerts?.total_alerts)));
+  setText("#metricSample", data.alerts?.sampled == null
+    ? ui("Detail L1 tidak tersedia pada snapshot ini", "L1 detail unavailable in this snapshot")
+    : ui(`${fmt.format(number(data.alerts?.sampled))} detail L1 / ${fmt.format(number(data.alerts?.l1_total))}; maks ${number(data.alerts?.sampled_limit)}`, `${fmt.format(number(data.alerts?.sampled))} L1 details / ${fmt.format(number(data.alerts?.l1_total))}; max ${number(data.alerts?.sampled_limit)}`));
+  const agentsAvailable = data.agents?.status !== "unavailable" && data.agents?.total != null;
+  const vulnKnown = data.vulnerabilities?.critical != null;
+  const reconKnown = data.ai_recon?.ai_agent_sources != null;
+  setText("#metricAgents", agentsAvailable ? fmt.format(activeAgents) : "—");
+  setText("#metricAgentTotal", agentsAvailable ? `${fmt.format(totalAgents)} ${ui("total", "total")}` : ui("inventaris di luar snapshot", "inventory not in snapshot"));
+  setText("#metricCriticalCves", vulnKnown ? fmt.format(number(data.vulnerabilities?.critical)) : "—");
+  setText("#metricVulnTotal", data.vulnerabilities?.total == null ? ui("inventaris tidak tersedia", "inventory unavailable") : `${fmt.format(number(data.vulnerabilities?.total))} ${ui("total", "total")}`);
+  setText("#metricAiSources", reconKnown ? fmt.format(number(data.ai_recon?.ai_agent_sources)) : "—");
 }
 
 function chartPoints(series, width = 620, height = 180, pad = 20) {
@@ -668,6 +800,15 @@ function sparkAreaSvg(series, title = "Alert activity") {
 }
 
 function renderSeverity(data) {
+  const severityStatus = data.alerts?.severity_status;
+  if (severityStatus && severityStatus !== "available") {
+    const message = severityStatus === "materializing"
+      ? "Severity distribution is being materialized for this historical range."
+      : "Severity distribution is unavailable for this snapshot; zero is not inferred.";
+    setHtml("#severityBars", `<div class="emptyState">${esc(message)}</div>`);
+    setText("#severityNote", severityStatus === "materializing" ? "Materializing" : "Unavailable");
+    return;
+  }
   const sev = data.alerts?.severity || {};
   const order = ["critical", "high", "medium", "low"];
   const total = Math.max(order.reduce((sum, key) => sum + number(sev[key]), 0), 1);
@@ -684,7 +825,7 @@ function renderSeverity(data) {
       <div class="severityDonut" style="background: conic-gradient(${stops});" role="img" aria-label="Severity distribution ${fmt.format(total)} alerts">
         <div>
           <strong>${fmt.format(total)}</strong>
-          <small>sampled</small>
+          <small>indexed</small>
         </div>
       </div>
       <div class="severityLegend">
@@ -1001,7 +1142,7 @@ function renderSocCoverage(data) {
       label: "SIEM Alerts",
       source: "Wazuh",
       value: number(data.alerts?.total_alerts),
-      detail: `${fmt.format(number(data.alerts?.sampled))} sampled, severity/rule pivots ready`,
+      detail: `${fmt.format(number(data.alerts?.sampled))} L1 detail rows shown (max ${number(data.alerts?.sampled_limit)}); severity totals are exact`,
       tone: "high",
       tool: "get_wazuh_alerts",
     },
@@ -1126,6 +1267,10 @@ function renderDetectionLayers(data) {
 
 function renderCloudM365(data) {
   const cloud = data.cloud_m365 || {};
+  if (cloud.status === "unavailable" || cloud.status === "materializing" || cloud.ok === false) {
+    setHtml("#cloudM365Panel", `<div class="emptyState">${esc(cloud.message || (cloud.status === "materializing" ? "Microsoft 365 summary is materializing." : "Microsoft 365 event detail is unavailable for this view."))}</div>`);
+    return;
+  }
   const bucketList = (title, rows) => {
     const max = Math.max(...(rows || []).map((row) => number(row.doc_count)), 1);
     return `
@@ -1411,10 +1556,28 @@ function renderSourceIps(data) {
 function renderCorrelation(data) {
   const cats = data.three_sum?.categories || [];
   const historicalStatus = data.historical_detail?.l2;
+  const historicalRange = ["7d", "30d", "custom"].includes(data.requested_range);
+  const entityGroups = data.correlation_groups || {};
   const config = data.three_sum?.configuration || {};
   const windowLabel = data.requested_range || "24h";
   const lookback = number(config.lookback_minutes || data.three_sum?.lookback_minutes || 60);
   const threshold = number(config.threshold_score || data.three_sum?.threshold_score || 35);
+  if (historicalRange) {
+    const candidates = entityGroups.items || [];
+    const isPartial = entityGroups.status === "partial";
+    setText("#correlationMeta", `${windowLabel} | ${isPartial ? `rolling ${fmt.format(number(entityGroups.lookback_hours) || 24)}h entity graph` : "stored entity graph"}`);
+    setText("#correlationIntro", candidates.length
+      ? `${fmt.format(candidates.length)} correlation candidate(s) from the local entity graph. ${isPartial ? "Only the rolling window is covered for this historical selection." : ""} Candidates are not confirmed incidents or attack paths.`
+      : (entityGroups.status === "unavailable" ? "Local entity graph is unavailable for this range." : entityGroups.status === "partial" ? `No candidate in the available rolling ${fmt.format(number(entityGroups.lookback_hours) || 24)}h overlap; older selected-range correlation is not materialized.` : "No entity-graph candidates matched this selected range."));
+    setHtml("#correlationGrid", candidates.map(row => `
+      <div class="corrCell">
+        <span class="muted">Candidate · ${esc(row.primary_entity?.type || "entity")}</span>
+        <strong>${esc(row.primary_entity?.value || "not returned")}</strong>
+        <small>${fmt.format(number(row.evidence_count))} evidence · ${fmt.format(number(row.source_count))} sources · ${fmt.format(number(row.confidence))}% heuristic confidence</small>
+        <small>${esc(row.first_seen || "-")} to ${esc(row.last_seen || "-")}</small>
+      </div>`).join("") || `<div class="emptyState">${esc(entityGroups.error || (entityGroups.status === "unavailable" ? "Entity graph unavailable." : "No stored candidate groups for this date range."))}</div>`);
+    return;
+  }
   setText("#correlationMeta", `${windowLabel} view | ${lookback}m lookback`);
   setText("#correlationIntro", historicalStatus && historicalStatus.status !== "available"
     ? historicalStatus.message
@@ -1441,7 +1604,7 @@ function renderAiRecon(data) {
   const sourceCount = number(data.ai_recon?.ai_agent_sources || sources.length);
   setText("#aiReconMeta", `${windowLabel} | ${fmt.format(sourceCount)} sources`);
   setText("#aiReconIntro", ui("Pola request menyerupai probe otomatis terhadap file sensitif. Ini belum membuktikan penggunaan AI atau keberhasilan eksploitasi.", "Request patterns resemble automated probing of sensitive files. This does not prove AI usage or successful exploitation."));
-  setHtml("#aiReconList", historicalStatus && historicalStatus.status !== "available" ? `<div class="emptyState">${esc(historicalStatus.message)}</div>` : sources.map((source) => `
+  setHtml("#aiReconList", historicalStatus && historicalStatus.status !== "available" ? `<div class="emptyState">${esc(data.ai_recon?.message || historicalStatus.message)}</div>` : sources.map((source) => `
     <div class="intelItem">
       <div>
         <strong>${esc(source.srcip || source.source_ip || "-")}</strong>
@@ -1460,13 +1623,19 @@ function renderAiRecon(data) {
 function renderVulnerabilities(data) {
   const vulns = data.vulnerabilities || {};
   const rows = vulns.critical_items || [];
+  const count = (value) => value == null ? "—" : fmt.format(number(value));
+  const scopeNote = vulns.status === "partial"
+    ? '<div class="emptyState">Only the retained critical-CVE summary is available for this range; severity breakdown and affected-asset rows are not stored historically.</div>'
+    : vulns.status === "unavailable" ? '<div class="emptyState">Vulnerability inventory is unavailable for this historical snapshot.</div>'
+      : vulns.status === "materializing" ? '<div class="emptyState">Vulnerability summary is being loaded for this snapshot.</div>' : "";
   setHtml("#criticalVulnList", `
     <div class="vulnStats">
-      <span><b>${fmt.format(number(vulns.critical))}</b> Critical</span>
-      <span><b>${fmt.format(number(vulns.high))}</b> High</span>
-      <span><b>${fmt.format(number(vulns.medium))}</b> Medium</span>
-      <span><b>${fmt.format(number(vulns.low))}</b> Low</span>
+      <span><b>${count(vulns.critical)}</b> Critical</span>
+      <span><b>${count(vulns.high)}</b> High</span>
+      <span><b>${count(vulns.medium)}</b> Medium</span>
+      <span><b>${count(vulns.low)}</b> Low</span>
     </div>
+    ${scopeNote}
     ${rows.map((item) => `
       <div class="vulnItem">
         <div>
@@ -1475,7 +1644,7 @@ function renderVulnerabilities(data) {
         </div>
         <span class="pill critical">${esc(item.severity || item.vulnerability?.severity || "critical")}</span>
       </div>
-    `).join("") || '<div class="emptyState">No critical vulnerability rows returned.</div>'}
+    `).join("") || (vulns.status === "available" ? '<div class="emptyState">No critical vulnerability rows returned.</div>' : "")}
   `);
 }
 
@@ -1558,6 +1727,12 @@ async function loadCveExposureGraph(force = false) {
 
 function renderAgents(data) {
   const agents = data.agents?.items || [];
+  if (data.agents?.status && data.agents.status !== "available") {
+    const status = data.agents.status;
+    setText("#agentCountLabel", status === "materializing" ? "Loading snapshot" : "Not available for selected range");
+    setHtml("#agentTable", `<div class="emptyState">${esc(data.agents.message || (status === "materializing" ? "Agent inventory is loading." : "Agent inventory was not retained for this date range."))}</div>`);
+    return;
+  }
   setText("#agentCountLabel", ui(`${fmt.format(agents.length)} ditampilkan`, `${fmt.format(agents.length)} displayed`));
   const table = `
     <div class="tableHeader">
@@ -1578,6 +1753,7 @@ function renderAgents(data) {
 
 function renderInsights(data) {
   const sev = data.alerts?.severity || {};
+  const severityKnown = !["unavailable", "materializing"].includes(data.alerts?.severity_status);
   const nonLow = number(sev.critical) + number(sev.high) + number(sev.medium);
   const criticalCves = number(data.vulnerabilities?.critical);
   const aiSources = number(data.ai_recon?.ai_agent_sources);
@@ -1586,27 +1762,27 @@ function renderInsights(data) {
   const cards = [
     {
       view: "l1",
-      tone: nonLow > 0 ? ui("Review", "Review") : ui("Kontrol Noise", "Noise Control"),
-      title: nonLow > 0 ? ui(`${fmt.format(nonLow)} alert non-low`, `${fmt.format(nonLow)} non-low alert(s)`) : ui("Sampel terbaru mayoritas low severity", "Latest sample is mostly low severity"),
-      body: ui("Mulai dari rule dan source IP teratas, lalu close atau eskalasi.", "Start from top rules and source IPs, then close or escalate."),
+      tone: !severityKnown ? ui("Data tidak tersedia", "Data unavailable") : nonLow > 0 ? ui("Review", "Review") : ui("Kontrol Noise", "Noise Control"),
+      title: !severityKnown ? ui("Severity belum tersedia", "Severity unavailable") : nonLow > 0 ? ui(`${fmt.format(nonLow)} alert non-low`, `${fmt.format(nonLow)} non-low alert(s)`) : ui("Tidak ada alert non-low terukur", "No measured non-low alerts"),
+      body: !severityKnown ? ui("Sumber alert gagal dibaca; ini bukan hitungan nol.", "Alert source could not be read; this is not a zero count.") : ui("Mulai dari rule dan source IP teratas, lalu close atau eskalasi.", "Start from top rules and source IPs, then close or escalate."),
     },
     {
       view: "vuln",
-      tone: criticalCves > 0 ? ui("Risiko Patch", "Patch Risk") : ui("Vuln Stabil", "Vuln Stable"),
-      title: ui(`${fmt.format(criticalCves)} CVE kritis`, `${fmt.format(criticalCves)} critical CVE(s)`),
-      body: ui(`${fmt.format(number(data.vulnerabilities?.high))} CVE high perlu owner dan SLA.`, `${fmt.format(number(data.vulnerabilities?.high))} high CVEs need owner and SLA.`),
+      tone: data.vulnerabilities?.critical == null ? ui("Data tidak tersedia", "Data unavailable") : criticalCves > 0 ? ui("Risiko Patch", "Patch Risk") : ui("Vuln Stabil", "Vuln Stable"),
+      title: data.vulnerabilities?.critical == null ? ui("Inventaris CVE belum tersedia", "CVE inventory unavailable") : ui(`${fmt.format(criticalCves)} CVE kritis`, `${fmt.format(criticalCves)} critical CVE(s)`),
+      body: data.vulnerabilities?.high == null ? ui("Severity breakdown tidak tersedia untuk snapshot ini.", "Severity breakdown is unavailable for this snapshot.") : ui(`${fmt.format(number(data.vulnerabilities?.high))} CVE high perlu owner dan SLA.`, `${fmt.format(number(data.vulnerabilities?.high))} high CVEs need owner and SLA.`),
     },
     {
       view: "l2",
       tone: aiSources > 0 ? "Recon" : "Intel",
-      title: `${fmt.format(aiSources)} AI recon source(s)`,
-      body: ui("Pivot ke pola path dan korelasikan dengan reputasi sumber.", "Pivot to path patterns and correlate with source reputation."),
+      title: data.ai_recon?.ai_agent_sources == null ? ui("AI recon tidak tersedia", "AI recon unavailable") : `${fmt.format(aiSources)} AI recon source(s)`,
+      body: data.ai_recon?.ai_agent_sources == null ? ui("Detail historis tidak disimpan untuk rentang ini.", "Historical detail is not retained for this range.") : ui("Pivot ke pola path dan korelasikan dengan reputasi sumber.", "Pivot to path patterns and correlate with source reputation."),
     },
     {
       view: "assets",
-      tone: active === total ? ui("Sehat", "Healthy") : ui("Perhatian", "Attention"),
-      title: ui(`${fmt.format(active)} dari ${fmt.format(total)} agent aktif`, `${fmt.format(active)} of ${fmt.format(total)} agents active`),
-      body: active === total ? ui("Cakupan online pada aset yang dikelola.", "Coverage is online across managed assets.") : ui("Agent nonaktif perlu follow-up endpoint.", "Inactive agents need endpoint follow-up."),
+      tone: data.agents?.total == null ? ui("Data tidak tersedia", "Data unavailable") : active === total ? ui("Sehat", "Healthy") : ui("Perhatian", "Attention"),
+      title: data.agents?.total == null ? ui("Inventaris agent tidak ada di snapshot", "Agent inventory not in snapshot") : ui(`${fmt.format(active)} dari ${fmt.format(total)} agent aktif`, `${fmt.format(active)} of ${fmt.format(total)} agents active`),
+      body: data.agents?.total == null ? ui("Status aset tidak dapat disimpulkan dari rentang historis.", "Asset status cannot be inferred from the historical range.") : active === total ? ui("Cakupan online pada aset yang dikelola.", "Coverage is online across managed assets.") : ui("Agent nonaktif perlu follow-up endpoint.", "Inactive agents need endpoint follow-up."),
     },
   ];
   setHtml("#insightStrip", cards.map((card) => `
@@ -1620,10 +1796,11 @@ function renderInsights(data) {
 
 function renderDecisions(data) {
   const sev = data.alerts?.severity || {};
+  const severityKnown = !["unavailable", "materializing"].includes(data.alerts?.severity_status);
   const decisions = [
-    ["1", ui("Kurangi noise dahulu", "Reduce noise first"), ui(`${fmt.format(number(sev.low))} event low severity disampel; review rule berulang teratas sebelum eskalasi.`, `${fmt.format(number(sev.low))} low severity events are sampled; review top repeated rules before escalation.`)],
-    ["2", ui("Eskalasi risiko material", "Escalate material risk"), ui(`${fmt.format(number(sev.medium) + number(sev.high) + number(sev.critical))} event sampel non-low dan ${fmt.format(number(data.vulnerabilities?.critical))} CVE kritis masuk L2.`, `${fmt.format(number(sev.medium) + number(sev.high) + number(sev.critical))} non-low sample events and ${fmt.format(number(data.vulnerabilities?.critical))} critical CVEs belong in L2.`)],
-    ["3", ui("Jaga cakupan", "Preserve coverage"), ui(`${fmt.format(number(data.agents?.counts?.active))} agent aktif dilaporkan; konfirmasi tidak ada blind spot sebelum closing.`, `${fmt.format(number(data.agents?.counts?.active))} active agents reported; confirm no blind spots before closing.`)],
+    ["1", ui("Kurangi noise dahulu", "Reduce noise first"), severityKnown ? ui(`${fmt.format(number(sev.low))} event low severity terukur; review rule berulang teratas sebelum eskalasi.`, `${fmt.format(number(sev.low))} measured low-severity events; review top repeated rules before escalation.`) : ui("Alert severity tidak tersedia; jangan simpulkan jumlah noise.", "Alert severity is unavailable; do not infer a noise count.")],
+    ["2", ui("Eskalasi risiko material", "Escalate material risk"), severityKnown && data.vulnerabilities?.critical != null ? ui(`${fmt.format(number(sev.medium) + number(sev.high) + number(sev.critical))} event non-low terindeks dan ${fmt.format(number(data.vulnerabilities?.critical))} CVE kritis perlu ditinjau L2.`, `${fmt.format(number(sev.medium) + number(sev.high) + number(sev.critical))} indexed non-low events and ${fmt.format(number(data.vulnerabilities?.critical))} critical CVEs warrant L2 review.`) : ui("Severity alert atau inventaris CVE tidak tersedia pada snapshot ini.", "Alert severity or CVE inventory is unavailable in this snapshot.")],
+    ["3", ui("Jaga cakupan", "Preserve coverage"), data.agents?.counts?.active == null ? ui("Status agent tidak tersedia pada rentang ini.", "Agent status is unavailable for this range.") : ui(`${fmt.format(number(data.agents?.counts?.active))} agent aktif dilaporkan; konfirmasi tidak ada blind spot sebelum closing.`, `${fmt.format(number(data.agents?.counts?.active))} active agents reported; confirm no blind spots before closing.`)],
   ];
   setHtml("#l1DecisionList", decisions.map(([n, title, body]) => `
     <div class="decisionItem">
@@ -1765,6 +1942,7 @@ function renderIncidentDetail(incident) {
     return;
   }
   const record = incident.caseRecord || state.caseDetails[incident.id] || {};
+  const timelineState = state.caseTimelines[incident.id] || {};
   const evidenceRows = (record.evidence || []).slice(0, 20);
   const auditRows = (record.audit_log || []).slice(-20).reverse();
   const isClosed = record.status === "closed";
@@ -1811,6 +1989,17 @@ function renderIncidentDetail(incident) {
       ${loading ? '<div class="caseMessage">Loading durable case workspace...</div>' : ""}
       ${mutationMessage}
       <div class="caseWorkspace" data-case-id="${esc(incident.id)}" data-case-revision="${esc(record.revision || incident.revision)}">
+        <section class="caseWorkspaceSection caseEventTimeline">
+          <div class="caseSectionHead"><h3>Entity-linked evidence timeline</h3><span>${fmt.format(number(timelineState.returned))} evidence record(s)</span></div>
+          <p class="caseTimelineNote">Chronological evidence linked to case entities. This is not an attack path; shared observation does not prove causality. ATT&amp;CK appears only when the source event has an explicit technique mapping.</p>
+          ${timelineState.loading ? '<div class="caseMessage">Loading local entity evidence...</div>' : ""}
+          ${timelineState.error ? `<div class="caseMessage error" role="status">${esc(timelineState.error)}</div>` : ""}
+          ${timelineState.status === "no_entities" ? '<div class="emptyState">This case has no entity links to pivot on.</div>' : ""}
+          ${timelineState.status === "no_events" ? '<div class="emptyState">No entity-linked evidence in the selected time range.</div>' : ""}
+          ${timelineState.events?.length ? `<ol class="entityEventList">${timelineState.events.map(event => `<li><time datetime="${esc(event.timestamp)}">${esc(event.timestamp)}</time><div class="entityEventBody"><div class="entityEventTitle"><strong>${esc(event.title)}</strong><span>${esc(event.source)} · ${esc(event.severity)} · confidence ${fmt.format(number(event.confidence))}%${number(event.occurrence_count) > 1 ? ` · ${fmt.format(number(event.occurrence_count))} coalesced occurrences` : ""}</span></div><small>Evidence <code>${esc(event.evidence_id)}</code> · record ${esc(event.source_record_id)}${event.last_seen !== event.timestamp ? ` · last seen ${esc(event.last_seen)}` : ""}</small><div class="entityEventEntities">${(event.matched_entities || []).map(entity => `<span>${esc(entity.type)}: ${esc(entity.value)}</span>`).join("") || "<span>Entity match unavailable</span>"}</div>${event.attack_techniques?.length ? `<div class="entityAttackMappings"><b>ATT&amp;CK mapping from ${esc(event.attack_techniques[0].mapping_source || "source event")}</b>${event.attack_techniques.map(technique => `<span>${esc(technique.id)}${technique.name ? ` · ${esc(technique.name)}` : ""}${technique.tactic ? ` · ${esc(technique.tactic)}` : ""}</span>`).join("")}</div>` : '<small class="entityNoAttackMapping">No explicit ATT&amp;CK technique mapping stored on this event.</small>'}<details><summary>Provenance</summary><span>Observed ${esc(event.timestamp)} · source ${esc(event.source)} · source record ${esc(event.source_record_id)} · confidence ${fmt.format(number(event.confidence))}%</span><ul>${(event.entities || []).slice(0, 12).map(entity => `<li>${esc(entity.role)}: ${esc(entity.type)} ${esc(entity.value)} · field ${esc(entity.field_path)} · ${fmt.format(number(entity.confidence))}%</li>`).join("")}</ul></details></div></li>`).join("")}</ol>` : ""}
+          ${timelineState.truncated ? '<p class="caseTimelineNote">Result limit reached; additional matching events are not shown.</p>' : ""}
+          <small class="caseTimelineScope">${esc(timelineState.source || "Local entity graph")} · ${esc(timelineState.interpretation || "Only evidence already ingested into the local entity graph is included.")}</small>
+        </section>
         <section class="caseWorkspaceSection">
           <div class="caseSectionHead"><h3>Assignment and Status</h3><span>Every write checks revision ${fmt.format(number(record.revision || incident.revision))}</span></div>
           <div class="caseFormGrid">
@@ -1903,7 +2092,7 @@ function renderIncidentBoard(data) {
   renderIncidentDetail(incidents[state.selectedIncident]);
 }
 
-async function loadPersistentCases(offset = state.casePagination.offset) {
+async function loadPersistentCases(offset = state.casePagination.offset, limit = state.casePagination.limit) {
   const windowPayload = currentWindowPayload();
   const windowKey = JSON.stringify(windowPayload);
   if (state.caseWindow !== windowKey) {
@@ -1911,17 +2100,24 @@ async function loadPersistentCases(offset = state.casePagination.offset) {
     offset = 0;
   }
   try {
-    const result = await postJson("/api/incidents/list", {...windowPayload, offset, limit: state.casePagination.limit});
+    const result = await postJson("/api/incidents/list", limit === state.casePagination.limit
+      ? {...windowPayload, offset, limit: state.casePagination.limit}
+      : {...windowPayload, offset, limit});
     state.persistentCases = result.ok ? result.cases || [] : [];
-    state.casePagination = result.ok ? {...state.casePagination, ...(result.pagination || {}), offset} : {...state.casePagination, offset};
+    state.caseLoadStatus = result.ok ? "ok" : (result.status || "unavailable");
+    state.casePagination = result.ok ? {...state.casePagination, ...(result.pagination || {}), offset, limit} : {...state.casePagination, offset, limit};
   } catch (_) {
     state.persistentCases = [];
+    state.caseLoadStatus = "unavailable";
   }
+  if (state.view === "command" && state.overview) renderSituation(state.overview);
   if (state.view === "incidents") renderIncidentBoard(state.overview || {});
   if (state.view === "l1") renderL1Queue(state.overview || {});
   const selected = state.incidents[state.selectedIncident];
-  if (state.view === "incidents" && selected?.persisted && !state.caseDetails[selected.id]) {
-    void loadCaseDetail(selected);
+  if (state.view === "incidents" && selected?.persisted) {
+    const record = state.caseDetails[selected.id] || selected.caseRecord;
+    if (record?.entity_links) void loadIncidentTimeline(selected, record);
+    if (!state.caseDetails[selected.id]) void loadCaseDetail(selected);
   }
 }
 
@@ -1935,11 +2131,46 @@ async function loadCaseDetail(incident, force = false) {
     if (!result.ok || !result.case) throw new Error(result.error || "Case detail unavailable");
     state.caseDetails[incident.id] = result.case;
     state.persistentCases = state.persistentCases.map(item => item.case_id === incident.id ? {...item, ...result.case} : item);
+    void loadIncidentTimeline(incident, result.case);
   } catch (error) {
     state.caseMutationError = error.message;
   } finally {
     state.caseDetailLoading = "";
     if (state.view === "incidents") renderIncidentBoard(state.overview || {});
+  }
+}
+
+async function loadIncidentTimeline(incident, record) {
+  if (!incident?.persisted || state.caseTimelineLoading[incident.id]) return;
+  let windowPayload;
+  try { windowPayload = currentWindowPayload(); }
+  catch (error) {
+    state.caseTimelines[incident.id] = {status: "unavailable", error: error.message};
+    return;
+  }
+  const windowKey = JSON.stringify(windowPayload);
+  if (state.caseTimelines[incident.id]?.windowKey === windowKey && !state.caseTimelines[incident.id]?.error) return;
+  state.caseTimelineLoading[incident.id] = true;
+  state.caseTimelines[incident.id] = {windowKey, loading: true};
+  renderIncidentDetail({...incident, caseRecord: record});
+  try {
+    const result = await postJson("/api/incidents/timeline", {case_id: incident.id, ...windowPayload, limit: 100});
+    if (!result.ok) throw new Error(result.error || "Entity timeline unavailable");
+    if (JSON.stringify(currentWindowPayload()) !== windowKey) return;
+    state.caseTimelines[incident.id] = {...result, windowKey, loading: false};
+  } catch (error) {
+    state.caseTimelines[incident.id] = {windowKey, status: "unavailable", error: error.message};
+  } finally {
+    delete state.caseTimelineLoading[incident.id];
+    let currentWindowKey = "";
+    try { currentWindowKey = JSON.stringify(currentWindowPayload()); } catch (_) {}
+    if (currentWindowKey && currentWindowKey !== windowKey) {
+      state.caseTimelines[incident.id] = {};
+      void loadIncidentTimeline(incident, record);
+    }
+    if (state.view === "incidents" && state.incidents[state.selectedIncident]?.id === incident.id) {
+      renderIncidentDetail({...incident, caseRecord: record});
+    }
   }
 }
 
@@ -1964,6 +2195,7 @@ async function mutateIncidentCase(form) {
     const result = await postJson("/api/incidents/action", payload);
     if (!result.ok || !result.case) throw new Error(result.error || "Case update failed");
     state.caseDetails[incident.id] = result.case;
+    delete state.caseTimelines[incident.id];
     state.persistentCases = state.persistentCases.map(item => item.case_id === incident.id ? {...item, ...result.case} : item);
     form.reset();
   } catch (error) {
@@ -3099,7 +3331,7 @@ function renderSettings() {
   setHtml("#telemetryReadiness", `
     <div class="telemetrySummary"><strong>${fmt.format(number(readiness.ready_sources))} / ${fmt.format(number(readiness.expected_sources))}</strong><span>sources ready for field-level detection</span><small>${fmt.format(number(readiness.observed_sources))} observed · ${fmt.format(number(readiness.observed_incomplete_sources))} incomplete · ${fmt.format(number(readiness.degraded_sources))} degraded · ${fmt.format(number(readiness.stale_sources))} stale. ${esc(telemetry.note || "Load a dashboard snapshot to inspect local telemetry readiness.")}</small></div>
     <div class="telemetrySourceGrid">${sourceRows.map(renderTelemetrySource).join("") || '<div class="emptyState">Telemetry contract loads with the selected dashboard window.</div>'}</div>
-    <div class="telemetryExternal"><article><strong>CYFIRMA research</strong><span>${research.enabled ? esc(research.status || "not started") : "disabled"}</span><b>${fmt.format(number(research.items))}</b><small>Stored separately from STIX IOC feeds</small></article><article><strong>CYFIRMA TAXII</strong><span>${esc(collectorProgress(taxii))}</span><b>${taxii.configured ? "checkpointed collection" : "configuration required"}</b><small>${esc(taxii.collection || "Collection URL not configured")} · valid until ${esc(taxii.freshness?.earliest_valid_until || "not reported")}</small></article><article><strong>CYFIRMA Org CVE</strong><span>${esc(collectorProgress(orgVulnerability))}</span><b>${orgVulnerability.configured ? "checkpointed collection" : "configuration required"}</b><small>Bounded Vulnerability V2 pagination · valid until ${esc(orgVulnerability.freshness?.earliest_valid_until || "not reported")}</small></article><article><strong>Microsoft Defender XDR</strong><span>${defender.enabled ? esc(defender.status || "not started") : "disabled"}</span><b>${fmt.format(number(defender.observations))}</b><small>${defender.configured ? `${fmt.format(number(entityGraph.entities))} canonical entities · ${fmt.format(number(entityGraph.clusters))} correlated clusters · graph ${fmt.format(number(entityGraph.latest_batch?.stored))} stored / ${fmt.format(number(entityGraph.latest_batch?.queued))} queued · ${fmt.format(number(entityGraph.queue?.pending))} pending${number(entityGraph.latest_batch?.dropped) ? ` · ${fmt.format(number(entityGraph.latest_batch?.dropped))} dropped in last batch` : ""}${number(entityGraph.batch_history?.dropped) ? ` · ${fmt.format(number(entityGraph.batch_history.dropped))} historical candidates unrepresented` : ""}` : "requires separate app permission"}</small></article></div>
+    <div class="telemetryExternal"><article><strong>CYFIRMA research</strong><span>${research.enabled ? esc(research.status || "not started") : "disabled"}</span><b>${fmt.format(number(research.items))}</b><small>Stored separately from STIX IOC feeds</small></article><article><strong>CYFIRMA TAXII</strong><span>${esc(collectorProgress(taxii))}</span><b>${taxii.configured ? "checkpointed collection" : "configuration required"}</b><small>${esc(taxii.collection || "Collection URL not configured")} · valid until ${esc(taxii.freshness?.earliest_valid_until || "not reported")}</small></article><article><strong>CYFIRMA Org CVE</strong><span>${esc(collectorProgress(orgVulnerability))}</span><b>${orgVulnerability.configured ? "checkpointed collection" : "configuration required"}</b><small>Bounded Vulnerability V2 pagination · valid until ${esc(orgVulnerability.freshness?.earliest_valid_until || "not reported")}</small></article><article><strong>Microsoft Defender XDR</strong><span>${defender.enabled ? esc(defender.status || "not started") : "disabled"}</span><b>${fmt.format(number(defender.counts?.incidents))} incidents · ${fmt.format(number(defender.counts?.alerts))} alerts</b><small>${defender.configured ? `collection ${esc(defender.mode || "unknown")} · ${fmt.format(number(entityGraph.entities))} canonical entities · ${fmt.format(number(entityGraph.clusters))} correlated clusters · graph ${fmt.format(number(entityGraph.latest_batch?.stored))} stored / ${fmt.format(number(entityGraph.latest_batch?.queued))} queued · ${fmt.format(number(entityGraph.queue?.pending))} pending${number(entityGraph.latest_batch?.dropped) ? ` · ${fmt.format(number(entityGraph.latest_batch.dropped))} dropped in last batch` : ""}${number(entityGraph.batch_history?.dropped) ? ` · ${fmt.format(number(entityGraph.batch_history.dropped))} historical candidates unrepresented` : ""}` : "requires Entra app credentials"}</small></article></div>
   `);
 }
 
@@ -3547,7 +3779,7 @@ function renderNetworkIdentityEvidence(data) {
   root.innerHTML = `
     <div class="evidenceSplit">
       <section><div class="evidenceSubhead"><h3>Network flow</h3><span>${network.length} bounded samples</span></div><div class="evidenceTableWrap"><table class="evidenceTable"><thead><tr><th>Time</th><th>Source</th><th>Destination</th><th>App</th><th>Policy</th><th>Action</th><th>Direction</th></tr></thead><tbody>${networkRows || '<tr><td colspan="7">Individual network samples are not retained for this historical rollup.</td></tr>'}</tbody></table></div>${profileRows ? `<div class="evidenceMetrics">${profileRows}</div>` : ''}</section>
-      <section><div class="evidenceSubhead"><h3>Identity chain</h3><span>${identity.length} bounded samples</span></div><div class="evidenceTableWrap"><table class="evidenceTable"><thead><tr><th>Time</th><th>User</th><th>Mailbox</th><th>Operation</th><th>Privilege</th><th>Session / auth</th></tr></thead><tbody>${identityRows || '<tr><td colspan="6">No identity fields were observed in this window.</td></tr>'}</tbody></table></div></section>
+      <section><div class="evidenceSubhead"><h3>Identity chain</h3><span>${identity.length} bounded samples</span></div><div class="evidenceTableWrap"><table class="evidenceTable"><thead><tr><th>Time</th><th>User</th><th>Mailbox</th><th>Operation</th><th>Privilege</th><th>Session / auth</th></tr></thead><tbody>${identityRows || `<tr><td colspan="6">${esc(evidence.identity?.status === "aggregated_only" ? evidence.identity.note : "Identity telemetry is unavailable for this window; no zero-event conclusion can be drawn.")}</td></tr>`}</tbody></table></div></section>
     </div>
   `;
 }
@@ -3676,6 +3908,7 @@ function renderView(view, data) {
   if (!data) return;
   if (view === "command") {
     renderPosture(data);
+    renderSituation(data);
     renderLanes(data);
     renderMetrics(data);
     renderInsights(data);
@@ -3811,12 +4044,15 @@ async function loadDashboard(force = false) {
     const errors = Object.keys(overview.errors || {});
     const cache = overview.cache ? ` | cache ${overview.cache.status}${overview.cache.age_seconds ? ` ${overview.cache.age_seconds}s` : ""}${overview.cache.refresh_error ? " | refresh failed; showing last valid snapshot" : ""}` : "";
     const toolTotal = number(overview.tools?.total) || state.tools.length;
-    const materialization = overview.materialization?.status === "building" ? " | exact snapshot building in background" : "";
-    els.status.textContent = `Updated ${overview.generated_at || "now"} | ${currentRangeLabel(overview)} | ${fmt.format(toolTotal)} tools${cache}${materialization}${errors.length ? " | degraded: " + errors.join(", ") : ""}`;
+    const materialization = overview.detail_materialization?.status === "building"
+      ? " | historical details building in background"
+      : overview.materialization?.status === "building" ? " | exact snapshot building in background" : "";
+    els.status.textContent = `Updated ${overview.generated_at || "now"} | build ${overview.build_id || "unknown"} | ${currentRangeLabel(overview)} | ${fmt.format(toolTotal)} tools${cache}${materialization}${errors.length ? " | degraded: " + errors.join(", ") : ""}`;
     els.dot.className = errors.length ? "bad" : "ok";
     els.connectionText.textContent = errors.length ? "Degraded" : "Operational";
     els.sideMeta.textContent = `${fmt.format(number(overview.tools?.gensecai))} GenSecAI + ${fmt.format(number(overview.tools?.infokom))} INFOKOM tools`;
     renderOverview(overview);
+    if (state.view === "command") void loadPersistentCases(0, 200);
     if (state.view === "vuln") void loadCveExposureGraph();
     if (["incidents", "l1"].includes(state.view)) void loadPersistentCases();
     if (["stale-refreshing", "stale-error", "building"].includes(overview.cache?.status) && !state.overviewRefreshTimer) {
@@ -3919,7 +4155,15 @@ function setView(view, { updateRoute = true } = {}) {
   if (state.overview) renderView(view, state.overview);
   if (view === "vuln") void loadCveExposureGraph();
   if (["incidents", "l1"].includes(view)) void loadPersistentCases();
+  else if (view === "command" && state.overview) void loadPersistentCases(0, 200);
   document.dispatchEvent(new CustomEvent("soc:view", { detail: { view } }));
+  if (view === "findings") {
+    setTimeout(() => {
+      if (state.view !== "findings" || window.SocFindings?.ready) return;
+      showFindingsModuleError("Module did not initialize within 8 seconds; inspect the failed findings.js request or browser runtime error. Telemetry data was not cleared.");
+      console.error("[SOC Findings] Module boot watchdog expired");
+    }, 8000);
+  }
   if (updateRoute) writeRoute();
 }
 

@@ -54,7 +54,8 @@ MENU_TOOLS = {
         blueteam_sudo_history blueteam_list_users blueteam_check_ssh_authorized_keys
         blueteam_list_processes blueteam_list_cron_jobs blueteam_wazuh_agents
         blueteam_wazuh_agents_summary blueteam_wazuh_get_groups
-        blueteam_asset_context blueteam_owned_domains blueteam_set_owned_domains''',
+        blueteam_asset_context blueteam_asset_resolve blueteam_owned_domains
+        blueteam_set_owned_domains''',
     'incidents': '''wazuh_block_ip wazuh_isolate_host wazuh_kill_process
         wazuh_disable_user wazuh_quarantine_file wazuh_active_response
         wazuh_firewall_drop wazuh_host_deny wazuh_restart wazuh_check_blocked_ip
@@ -64,7 +65,10 @@ MENU_TOOLS = {
         blueteam_fail2ban_status blueteam_fail2ban_jail_status blueteam_fail2ban_unban
         blueteam_mark_investigated blueteam_investigation_summary
         blueteam_investigation_history blueteam_case_create blueteam_case_add_iocs
-        blueteam_case_add_verdict blueteam_case_get blueteam_case_list''',
+        blueteam_case_add_verdict blueteam_case_get blueteam_case_list
+        blueteam_case_add_evidence blueteam_case_add_note blueteam_case_assign
+        blueteam_case_update_status blueteam_case_record_containment
+        blueteam_case_resolve blueteam_case_reopen blueteam_case_close''',
     'workbench': '''generate_security_report run_compliance_check get_iso27001_dashboard
         get_iso27001_control_detail get_sca_policy_checks get_iso27001_gap_analysis
         get_iso27001_alerts blueteam_wazuh_compliance blueteam_export_report
@@ -85,6 +89,9 @@ MENU_TOOLS = {
         blueteam_wazuh_get_rule_file_content''',
 }
 BINDINGS = {name: menu for menu, names in MENU_TOOLS.items() for name in names.split()}
+CASE_LIFECYCLE_TOOLS = frozenset('''blueteam_case_add_evidence blueteam_case_add_note
+    blueteam_case_assign blueteam_case_update_status blueteam_case_record_containment
+    blueteam_case_resolve blueteam_case_reopen blueteam_case_close'''.split())
 
 # Curated secondary surface for contextual Security Findings pivots. These remain
 # analyst-triggered cached reads; membership never makes a tool run on page load.
@@ -124,7 +131,7 @@ APPROVAL_TOOLS = {
     'blueteam_check_ssh_authorized_keys', 'blueteam_wazuh_indexer_search',
     'wazuh_alert_dsl_query', 'blueteam_wazuh_export', 'wazuh_alert_focused_crawl',
     'blueteam_prompt_route',
-}
+} | CASE_LIFECYCLE_TOOLS
 PROVIDERS = ('crowdsec', 'greynoise', 'threatfox', 'otx', 'virustotal', 'urlhaus',
              'abuseipdb', 'cyfirma', 'cve_', 'breach', 'stealer', 'whois', 'crtsh',
              'reputation', 'threat_intel', 'unified_threat', 'argus', 'netra', 'sangfor')

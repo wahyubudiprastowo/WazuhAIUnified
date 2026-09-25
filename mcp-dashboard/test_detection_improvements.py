@@ -53,6 +53,10 @@ class DetectionImprovementTests(unittest.TestCase):
         self.assertEqual(result["confidence"], "evidence_complete")
         self.assertEqual(result["assertion"], "attempt_or_signal")
 
+    def test_bruteforce_force_does_not_false_match_rce_substring(self):
+        result = classify({"rule": {"id": "9", "description": "Fortigate brute force login failed"}})
+        self.assertEqual(result["family"], "bruteforce")
+
     def test_rollup_stores_compact_detection_labels(self):
         event = {"rule": {"id": "2", "description": "Nmap port scan"},
                  "decoder": {"name": "fortigate"},
@@ -63,6 +67,14 @@ class DetectionImprovementTests(unittest.TestCase):
         self.assertIn(("mitre", "T1595", "T1595"), rows)
         self.assertEqual(telemetry_source(event), "fortigate")
         self.assertEqual(telemetry_fields(event)[0], "fortigate")
+
+    def test_sangfor_is_only_attributed_from_an_explicit_decoder(self):
+        event = {"decoder": {"name": "sangfor-firewall-json"},
+                 "data": {"srcip": "198.51.100.8", "dstip": "10.0.0.4"}}
+        generic = {"decoder": {"name": "json"}, "data": {"srcip": "198.51.100.8"}}
+        self.assertEqual(telemetry_source(event), "sangfor_firewall")
+        self.assertEqual(telemetry_source(generic), "other")
+        self.assertIn(("telemetry_source", "sangfor_firewall", "sangfor_firewall"), rollup_dimensions(event))
 
     def test_ndr_consensus_requires_local_evidence_and_provider_context(self):
         event = {"rule": {"id": "3", "description": "Periodic C2 beaconing"},
@@ -113,6 +125,7 @@ class DetectionImprovementTests(unittest.TestCase):
         self.assertEqual(by_key["fortigate"]["available_fields"], ["source_ip", "destination_ip"])
         self.assertIn("firewall_policy", by_key["fortigate"]["missing_fields"])
         self.assertEqual(by_key["defender_xdr"]["status"], "not_observed")
+        self.assertEqual(by_key["sangfor_firewall"]["status"], "not_observed")
 
     def test_fortiweb_contract_does_not_inflate_fortigate_coverage(self):
         result = summary({"decoder": [{"value": "fortiweb-json", "count": 9}], "telemetry_field": []})
@@ -183,6 +196,29 @@ class DetectionImprovementTests(unittest.TestCase):
         self.assertEqual(set(result["available_fields"]), {
             "alert_or_incident", "severity", "entities", "status", "first_seen", "last_update"})
         self.assertEqual(result["last_observed_at"], "2026-09-23T09:59:00+00:00")
+
+    def test_defender_telemetry_profile_respects_selected_time_window(self):
+        db = sqlite3.connect(":memory:")
+        defender_xdr.ensure_schema(db)
+        older = datetime(2026, 9, 22, 9, 0, tzinfo=timezone.utc).timestamp()
+        recent = datetime(2026, 9, 23, 9, 0, tzinfo=timezone.utc).timestamp()
+        rows = [
+            ("old", older, older, "alert-old", "incident-old", "high", "active", "", "Old",
+             json.dumps({"createdDateTime": "2026-09-22T08:00:00Z", "lastUpdateDateTime": "2026-09-22T09:00:00Z",
+                         "alerts": [{"ipAddress": "198.51.100.8"}]}), "incident"),
+            ("new", recent, recent, "alert-new", "incident-new", "high", "active", "", "New",
+             json.dumps({"createdDateTime": "2026-09-23T08:00:00Z", "lastUpdateDateTime": "2026-09-23T09:00:00Z"}), "incident"),
+        ]
+        db.executemany("""INSERT INTO defender_xdr_observations
+            (item_key,observed_at,collected_at,alert_id,incident_id,severity,status,category,title,data,record_type)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)""", rows)
+        result = defender_xdr.status(db, "2026-09-23T00:00:00Z", "2026-09-24T00:00:00Z")
+        db.close()
+        self.assertEqual(result["observations"], 1)
+        self.assertEqual(result["counts"], {"incidents": 1, "alerts": 0})
+        self.assertEqual(result["field_sample_size"], 1)
+        self.assertEqual(result["field_counts"]["entities"], 0)
+        self.assertEqual(result["recent"][0]["incident_id"], "incident-new")
 
     def test_defender_collection_time_does_not_fake_source_last_update(self):
         db = sqlite3.connect(":memory:")
@@ -363,6 +399,118 @@ class DetectionImprovementTests(unittest.TestCase):
         self.assertEqual(result["provider"], "graph")
         self.assertEqual(calls[0], "https://graph.microsoft.com/.default")
         self.assertIn("https://graph.microsoft.com/v1.0/security/incidents?", calls[1])
+
+    def test_defender_graph_collects_alerts_and_incidents_into_local_history(self):
+        original_token, original_request = defender_xdr._token, defender_xdr._request_json
+        requested = []
+        def request(url, *_args, **_kwargs):
+            requested.append(url)
+            if "/alerts_v2?" in url:
+                return {"value": [{
+                    "id": "alert-1", "incidentId": "incident-1", "title": "Suspicious sign-in",
+                    "severity": "high", "status": "new", "lastUpdateDateTime": "2026-09-23T00:01:00Z",
+                    "serviceSource": "microsoftDefenderForIdentity", "detectionSource": "identityProtection",
+                    "description": "Risky sign-in from an unfamiliar location.", "mitreTechniques": ["T1110"],
+                    "alertWebUrl": "https://security.microsoft.com/alerts/alert-1",
+                }]}
+            return {"value": [{
+                "id": "incident-1", "displayName": "Identity investigation", "severity": "high",
+                "status": "active", "lastUpdateDateTime": "2026-09-23T00:00:00Z", "alerts": [],
+            }]}
+        try:
+            defender_xdr._token = lambda *_args, **_kwargs: "token"
+            defender_xdr._request_json = request
+            with tempfile.TemporaryDirectory() as directory:
+                db = sqlite3.connect(Path(directory) / "state.db")
+                with db:
+                    result = defender_xdr.collect(db, {
+                        "DEFENDER_XDR_ENABLED": "true", "DEFENDER_XDR_TENANT_ID": "tenant",
+                        "DEFENDER_XDR_CLIENT_ID": "client", "DEFENDER_XDR_CLIENT_SECRET": "secret",
+                        "DEFENDER_XDR_API_PROVIDER": "graph", "DEFENDER_XDR_COLLECTION_MODE": "both",
+                        "DEFENDER_XDR_BATCH_SIZE": "10", "DEFENDER_XDR_POLL_INTERVAL_SECONDS": "300",
+                    })
+                    history = defender_xdr.history(db, limit=10)
+                    status = defender_xdr.status(db)
+                db.close()
+        finally:
+            defender_xdr._token, defender_xdr._request_json = original_token, original_request
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["received"], 2)
+        self.assertTrue(any("/v1.0/security/incidents?" in url for url in requested))
+        self.assertTrue(any("/v1.0/security/alerts_v2?" in url for url in requested))
+        self.assertEqual(history["summary"]["record_types"], {"incident": 1, "alert": 1})
+        self.assertEqual(status["counts"], {"incidents": 1, "alerts": 1})
+        alert = status["recent_alerts"][0]
+        self.assertEqual(alert["alert_id"], "alert-1")
+        self.assertEqual(alert["service_source"], "microsoftDefenderForIdentity")
+        self.assertEqual(alert["mitre_techniques"], ["T1110"])
+        self.assertEqual(alert["description"], "Risky sign-in from an unfamiliar location.")
+
+    def test_defender_graph_pagination_resumes_and_preserves_latest_watermark(self):
+        original_token, original_request = defender_xdr._token, defender_xdr._request_json
+        next_url = "https://graph.microsoft.com/v1.0/security/alerts_v2?$skiptoken=page-two"
+        requested = []
+        def request(url, *_args, **_kwargs):
+            requested.append(url)
+            if url == next_url:
+                return {"value": [{"id": "alert-old", "title": "Older alert", "lastUpdateDateTime": "2026-09-22T00:00:00Z"}]}
+            return {"value": [{"id": "alert-new", "title": "Newer alert", "lastUpdateDateTime": "2026-09-23T00:00:00Z"}], "@odata.nextLink": next_url}
+        try:
+            defender_xdr._token = lambda *_args, **_kwargs: "token"
+            defender_xdr._request_json = request
+            with tempfile.TemporaryDirectory() as directory:
+                db = sqlite3.connect(Path(directory) / "state.db")
+                config = {"DEFENDER_XDR_ENABLED": "true", "DEFENDER_XDR_TENANT_ID": "tenant",
+                          "DEFENDER_XDR_CLIENT_ID": "client", "DEFENDER_XDR_CLIENT_SECRET": "secret",
+                          "DEFENDER_XDR_API_PROVIDER": "graph", "DEFENDER_XDR_COLLECTION_MODE": "alerts",
+                          "DEFENDER_XDR_BATCH_SIZE": "1", "DEFENDER_XDR_POLL_INTERVAL_SECONDS": "300"}
+                with db:
+                    first = defender_xdr.collect(db, config)
+                    db.execute("UPDATE defender_xdr_checkpoint SET updated_at=0 WHERE source='graph:alerts'")
+                    second = defender_xdr.collect(db, config)
+                    checkpoint = db.execute("SELECT checkpoint,detail FROM defender_xdr_checkpoint WHERE source='graph:alerts'").fetchone()
+                    history = defender_xdr.history(db, limit=10)
+                db.close()
+        finally:
+            defender_xdr._token, defender_xdr._request_json = original_token, original_request
+        self.assertTrue(first["sources"][0]["has_more"])
+        self.assertEqual(second["status"], "ok")
+        self.assertEqual(requested[1], next_url)
+        self.assertEqual(checkpoint[0], "2026-09-23T00:00:00Z")
+        self.assertEqual(history["total"], 2)
+
+    def test_defender_findings_deduplicate_alert_snapshots_but_keep_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = sqlite3.connect(Path(directory) / "state.db")
+            defender_xdr.ensure_schema(db)
+            rows = [
+                ("snapshot-1", 10, 20, "alert-1", "incident-1", "medium", "new", "identity", "Sign-in", '{"serviceSource":"identity"}', "alert"),
+                ("snapshot-2", 30, 40, "alert-1", "incident-1", "high", "inProgress", "identity", "Sign-in updated", '{"serviceSource":"identity"}', "alert"),
+            ]
+            db.executemany("""INSERT INTO defender_xdr_observations
+                (item_key,observed_at,collected_at,alert_id,incident_id,severity,status,category,title,data,record_type)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)""", rows)
+            status = defender_xdr.status(db)
+            history = defender_xdr.history(db, limit=10)
+            db.close()
+        self.assertEqual(status["counts"]["alerts"], 1)
+        self.assertEqual(len(status["recent_alerts"]), 1)
+        self.assertEqual(status["recent_alerts"][0]["title"], "Sign-in updated")
+        self.assertEqual(history["total"], 2)
+
+    def test_defender_schema_migration_preserves_existing_observations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = sqlite3.connect(Path(directory) / "state.db")
+            db.execute("""CREATE TABLE defender_xdr_observations (
+                item_key TEXT PRIMARY KEY, observed_at REAL NOT NULL, collected_at REAL NOT NULL,
+                alert_id TEXT, incident_id TEXT, severity TEXT, status TEXT, category TEXT, title TEXT,
+                data TEXT NOT NULL)""")
+            db.execute("INSERT INTO defender_xdr_observations(item_key,observed_at,collected_at,data) VALUES ('old',1,1,'{}')")
+            db.execute("INSERT INTO defender_xdr_observations(item_key,observed_at,collected_at,alert_id,data) VALUES ('old-alert',1,1,'alert-old','{}')")
+            defender_xdr.ensure_schema(db)
+            rows = dict(db.execute("SELECT item_key,record_type FROM defender_xdr_observations"))
+            db.close()
+        self.assertEqual(rows, {"old": "incident", "old-alert": "alert"})
 
     def test_defender_correlation_uses_local_ledger_and_exact_entities_only(self):
         with tempfile.TemporaryDirectory() as directory:

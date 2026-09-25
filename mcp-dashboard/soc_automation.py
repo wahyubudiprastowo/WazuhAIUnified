@@ -101,8 +101,8 @@ FIELDS = [
     ("DEFENDER_XDR_TENANT_ID", "Defender XDR tenant ID", "text", "", "Microsoft Defender XDR"),
     ("DEFENDER_XDR_CLIENT_ID", "Defender XDR application ID", "text", "", "Microsoft Defender XDR"),
     ("DEFENDER_XDR_CLIENT_SECRET", "Defender XDR application secret", "secret", "", "Microsoft Defender XDR"),
-    ("DEFENDER_XDR_API_PROVIDER", "Defender incident API provider", "choice", "defender", "Microsoft Defender XDR"),
-    ("DEFENDER_XDR_COLLECTION_MODE", "Defender XDR collection mode", "choice", "incidents", "Microsoft Defender XDR"),
+    ("DEFENDER_XDR_API_PROVIDER", "Defender incident API provider", "choice", "graph", "Microsoft Defender XDR"),
+    ("DEFENDER_XDR_COLLECTION_MODE", "Defender XDR collection mode", "choice", "both", "Microsoft Defender XDR"),
     ("DEFENDER_XDR_API_BASE_URL", "Defender XDR API base URL", "url", "https://api.security.microsoft.com", "Microsoft Defender XDR"),
     ("DEFENDER_XDR_POLL_INTERVAL_SECONDS", "Defender XDR refresh interval (seconds)", "integer", "900", "Microsoft Defender XDR"),
     ("DEFENDER_XDR_BATCH_SIZE", "Defender XDR alerts per cycle", "integer", "50", "Microsoft Defender XDR"),
@@ -127,7 +127,7 @@ FIELDS = [
     ("SOC_DELIVERY_ERROR_BACKOFF_SECONDS", "Failed delivery retry backoff (seconds)", "integer", "900", "Report Delivery"),
 ]
 SCHEMA = [{"key": k, "label": label, "type": typ, "group": group, "required": False, "restart": False,
-           **({"options": (["password", "oauth2"] if k == "SOC_SMTP_AUTH" else ["defender", "graph"] if k == "DEFENDER_XDR_API_PROVIDER" else ["incidents", "alerts"] if k == "DEFENDER_XDR_COLLECTION_MODE" else ["id", "en"])} if typ == "choice" else {})} for k, label, typ, _, group in FIELDS]
+           **({"options": (["password", "oauth2"] if k == "SOC_SMTP_AUTH" else ["defender", "graph"] if k == "DEFENDER_XDR_API_PROVIDER" else ["incidents", "alerts", "both"] if k == "DEFENDER_XDR_COLLECTION_MODE" else ["id", "en"])} if typ == "choice" else {})} for k, label, typ, _, group in FIELDS]
 DEFAULTS = {k: default for k, _, _, default, _ in FIELDS}
 LIMITS = {"SOC_INTERVAL_SECONDS": (900, 86400), "SOC_IOC_BUDGET": (0, 50),
           "SOC_QUEUE_BATCH_SIZE": (10, 500),
@@ -194,8 +194,8 @@ def validate(values):
         pass
     if values.get("SOC_SMTP_AUTH", "password") not in {"password", "oauth2"}:
         errors.append("SOC_SMTP_AUTH: choose password or oauth2")
-    if values.get("DEFENDER_XDR_COLLECTION_MODE", "incidents") not in {"incidents", "alerts"}:
-        errors.append("DEFENDER_XDR_COLLECTION_MODE: choose incidents or alerts")
+    if values.get("DEFENDER_XDR_COLLECTION_MODE", "both") not in {"incidents", "alerts", "both"}:
+        errors.append("DEFENDER_XDR_COLLECTION_MODE: choose incidents, alerts, or both")
     if values.get("DEFENDER_XDR_API_PROVIDER", "defender") not in {"defender", "graph"}:
         errors.append("DEFENDER_XDR_API_PROVIDER: choose defender or graph")
     for key in ("SOC_REPORT_RECIPIENTS", "SOC_SMTP_FROM"):
@@ -641,8 +641,8 @@ Output only JSON with this schema:
   "data_impact": [{"data": "file/mailbox/object/path or unknown", "operation": "read/write/delete/download/unknown", "status": "observed|suspected|not_established", "evidence": ["exact event_id or rule_id from supplied context"]}],
   "anomaly_baseline": [{"signal": "what changed vs history", "current": "current value", "baseline": "historical value", "interpretation": "why it matters"}],
   "attack_narrative": [{"stage": "Observed|Reputation|Exposure|Impact", "detail": "what happened", "evidence": ["exact event_id or rule_id from supplied context"]}],
-  "affected_assets": [{"asset": "host/device/user", "role": "reporter|target|user|unknown", "evidence": "why this asset matters"}],
-  "provider_findings": [{"provider": "name", "verdict": "match|no_match|error|unknown", "signal": "what this provider contributes"}],
+  "affected_assets": [{"asset": "host/device/user", "role": "reporter|source|target|user|inventory_asset|unknown", "evidence_ids": ["event/rule/inventory evidence IDs linked to this exact asset"]}],
+  "provider_findings": [{"provider": "exact provider name from supplied coverage", "verdict": "match|error|unknown", "signal": "what this provider contributes", "evidence_ids": ["provider snapshot evidence ID"]}],
   "cve_priorities": [{"cve": "CVE id", "asset": "asset", "priority": "patch_now|schedule|verify_only", "reason": "inventory/exposure rationale", "evidence": ["exact event_id or rule_id from supplied context"]}],
   "confidence_drivers": ["provider/evidence reasons that raise or lower confidence"],
   "escalation": {"level": "none|l1|l2|l3|incident", "reason": "why", "sla": "recommended handling time"},
@@ -658,7 +658,7 @@ Return only valid JSON using this schema: summary, verdict{status,severity,confi
 daily_brief, attack_categories[], network_paths[], identities[], data_impact[], anomaly_baseline[], attack_narrative[], affected_assets[], provider_findings[], cve_priorities[],
 confidence_drivers[], escalation{level,reason,sla},
 action_plan{l1[],l2[],l3[],response[]}, recommendations[], gaps[].
-For every structured activity/asset/CVE claim, cite exact event_id or rule_id values from supplied context in its evidence array. Never invent IDs. If unsupported, return an empty evidence array; the system will mark that claim unverified.
+For every structured activity claim, cite exact event_id or rule_id values from supplied context in its evidence array. An affected asset must exactly match an asset value in supplied telemetry or vulnerability inventory and cite only IDs linked to that asset. Presence as reporter/source/destination/user does not prove compromise or impact; inventory presence proves inventory exposure only. Provider findings must use an exact provider name and evidence_id from provider_coverage; these are report-window aggregates, not necessarily IOC-specific. Do not invent provider verdicts or signals. For CVEs, cite exact event_id/rule_id values; never invent IDs. If unsupported, return an empty evidence/evidence_ids array; the system will mark that claim unverified.
 Separate observed activity, provider reputation, vulnerable inventory, and confirmed compromise. Do not invent facts.
 No-match is unknown, not safe. A malicious source IP does not prove the reporting device is infected.
 Use ai_memory to identify spikes/new signals; say "insufficient history" if no reliable baseline is supplied.
@@ -675,17 +675,20 @@ OUTPUT RULES (strict): Return EXACTLY ONE valid JSON object. Do not emit any tex
 (no ```), no markdown, no commentary, no explanation outside the JSON, no "Here is the analysis". Omit optional keys
 that have no evidence instead of fabricating empty placeholders. The response must be parseable by a JSON parser.
 
-For source_facts, return objects {fact,evidence_ids}; cite only exact event or rule IDs present in local_evidence.
+For source_facts, return objects {fact,evidence_ids}; cite only exact event/rule IDs in local_evidence or evidence_id values
+in related_evidence.events. Related events are linked through an exact canonical entity in the local evidence graph;
+shared entity/time is context, not proof of causality.
 If no supplied evidence ID supports a statement, do not present it as a source fact; put it in gaps or inference.
 Return only JSON with: summary, verdict{status,severity,confidence,reason}, attack_category,
 network_flow{source,destination,ports,protocol,action,direction,evidence}, identity_activity[], data_impact[], source_facts[{fact,evidence_ids}], inference,
-attack_path[{stage,detail,evidence}], affected_assets[{asset,role,evidence}], provider_consensus[{provider,status,signal}],
+attack_path[{stage,detail,evidence}], affected_assets[{asset,role,evidence_ids}], provider_consensus[{provider,status,signal,evidence_ids}],
 cves[{cve,relationship,local_exposure,priority,reason}], actions{l1[],l2[],l3[],response[]}, quality_checks[], gaps[].
+Asset claims must cite an entity_evidence reference linked to that exact entity. Entity presence does not prove compromise or impact. Provider consensus must cite its exact provider_evidence reference; provider reputation is not local malicious activity.
 Recommendations must be specific, reversible, evidence-gated, and in the requested language. Keep all string values
 concise and factual; never wrap the object in prose."""
 
 
-FINDING_SKILL_VERSION = "soc-finding-v4"
+FINDING_SKILL_VERSION = "soc-finding-v6"
 
 
 def finding_analysis_profile(context):
@@ -942,6 +945,22 @@ def _short(value, limit=220):
     return text[:limit]
 
 
+AI_AUDIT_VERSION = 1
+WINDOW_AI_SKILL_VERSION = "soc-window-v3"
+
+
+def _snapshot_ref(prefix, value):
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, default=str)
+    return f"{prefix}:{hashlib.sha256(encoded.encode()).hexdigest()[:20]}"
+
+
+def _compact_provider_snapshot(row):
+    compact = {key: row.get(key) for key in ("provider", "status", "matched", "context", "errors")}
+    compact.update({"cves": (row.get("cves") or [])[:4], "tags": (row.get("tags") or [])[:4]})
+    compact["evidence_id"] = _snapshot_ref("provider-summary", compact)
+    return compact
+
+
 def _compact_coverage(coverage):
     coverage = coverage or {}
     feeds = {}
@@ -995,7 +1014,7 @@ def _compact_rule(rule, language="en"):
 
 def _compact_vulnerability(row):
     score = row.get("score") if isinstance(row.get("score"), dict) else _cve_score_summary(row)
-    return {
+    compact = {
         "cve": row.get("cve"),
         "asset": row.get("asset") or row.get("agent"),
         "package": row.get("package"),
@@ -1010,6 +1029,9 @@ def _compact_vulnerability(row):
         "poc": score.get("poc") if isinstance(score, dict) else None,
         "recommendation": _short(row.get("recommendation"), 220),
     }
+    compact["evidence_id"] = _snapshot_ref("wazuh-vuln", {
+        key: compact.get(key) for key in ("cve", "asset", "package", "version")})
+    return compact
 
 
 def _compact_finding(finding):
@@ -1058,15 +1080,7 @@ def build_ai_context(report):
         "generated_at": report.get("generated_at"),
         "coverage": _compact_coverage(report.get("coverage")),
         "rules": [_compact_rule(r, language) for r in report.get("rules", [])[:5]],
-        "provider_coverage": [{
-            "provider": row.get("provider"),
-            "status": row.get("status"),
-            "matched": row.get("matched"),
-            "context": row.get("context"),
-            "errors": row.get("errors"),
-            "cves": (row.get("cves") or [])[:4],
-            "tags": (row.get("tags") or [])[:4],
-        } for row in (deck.get("provider_coverage") or [])[:8]],
+        "provider_coverage": [_compact_provider_snapshot(row) for row in (deck.get("provider_coverage") or [])[:8]],
         "top_findings": top_findings,
         "vulnerability_focus": [_compact_vulnerability(row) for row in (deck.get("vulnerability_focus") or [])[:4]],
         "ai_memory": _compact_ai_memory(report.get("ai_memory")),
@@ -1143,6 +1157,73 @@ def _minimal_ai_context(context):
         "ai_memory": minimal_memory,
         "limitations": (context.get("limitations") or [])[:2],
     }
+
+
+def _prepare_window_ai_context(report):
+    context = build_ai_context(report)
+    content = _shrink_ai_context(context, 6200)
+    if len(content) > 6200:
+        context = _minimal_ai_context(context)
+        content = json.dumps(context, ensure_ascii=True)
+    if len(content) > 6200:
+        raise ValueError("Evidence exceeds model input budget")
+    return context, content
+
+
+def _sha256_text(value):
+    return hashlib.sha256(str(value).encode("utf-8")).hexdigest()
+
+
+def _window_system_prompt(config):
+    return FAST_SYSTEM_PROMPT + prompt_clause("window") + " Language: " + config["SOC_REPORT_LANGUAGE"]
+
+
+def _window_audit_metadata(report, result, config, context=None, content=None, system_prompt=None):
+    if context is None or content is None:
+        context, content = _prepare_window_ai_context(report)
+    system_prompt = system_prompt or _window_system_prompt(config)
+    provenance = _window_provenance_index(context)
+    evidence_ids = sorted(provenance["ids"])
+    provider_sources = [{"provider": row.get("provider"), "evidence_id": row.get("evidence_id"),
+                         "status": row.get("status")}
+                        for row in context.get("provider_coverage", []) if isinstance(row, dict)]
+    return {"audit_version": AI_AUDIT_VERSION, "run_id": uuid.uuid4().hex,
+        "scope": "window", "skill_version": WINDOW_AI_SKILL_VERSION,
+        "contract_version": CONTRACT_VERSION, "model": result.get("model") or "unknown",
+        "configured_model": config.get("AI_MODEL") or "unknown",
+        "prompt_sha256": None if result.get("fallback_used") else _sha256_text(system_prompt),
+        "input_sha256": _sha256_text(content),
+        "evidence_ids": evidence_ids[:200], "evidence_ref_count": len(evidence_ids),
+        "provider_snapshots": provider_sources[:20],
+        "fallback_used": bool(result.get("fallback_used")), "created_at": now()}
+
+
+def _finding_system_prompt(config):
+    return FINDING_SYSTEM_PROMPT + prompt_clause("finding") + " Language: " + config.get("SOC_REPORT_LANGUAGE", "id")
+
+
+def _finding_audit_metadata(context, result, config):
+    bounded = _bounded_finding_context(context)
+    content = json.dumps(bounded, ensure_ascii=True, separators=(",", ":"))
+    system_prompt = _finding_system_prompt(config)
+    evidence_ids = set(_finding_evidence_ids(bounded))
+    for row in bounded.get("entity_evidence", []) + bounded.get("provider_evidence", []):
+        if not isinstance(row, dict):
+            continue
+        refs = row.get("evidence_ids") or [row.get("evidence_id")]
+        evidence_ids.update(str(ref)[:300] for ref in refs if ref)
+    evidence_ids = sorted(evidence_ids)
+    return {"audit_version": AI_AUDIT_VERSION, "run_id": uuid.uuid4().hex,
+        "scope": "finding", "skill_version": FINDING_SKILL_VERSION,
+        "contract_version": CONTRACT_VERSION, "model": result.get("model") or "unknown",
+        "configured_model": config.get("AI_MODEL") or "unknown",
+        "prompt_sha256": None if result.get("fallback_used") else _sha256_text(system_prompt),
+        "input_sha256": _sha256_text(content),
+        "evidence_ids": evidence_ids[:200], "evidence_ref_count": len(evidence_ids),
+        "fallback_used": bool(result.get("fallback_used")),
+        "provider_sources": sorted({str(row.get("provider") or row.get("name"))[:100]
+            for row in bounded.get("provider_evidence", []) if isinstance(row, dict) and (row.get("provider") or row.get("name"))}),
+        "created_at": now()}
 
 
 def _compact_ai_memory(memory):
@@ -1258,12 +1339,20 @@ def local_ai_fallback(report, error="AI provider unavailable"):
     confidence = "medium" if matched_providers else "low"
     provider_findings = []
     for row in provider_rows[:10]:
-        verdict = "error" if row.get("errors") else "match" if row.get("matched") else "unknown"
+        snapshot = _compact_provider_snapshot(row)
+        matched, errors = int(row.get("matched") or 0), int(row.get("errors") or 0)
+        verdict = "match" if matched else "error" if errors else "unknown"
         provider_findings.append({"provider": row.get("provider"), "verdict": verdict,
-            "signal": f"{row.get('matched', 0)} matches, {row.get('context', 0)} context, {row.get('errors', 0)} errors"})
+            "signal": f"Stored aggregate: {matched} match(es), {int(row.get('context') or 0)} context record(s), {errors} error(s).",
+            "evidence_ids": [snapshot["evidence_id"]], "citation_status": "verified_provider_snapshot",
+            "reference_validation": "stored_provider_snapshot_match", "semantic_support": "not_assessed",
+            "provenance": "stored_provider_aggregate", "scope": "report_window_aggregate",
+            "ioc_specific": False})
     cve_priorities = [{"cve": row.get("cve"), "asset": row.get("asset"),
         "priority": "patch_now" if row.get("severity") == "Critical" and (row.get("score") or {}).get("kev") else "schedule" if row.get("severity") in {"Critical", "High"} else "verify_only",
-        "reason": f"{row.get('severity')} inventory finding on {row.get('package')} {row.get('version')}; verify exposure and vendor advisory."}
+        "reason": f"{row.get('severity')} inventory finding on {row.get('package')} {row.get('version')}; verify exposure and vendor advisory.",
+        "evidence_ids": [_compact_vulnerability(row)["evidence_id"]],
+        "reference_validation": "vulnerability_inventory_snapshot_match", "semantic_support": "not_assessed"}
         for row in vulnerabilities[:8]]
     category_counts = Counter(row.get("attack_category") or "other" for row in findings)
     category_evidence = {}
@@ -1271,6 +1360,34 @@ def local_ai_fallback(report, error="AI provider unavailable"):
         category_evidence[finding.get("attack_category") or "other"] = list(dict.fromkeys(
             str(value) for event in (finding.get("evidence") or [])[:3]
             for value in (event.get("event_id"), event.get("rule_id")) if value))[:8]
+    asset_claims = {}
+    for finding in findings:
+        for event in (finding.get("evidence") or [])[:3]:
+            refs = [str(value) for value in (event.get("event_id"), event.get("rule_id")) if value]
+            for field, role in (("device", "reporter"), ("source_ip", "source"),
+                                ("destination_ip", "target"), ("user", "user")):
+                value = event.get(field)
+                if value and refs:
+                    row = asset_claims.setdefault(str(value), {"asset": str(value), "roles": set(), "evidence_ids": set()})
+                    row["roles"].add(role)
+                    row["evidence_ids"].update(refs)
+    for row in vulnerabilities:
+        asset = row.get("asset") or row.get("agent")
+        if asset:
+            ref = _compact_vulnerability(row)["evidence_id"]
+            claim = asset_claims.setdefault(str(asset), {"asset": str(asset), "roles": set(), "evidence_ids": set()})
+            claim["roles"].add("inventory_asset")
+            claim["evidence_ids"].add(ref)
+    affected_asset_rows = [{"asset": row["asset"],
+        "role": next(iter(row["roles"])) if len(row["roles"]) == 1 else "unknown",
+        "observed_roles": sorted(row["roles"]),
+        "evidence_ids": sorted(row["evidence_ids"]),
+        "citation_status": "verified_reference" if row["evidence_ids"] else "unverified",
+        "reference_validation": "entity_role_link_available" if row["evidence_ids"] else "no_matching_entity_reference",
+        "semantic_support": "not_assessed",
+        "evidence": "Entity and observed role match supplied snapshot; compromise/impact is not established." if row["evidence_ids"] else "No local evidence reference",
+        "impact_status": "not_established"}
+        for row in list(asset_claims.values())[:10]]
     network_paths = []
     identities = []
     for finding in findings[:6]:
@@ -1303,16 +1420,22 @@ def local_ai_fallback(report, error="AI provider unavailable"):
             "verdict": {"status": status, "severity": severity, "confidence": confidence,
                 "reason": "Derived from local evidence, provider coverage, CVE inventory and queue priority; analyst verification is required."},
             "assessment": "The fallback assessment separates observed Wazuh/syslog activity from external reputation and vulnerability inventory. Treat no-match and provider errors as unknown, not safe.",
+            "semantic_validation": {"status": "analyst_review_required",
+                "reason": "Deterministic references identify the stored record or aggregate; semantic support for each conclusion is not assessed."},
             "attack_categories": [{"category": category, "count": count, "severity": severity,
                 "evidence": category_evidence.get(category, []),
+                "reference_validation": "ids_available_in_context" if category_evidence.get(category) else "missing_or_unknown_ids",
+                "semantic_support": "not_assessed",
                 "citation_status": "verified_reference" if category_evidence.get(category) else "unverified"}
                 for category, count in category_counts.most_common(8)],
-            "network_paths": [{**row, "citation_status": "verified_reference" if row.get("evidence") else "unverified"} for row in network_paths[:12]],
-            "identities": [{**row, "citation_status": "verified_reference" if row.get("evidence") else "unverified"} for row in identities[:12]],
+            "network_paths": [{**row, "citation_status": "verified_reference" if row.get("evidence") else "unverified",
+                "reference_validation": "ids_available_in_context" if row.get("evidence") else "missing_or_unknown_ids", "semantic_support": "not_assessed"} for row in network_paths[:12]],
+            "identities": [{**row, "citation_status": "verified_reference" if row.get("evidence") else "unverified",
+                "reference_validation": "ids_available_in_context" if row.get("evidence") else "missing_or_unknown_ids", "semantic_support": "not_assessed"} for row in identities[:12]],
             "data_impact": [],
             "anomaly_baseline": [{"signal": "AI historical comparison", "current": "not model-evaluated", "baseline": "stored in report history", "interpretation": "Run model analysis when provider is reachable for richer anomaly narrative."}],
-            "attack_narrative": [{"stage": "Observed", "detail": f"{top.get('indicator', 'No IOC')} is the highest ranked local indicator in this cycle.", "evidence": list(dict.fromkeys(str(value) for event in (top.get("evidence") or [])[:3] for value in (event.get("event_id"), event.get("rule_id")) if value)), "citation_status": "verified_reference" if top.get("evidence") else "unverified"}],
-            "affected_assets": [{"asset": asset, "role": "reporter|target|unknown", "evidence": "Observed in local report evidence"} for asset in sorted({dev for row in findings for dev in (row.get("devices") or [])})[:8]],
+            "attack_narrative": [{"stage": "Observed", "detail": f"{top.get('indicator', 'No IOC')} is the highest ranked local indicator in this cycle.", "evidence": list(dict.fromkeys(str(value) for event in (top.get("evidence") or [])[:3] for value in (event.get("event_id"), event.get("rule_id")) if value)), "citation_status": "verified_reference" if top.get("evidence") else "unverified", "reference_validation": "ids_available_in_context" if top.get("evidence") else "missing_or_unknown_ids", "semantic_support": "not_assessed"}],
+            "affected_assets": affected_asset_rows,
             "provider_findings": provider_findings,
             "cve_priorities": cve_priorities,
             "confidence_drivers": [
@@ -1334,10 +1457,13 @@ def local_ai_fallback(report, error="AI provider unavailable"):
     }
 
 
-def _window_evidence_ids(context):
+def _window_provenance_index(context):
     allowed = set()
+    activity_ids = set()
+    assets = {}
+    providers = {}
     if not isinstance(context, dict):
-        return allowed
+        return {"ids": allowed, "activity_ids": activity_ids, "assets": assets, "providers": providers}
     for row in context.get("rules", []) if isinstance(context.get("rules"), list) else []:
         value = row.get("rule_id") if isinstance(row, dict) else None
         if isinstance(value, (str, int)) and str(value).strip():
@@ -1351,8 +1477,106 @@ def _window_evidence_ids(context):
             for key in ("event_id", "rule_id"):
                 value = event.get(key)
                 if isinstance(value, (str, int)) and str(value).strip():
-                    allowed.add(str(value).strip()[:300])
-    return allowed
+                    ref = str(value).strip()[:300]
+                    allowed.add(ref)
+                    activity_ids.add(ref)
+            refs = [str(event.get(key)).strip()[:300] for key in ("event_id", "rule_id")
+                    if isinstance(event.get(key), (str, int)) and str(event.get(key)).strip()]
+            for key, role in (("device", "reporter"), ("source_ip", "source"),
+                              ("destination_ip", "target"), ("user", "user")):
+                value = event.get(key)
+                if value and refs:
+                    links = assets.setdefault(str(value).strip().casefold(), {})
+                    for ref in refs:
+                        links.setdefault(ref, set()).add(role)
+    for row in context.get("vulnerability_focus", []) if isinstance(context.get("vulnerability_focus"), list) else []:
+        if not isinstance(row, dict):
+            continue
+        asset, ref = row.get("asset"), row.get("evidence_id")
+        if asset and isinstance(ref, str) and ref:
+            allowed.add(ref)
+            assets.setdefault(str(asset).strip().casefold(), {}).setdefault(ref, set()).add("inventory_asset")
+    for row in context.get("provider_coverage", []) if isinstance(context.get("provider_coverage"), list) else []:
+        if not isinstance(row, dict):
+            continue
+        name, ref = row.get("provider"), row.get("evidence_id")
+        if name and isinstance(ref, str) and ref:
+            providers[str(name).strip().casefold()] = row
+            allowed.add(ref)
+    return {"ids": allowed, "activity_ids": activity_ids, "assets": assets, "providers": providers}
+
+
+def _window_evidence_ids(context):
+    return _window_provenance_index(context)["activity_ids"]
+
+
+def _normalize_window_assets(rows, provenance, violations):
+    assets, output = provenance["assets"], []
+    for row in rows:
+        item = dict(row)
+        name = str(item.get("asset") or "").strip()
+        key = name.casefold()
+        linked = assets.get(key, {})
+        raw_refs = item.get("evidence_ids") or []
+        if isinstance(raw_refs, (str, int)):
+            raw_refs = [raw_refs]
+        refs = [str(value).strip()[:300] for value in raw_refs[:20]
+                if isinstance(value, (str, int)) and str(value).strip()] if isinstance(raw_refs, list) else []
+        valid = list(dict.fromkeys(value for value in refs if value in linked))
+        if not linked or not valid or len(valid) != len(refs):
+            violations.append(f"affected_assets claim has no matching asset-to-evidence provenance: {name[:100] or 'unnamed'}")
+        roles = {role for ref in valid for role in linked.get(ref, set())}
+        role = str(item.get("role") or "unknown").strip().lower()
+        if role not in roles and role != "unknown":
+            violations.append(f"affected_assets role did not match telemetry for {name[:100] or 'unnamed'}")
+            role = next(iter(roles)) if len(roles) == 1 else "unknown"
+        elif role == "unknown" and len(roles) == 1:
+            role = next(iter(roles))
+        item["evidence_ids"] = valid
+        item["role"] = role
+        item["observed_roles"] = sorted(roles)
+        item["citation_status"] = "verified_reference" if linked and valid and len(valid) == len(refs) else "unverified"
+        item["reference_validation"] = "entity_role_link_available" if item["citation_status"] == "verified_reference" else "no_matching_entity_reference"
+        item["semantic_support"] = "not_assessed"
+        inventory_only = bool(valid) and "inventory_asset" in roles
+        item["relationship"] = role
+        item["impact_status"] = "vulnerability_inventory_only" if inventory_only else "not_established"
+        item["evidence"] = ("Entity-to-reference and observed role match; compromise/impact is not established."
+            if item["citation_status"] == "verified_reference" else "No matching asset-to-evidence link in supplied context")
+        output.append(item)
+    return output
+
+
+def _normalize_provider_findings(claims, provenance, violations):
+    providers = provenance["providers"]
+    for item in claims:
+        name = str(item.get("provider") or "").strip()
+        snapshot = providers.get(name.casefold())
+        if not snapshot:
+            violations.append(f"provider_findings named a provider absent from supplied coverage: {name[:100] or 'unnamed'}")
+            continue
+        refs = item.get("evidence_ids") or []
+        if isinstance(refs, str):
+            refs = [refs]
+        if not isinstance(refs, list) or snapshot.get("evidence_id") not in refs:
+            violations.append(f"provider_findings omitted or changed the stored snapshot reference for {name[:100]}")
+        matched, errors = int(snapshot.get("matched") or 0), int(snapshot.get("errors") or 0)
+        expected = "match" if matched else "error" if errors else "unknown"
+        claimed = str(item.get("verdict") or "unknown").lower()
+        allowed_verdicts = {"unknown", expected} | ({"error"} if errors else set())
+        if claimed not in allowed_verdicts:
+            violations.append(f"provider_findings verdict for {name[:100]} disagreed with stored aggregate")
+    output = []
+    for name, snapshot in providers.items():
+        matched, context_count, errors = (int(snapshot.get(key) or 0) for key in ("matched", "context", "errors"))
+        verdict = "match" if matched else "error" if errors else "unknown"
+        output.append({"provider": snapshot.get("provider"), "verdict": verdict,
+            "signal": f"Stored aggregate: {matched} match(es), {context_count} context record(s), {errors} error(s).",
+            "evidence_ids": [snapshot["evidence_id"]], "citation_status": "verified_provider_snapshot",
+            "reference_validation": "stored_provider_snapshot_match", "semantic_support": "not_assessed",
+            "provenance": "stored_provider_aggregate", "scope": "report_window_aggregate",
+            "ioc_specific": False})
+    return output
 
 
 def _validate_window_citations(rows, allowed, field_name, violations):
@@ -1371,6 +1595,8 @@ def _validate_window_citations(rows, allowed, field_name, violations):
         item["evidence"] = valid_refs
         item.pop("evidence_ids", None)
         item["citation_status"] = "verified_reference" if valid_refs and not unknown_refs else "unverified"
+        item["reference_validation"] = "ids_available_in_context" if item["citation_status"] == "verified_reference" else "missing_or_unknown_ids"
+        item["semantic_support"] = "not_assessed"
         validated.append(item)
     return validated
 
@@ -1384,9 +1610,12 @@ def normalize_ai_result(parsed, report, evidence_context=None):
         raise ValueError("Model returned invalid assessment schema")
     verdict = parsed.get("verdict") if isinstance(parsed.get("verdict"), dict) else {}
     citation_violations = []
-    allowed_evidence = _window_evidence_ids(evidence_context)
+    provenance = _window_provenance_index(evidence_context)
+    allowed_evidence = provenance["activity_ids"]
     result = {
         "summary": summary,
+        "semantic_validation": {"status": "analyst_review_required",
+            "reason": "Reference matching checks ID availability and entity links; it does not determine whether free-text claims logically follow from the cited event."},
         "daily_brief": str(parsed.get("daily_brief") or summary)[:1800],
         "assessment": assessment,
         "verdict": {
@@ -1401,8 +1630,8 @@ def normalize_ai_result(parsed, report, evidence_context=None):
         "identities": _validate_window_citations(_dict_list(parsed.get("identities"), 12), allowed_evidence, "identities", citation_violations),
         "data_impact": _validate_window_citations(_dict_list(parsed.get("data_impact"), 12), allowed_evidence, "data_impact", citation_violations),
         "anomaly_baseline": _dict_list(parsed.get("anomaly_baseline"), 8),
-        "affected_assets": _dict_list(parsed.get("affected_assets"), 10),
-        "provider_findings": _dict_list(parsed.get("provider_findings"), 12),
+        "affected_assets": _normalize_window_assets(_dict_list(parsed.get("affected_assets"), 10), provenance, citation_violations),
+        "provider_findings": _normalize_provider_findings(_dict_list(parsed.get("provider_findings"), 12), provenance, citation_violations),
         "cve_priorities": _validate_window_citations(_dict_list(parsed.get("cve_priorities"), 10), allowed_evidence, "cve_priorities", citation_violations),
         "confidence_drivers": _string_list(parsed.get("confidence_drivers"), 10),
         "escalation": parsed.get("escalation") if isinstance(parsed.get("escalation"), dict) else {"level": "l1", "reason": "Analyst validation required", "sla": "same shift"},
@@ -1416,10 +1645,13 @@ def normalize_ai_result(parsed, report, evidence_context=None):
         result["gaps"] = list(report.get("limitations") or [])[:4]
     for lane in ("l1", "l2", "l3", "response"):
         result["action_plan"][lane] = _string_list(result["action_plan"].get(lane), 8)
-    result["evidence_references"] = sorted({ref for key in ("attack_narrative", "attack_categories", "network_paths", "identities", "data_impact", "cve_priorities")
-        for row in result[key] for ref in row.get("evidence", [])})[:100]
+    result["evidence_references"] = sorted(
+        {ref for key in ("attack_narrative", "attack_categories", "network_paths", "identities", "data_impact", "cve_priorities")
+         for row in result[key] for ref in row.get("evidence", [])}
+        | {ref for row in result["affected_assets"] for ref in row.get("evidence_ids", [])}
+        | {ref for row in result["provider_findings"] for ref in row.get("evidence_ids", [])})[:100]
     if citation_violations or any(row.get("citation_status") != "verified_reference"
-            for key in ("attack_narrative", "attack_categories", "network_paths", "identities", "data_impact", "cve_priorities")
+            for key in ("attack_narrative", "attack_categories", "network_paths", "identities", "data_impact", "cve_priorities", "affected_assets")
             for row in result[key]):
         result["gaps"].append("One or more structured AI claims lack a valid event_id/rule_id citation from the supplied context.")
         result["confidence_drivers"].append("Structured claims without validated event/rule references are not treated as observed evidence.")
@@ -1449,17 +1681,12 @@ def analyze_with_model(config, report):
     if not base or not config.get("AI_MODEL"):
         return {"status": "not_configured"}
     # Send bounded structured evidence, not raw log bodies or configuration secrets.
-    context = build_ai_context(report)
-    content = _shrink_ai_context(context, 6200)
-    if len(content) > 6200:
-        context = _minimal_ai_context(context)
-        content = json.dumps(context, ensure_ascii=True)
-    if len(content) > 6200:
-        return {"status": "error", "error": "Evidence exceeds model input budget"}
+    context, content = _prepare_window_ai_context(report)
     headers = {"Authorization": "Bearer " + config["AI_API_KEY"]} if config.get("AI_API_KEY") else {}
     started = time.time()
     timeout = min(max(int(config.get("AI_TIMEOUT_SECONDS", "180")), 10), 180)
-    result = _request_ai_assessment(base, config, headers, FAST_SYSTEM_PROMPT + prompt_clause("window"), content, timeout)
+    system_prompt = _window_system_prompt(config)
+    result = _request_ai_assessment(base, config, headers, system_prompt, content, timeout)
     fallback_used = False
     choice = result["choices"][0]
     if choice.get("finish_reason") == "length":
@@ -1472,11 +1699,14 @@ def analyze_with_model(config, report):
     except (json.JSONDecodeError, ValueError) as exc:
         raise ValueError("AI returned malformed output; deterministic fallback required") from exc
     parsed = normalize_ai_result(parsed, report, context)
-    return {"status": "completed", "model": config["AI_MODEL"], "advisory": True, "schema": "soc-analyst-v2",
+    response = {"status": "completed", "model": result.get("model") or config["AI_MODEL"],
+            "configured_model": config["AI_MODEL"], "advisory": True, "schema": "soc-analyst-v2",
             "contract_version": CONTRACT_VERSION, "contract": contract_metadata("window"),
             "result": parsed, "evidence_findings_sent": len(context["top_findings"]), "fallback_used": fallback_used,
             "generated_at": now(),
             "elapsed_seconds": round(time.time() - started, 1)}
+    response["audit"] = _window_audit_metadata(report, response, config, context, content, system_prompt)
+    return response
 
 
 def _bounded_finding_context(value, depth=0):
@@ -1514,7 +1744,107 @@ def _finding_evidence_ids(context):
             rule_id = rule.get("id") if isinstance(rule, dict) else row.get("rule_id")
             if isinstance(rule_id, (str, int)) and str(rule_id).strip():
                 allowed.add(str(rule_id).strip()[:300])
+        related = context.get("related_evidence") if isinstance(context.get("related_evidence"), dict) else {}
+        for row in related.get("events", []) if isinstance(related.get("events"), list) else []:
+            if isinstance(row, dict) and row.get("evidence_id"):
+                allowed.add(str(row["evidence_id"]).strip()[:300])
     return allowed
+
+
+def _finding_provenance_context(context):
+    context = dict(context) if isinstance(context, dict) else {}
+    entities = {}
+    for row in context.get("local_evidence", []) if isinstance(context.get("local_evidence"), list) else []:
+        if not isinstance(row, dict):
+            continue
+        refs = [str(value).strip()[:300] for value in (row.get("event_id") or row.get("id"),
+            (row.get("rule") or {}).get("id") if isinstance(row.get("rule"), dict) else row.get("rule_id")) if value]
+        for field, role in (("device", "reporter"), ("source_ip", "source"),
+                            ("destination_ip", "target"), ("user", "user")):
+            value = str(row.get(field) or "").strip()
+            if value and refs:
+                item = entities.setdefault(value.casefold(), {"asset": value, "roles": set(), "evidence_ids": set()})
+                item["roles"].add(role)
+                item["evidence_ids"].update(refs)
+    for row in context.get("asset_context", []) if isinstance(context.get("asset_context"), list) else []:
+        if not isinstance(row, dict):
+            continue
+        value = str(row.get("asset") or row.get("host") or row.get("ip") or "").strip()
+        if not value:
+            continue
+        inventory = {key: row.get(key) for key in (
+            "owner", "criticality", "environment", "network_zone", "vendor", "version", "cpe",
+            "purpose", "application", "internet_exposed", "patch_state", "cpe_status", "components")
+            if row.get(key) is not None}
+        inventory_ref = _snapshot_ref("cmdb-asset", {"asset": value, **inventory})
+        item = entities.setdefault(value.casefold(), {"asset": value, "roles": set(), "evidence_ids": set(), "inventory": {}})
+        item["roles"].add("inventory_asset")
+        item["evidence_ids"].add(inventory_ref)
+        item["inventory"].update(inventory)
+    entity_evidence = [{"asset": item["asset"], "roles": sorted(item["roles"]),
+        "evidence_ids": sorted(item["evidence_ids"]), "inventory": item.get("inventory", {})}
+        for item in entities.values()]
+    providers = []
+    for source_key in ("provider_results", "stored_provider_history"):
+        rows = context.get(source_key)
+        if isinstance(rows, dict):
+            rows = rows.get("items") or rows.get("providers") or []
+        for row in rows if isinstance(rows, list) else []:
+            if not isinstance(row, dict):
+                continue
+            compact = {key: row.get(key) for key in ("provider", "name", "status", "matched", "is_malicious", "summary", "error") if row.get(key) is not None}
+            name = str(compact.get("provider") or compact.get("name") or "").strip()
+            if not name:
+                continue
+            providers.append({"provider": name, "source": source_key,
+                "status": compact.get("status") or "unknown", "matched": compact.get("matched"),
+                "is_malicious": compact.get("is_malicious"),
+                "signal": str(compact.get("summary") or compact.get("error") or "Stored provider result")[:300],
+                "evidence_id": _snapshot_ref("finding-provider", {"source": source_key, **compact})})
+    context["entity_evidence"] = entity_evidence[:40]
+    context["provider_evidence"] = providers[:30]
+    return context
+
+
+def _normalize_finding_assets(context):
+    output = []
+    for item in context.get("entity_evidence", []) if isinstance(context.get("entity_evidence"), list) else []:
+        roles = item.get("roles") or []
+        telemetry_roles = [value for value in roles if value != "inventory_asset"]
+        role = telemetry_roles[0] if len(telemetry_roles) == 1 else "inventory_asset" if roles == ["inventory_asset"] else "unknown"
+        refs = item.get("evidence_ids") or []
+        output.append({"asset": item.get("asset"), "role": role, "relationship": role,
+            "observed_roles": roles, "evidence_ids": refs,
+            "citation_status": "verified_reference" if refs else "unverified",
+            "reference_validation": "entity_role_link_available" if refs else "no_matching_entity_reference",
+            "semantic_support": "not_assessed",
+            "owner": (item.get("inventory") or {}).get("owner"),
+            "criticality": (item.get("inventory") or {}).get("criticality"),
+            "environment": (item.get("inventory") or {}).get("environment"),
+            "network_zone": (item.get("inventory") or {}).get("network_zone"),
+            "vendor": (item.get("inventory") or {}).get("vendor"),
+            "version": (item.get("inventory") or {}).get("version"),
+            "cpe": (item.get("inventory") or {}).get("cpe"),
+            "application": (item.get("inventory") or {}).get("application"),
+            "impact_status": "inventory_context_only" if roles == ["inventory_asset"] else "not_established",
+            "evidence": "Entity and observed role match; CMDB fields provide prioritization context only, not compromise proof."})
+    return output[:12]
+
+
+def _normalize_finding_providers(context):
+    output = []
+    for item in context.get("provider_evidence", []) if isinstance(context.get("provider_evidence"), list) else []:
+        status = str(item.get("status") or "unknown").lower()
+        verdict = "match" if status in {"matched", "match", "malicious"} or item.get("is_malicious") is True else (
+            "provider_error" if status in {"error", "failed", "provider_error"} else
+            "skipped" if status == "skipped" else "no_match" if status in {"no_match", "context"} else
+            "not_tried" if status == "not_tried" else "unknown")
+        output.append({"provider": item.get("provider"), "status": verdict,
+            "signal": item.get("signal") or "Stored provider result", "evidence_ids": [item.get("evidence_id")],
+            "citation_status": "verified_provider_snapshot", "scope": "finding_context_provider_result",
+            "reference_validation": "stored_provider_snapshot_match", "semantic_support": "not_assessed",
+            "not_local_activity_proof": True})
+    return output[:16]
 
 
 def normalize_finding_ai_result(parsed, context):
@@ -1546,10 +1876,40 @@ def normalize_finding_ai_result(parsed, context):
             violations.append("Model cited evidence IDs not present in supplied context: " + ", ".join(invalid_refs[:4]))
         if valid_refs:
             source_facts.append(fact)
-            source_fact_citations.append({"fact": fact, "evidence_ids": valid_refs})
+            source_fact_citations.append({"fact": fact, "evidence_ids": valid_refs,
+                "reference_validation": "ids_available_in_context", "semantic_support": "not_assessed"})
         else:
             unverified_source_facts.append(fact)
 
+    for claim in parsed.get("affected_assets", []) if isinstance(parsed.get("affected_assets"), list) else []:
+        if not isinstance(claim, dict):
+            continue
+        match = next((row for row in context.get("entity_evidence", [])
+                      if str(row.get("asset") or "").casefold() == str(claim.get("asset") or "").strip().casefold()), None)
+        refs = claim.get("evidence_ids") or []
+        if isinstance(refs, str):
+            refs = [refs]
+        if not match or not isinstance(refs, list) or not set(map(str, refs)).intersection(match.get("evidence_ids") or []):
+            violations.append("Affected-asset assertion did not cite a reference linked to that exact entity.")
+        elif str(claim.get("role") or "unknown").lower() not in set(match.get("roles") or []) | {"unknown"}:
+            violations.append("Affected-asset role did not match the cited entity telemetry.")
+    known_providers = {str(row.get("provider") or "").casefold(): row
+        for row in context.get("provider_evidence", []) if isinstance(row, dict)}
+    for claim in parsed.get("provider_consensus", []) if isinstance(parsed.get("provider_consensus"), list) else []:
+        if not isinstance(claim, dict):
+            continue
+        provider = known_providers.get(str(claim.get("provider") or "").casefold())
+        refs = claim.get("evidence_ids") or []
+        if isinstance(refs, str):
+            refs = [refs]
+        if not provider or provider.get("evidence_id") not in refs:
+            violations.append("Provider assertion did not cite the supplied provider snapshot.")
+        else:
+            provider_status = str(provider.get("status") or "unknown").lower()
+            matched_count = str(provider.get("matched") or "0")
+            expected_status = "match" if provider_status in {"matched", "match", "malicious"} or provider.get("is_malicious") is True or (matched_count.isdigit() and int(matched_count) > 0) else "provider_error" if provider_status in {"error", "failed", "provider_error"} else "skipped" if provider_status == "skipped" else "no_match" if provider_status in {"no_match", "context"} else "unknown"
+            if str(claim.get("status") or "unknown").lower() not in {"unknown", expected_status}:
+                violations.append("Provider assertion status disagreed with the supplied provider snapshot.")
     result = {
         "summary": summary,
         "attack_category": str(parsed.get("attack_category") or "other")[:80],
@@ -1568,9 +1928,11 @@ def normalize_finding_ai_result(parsed, context):
         "evidence_references": list(dict.fromkeys(
             value for item in source_fact_citations for value in item["evidence_ids"]))[:30],
         "inference": str(parsed.get("inference") or summary)[:3000],
+        "semantic_validation": {"status": "analyst_review_required",
+            "reason": "Evidence IDs establish that a record was supplied, not that it semantically supports each narrative claim."},
         "attack_path": _dict_list(parsed.get("attack_path"), 10),
-        "affected_assets": _dict_list(parsed.get("affected_assets"), 12),
-        "provider_consensus": _dict_list(parsed.get("provider_consensus"), 16),
+        "affected_assets": _normalize_finding_assets(context),
+        "provider_consensus": _normalize_finding_providers(context),
         "cves": _dict_list(parsed.get("cves"), 16),
         "actions": {},
         "quality_checks": _string_list(parsed.get("quality_checks"), 12),
@@ -1598,23 +1960,10 @@ def normalize_finding_ai_result(parsed, context):
 
 
 def local_finding_ai_fallback(context, error="AI provider unavailable"):
+    context = _finding_provenance_context(context)
     cves = sorted(set(re.findall(r"CVE-\d{4}-\d{4,}", json.dumps(context, default=str), re.I)))[:16]
-    assets = [str(item) for item in context.get("assets", []) if item][:12]
     local_evidence = context.get("local_evidence") if isinstance(context.get("local_evidence"), list) else []
     first_event = local_evidence[0] if local_evidence else {}
-    providers = context.get("provider_results") if isinstance(context.get("provider_results"), list) else []
-    cmdb = context.get("asset_context") if isinstance(context.get("asset_context"), list) else []
-    affected_assets = [{"asset": item, "role": "unknown", "evidence": "Listed on the selected finding"} for item in assets]
-    for row in cmdb[:12]:
-        if not isinstance(row, dict):
-            continue
-        affected_assets.append({
-            "asset": row.get("asset") or row.get("host") or row.get("ip") or "unknown",
-            "role": "unknown",
-            "owner": row.get("owner"), "criticality": row.get("criticality"),
-            "network_zone": row.get("network_zone"), "cpe": row.get("cpe"),
-            "evidence": "Local CMDB context; prioritization evidence only",
-        })
     return {
         "status": "completed", "model": "local-rule-fallback", "advisory": True,
         "schema": "soc-finding-v1-fallback", "contract_version": CONTRACT_VERSION,
@@ -1633,13 +1982,15 @@ def local_finding_ai_fallback(context, error="AI provider unavailable"):
             "data_impact": [],
             "verdict": {"status": "needs_review", "severity": context.get("severity") or "unknown", "confidence": "low", "reason": "The AI provider was unavailable, so no model inference was used."},
             "source_facts": ([f"Local event record {row.get('event_id')} was returned as evidence for this finding." for row in local_evidence if row.get("event_id")][:12]),
-            "source_fact_citations": ([{"fact": f"Local event record {row.get('event_id')} was returned as evidence for this finding.", "evidence_ids": [str(row.get("event_id"))]} for row in local_evidence if row.get("event_id")][:12]),
+            "source_fact_citations": ([{"fact": f"Local event record {row.get('event_id')} was returned as evidence for this finding.", "evidence_ids": [str(row.get("event_id"))], "semantic_support": "not_assessed"} for row in local_evidence if row.get("event_id")][:12]),
             "unverified_source_facts": [],
             "evidence_references": list(dict.fromkeys(str(row.get("event_id")) for row in local_evidence if row.get("event_id")))[:30],
             "inference": "The record requires correlation with original events, source/destination direction, affected asset role, and provider provenance.",
+            "semantic_validation": {"status": "analyst_review_required",
+                "reason": "Evidence IDs establish that a record was supplied, not that it semantically supports each narrative claim."},
             "attack_path": [{"stage": "Observed", "detail": context.get("description") or "Selected SOC finding", "evidence": context.get("id") or context.get("title")}],
-            "affected_assets": affected_assets[:12],
-            "provider_consensus": [{"provider": row.get("provider") or row.get("name") or "unknown", "status": row.get("status") or "unknown", "signal": row.get("summary") or row.get("error") or "Stored provider result"} for row in providers[:16] if isinstance(row, dict)],
+            "affected_assets": _normalize_finding_assets(context),
+            "provider_consensus": _normalize_finding_providers(context),
             "cves": [{"cve": cve, "relationship": "referenced", "local_exposure": "not_verified", "priority": "verify_only", "reason": "Validate product/version inventory and reachability."} for cve in cves],
             "actions": {
                 "l1": ["Open the matching Wazuh/syslog events and verify source, destination, action, timestamp, and reporting device role."],
@@ -1657,6 +2008,7 @@ def analyze_finding_with_model(config, finding):
     context = _bounded_finding_context(finding)
     if not isinstance(context, dict):
         raise ValueError("Invalid finding context")
+    context = _finding_provenance_context(context)
     if config.get("AI_ANALYST_ENABLED") != "true":
         return {"status": "disabled"}
     base = chat_base(config.get("AI_PROVIDER_BASE_URL", ""))
@@ -1673,7 +2025,7 @@ def analyze_finding_with_model(config, finding):
     result = post_chat(base + "/chat/completions", {
         "model": config["AI_MODEL"], "max_tokens": min(int(config.get("AI_MAX_TOKENS", "1600")), 4096),
         "temperature": 0, "messages": [
-            {"role": "system", "content": FINDING_SYSTEM_PROMPT + prompt_clause("finding") + " Language: " + config.get("SOC_REPORT_LANGUAGE", "id")},
+            {"role": "system", "content": _finding_system_prompt(config)},
             {"role": "user", "content": content},
         ],
     }, headers, timeout=min(max(int(config.get("AI_TIMEOUT_SECONDS", "180")), 10), 180))
@@ -1690,11 +2042,14 @@ def analyze_finding_with_model(config, finding):
     if not str(parsed.get("summary") or "").strip():
         raise ValueError("AI finding output is missing its summary; deterministic fallback required")
     elapsed = round(time.time() - started, 1)
-    return {"status": "completed", "model": config["AI_MODEL"], "advisory": True,
+    response = {"status": "completed", "model": result.get("model") or config["AI_MODEL"],
+            "configured_model": config["AI_MODEL"], "advisory": True,
             "schema": "soc-finding-v1", "contract_version": CONTRACT_VERSION,
             "contract": contract_metadata("finding"), "fallback_used": False, "generated_at": now(),
             "elapsed_seconds": elapsed,
             "result": normalize_finding_ai_result(parsed, context)}
+    response["audit"] = _finding_audit_metadata(context, response, config)
+    return response
 
 
 def report_text(report, language="id"):
@@ -1820,10 +2175,12 @@ class Automation:
         self.running = False
         self.phase = "idle"
         self.error = None
+        self.entity_group_error = None
         self.next_run = time.time() + 30
         # External collectors have their own cache/backoff and must not wait
         # for an Indexer-backed Wazuh report to succeed.
         self.next_external_refresh = time.time() + 30
+        self.next_entity_group_refresh = time.time() + 45
         self.stop = threading.Event()
         self.requested_window = {"range": "24h"}
 
@@ -1883,6 +2240,13 @@ class Automation:
                             conn.execute('CREATE TABLE IF NOT EXISTS ai_runs (id INTEGER PRIMARY KEY, report_id INTEGER, created REAL, data TEXT)')
                             conn.execute('CREATE TABLE IF NOT EXISTS finding_ai (cache_key TEXT PRIMARY KEY, finding_id TEXT, created REAL, expires REAL, data TEXT)')
                             conn.execute('CREATE INDEX IF NOT EXISTS finding_ai_created ON finding_ai(created)')
+                            conn.execute('''CREATE TABLE IF NOT EXISTS finding_ai_runs (
+                                run_id TEXT PRIMARY KEY, finding_id TEXT NOT NULL, created REAL NOT NULL,
+                                model TEXT NOT NULL, skill_version TEXT NOT NULL, contract_version TEXT NOT NULL,
+                                prompt_sha256 TEXT NOT NULL, input_sha256 TEXT NOT NULL,
+                                result_sha256 TEXT NOT NULL, evidence_ids TEXT NOT NULL,
+                                provider_sources TEXT NOT NULL, audit TEXT NOT NULL)''')
+                            conn.execute('CREATE INDEX IF NOT EXISTS finding_ai_runs_lookup ON finding_ai_runs(finding_id,created DESC)')
                             conn.execute('CREATE TABLE IF NOT EXISTS finding_ai_jobs (id TEXT PRIMARY KEY, cache_key TEXT, finding_id TEXT, created REAL, updated REAL, status TEXT, request TEXT, force INTEGER, result TEXT, error TEXT)')
                             columns = {row[1] for row in conn.execute("PRAGMA table_info(finding_ai_jobs)")}
                             if "attempts" not in columns:
@@ -1967,6 +2331,39 @@ class Automation:
         """Persist idempotent correlations from local records and bounded evidence."""
         with self.db() as db:
             return defender_xdr.correlate(db, context)
+
+    def refresh_correlation_candidates(self):
+        """Materialize bounded alert groups from the local entity ledger only."""
+        try:
+            with self.db() as db:
+                result = entity_resolver.materialize_correlation_candidates(db)
+        except Exception as exc:
+            self.entity_group_error = self.clean_error(exc)
+            try:
+                with self.db() as db:
+                    entity_resolver.record_candidate_materialization_error(db, self.entity_group_error)
+            except Exception:
+                pass
+            raise
+        self.entity_group_error = None
+        return result
+
+    def correlation_candidate_summary(self, start=None, end=None, limit=12):
+        """Read stored candidate groups without a Wazuh or provider call."""
+        lower = None
+        upper = None
+        try:
+            lower = datetime.fromisoformat(str(start).replace("Z", "+00:00")).timestamp() if start else None
+            upper = datetime.fromisoformat(str(end).replace("Z", "+00:00")).timestamp() if end else None
+        except (TypeError, ValueError, OverflowError):
+            lower = upper = None
+        with self.db() as db:
+            return entity_resolver.correlation_candidates(db, lower, upper, limit)
+
+    def entity_timeline(self, entities, start, end, limit=100):
+        """Read a case's timestamped entity evidence from the local graph."""
+        with self.db() as db:
+            return entity_resolver.entity_timeline(db, entities, start, end, limit)
 
     def put(self, key, value, ttl=21600):
         with self.db() as db:
@@ -2375,11 +2772,99 @@ class Automation:
         if not isinstance(context, dict) or not str(context.get("id") or context.get("title") or "").strip():
             raise ValueError("A finding id or title is required")
         context["analysis_profile"] = finding_analysis_profile(context)
+        context["related_evidence"] = self._finding_related_evidence(context)
         encoded = json.dumps({"skill_version": FINDING_SKILL_VERSION, "contract_version": CONTRACT_VERSION,
                               "finding": context}, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
         if len(encoded) > 12000:
             raise ValueError("Finding context exceeds the 12 KB analysis limit")
         return context, hashlib.sha256(encoded.encode()).hexdigest()
+
+    def _finding_related_evidence(self, context):
+        """Read a small, time-bounded evidence sequence from the local entity graph only."""
+        candidates = []
+        direct_ip = context.get("ip") or context.get("source_ip")
+        if direct_ip:
+            candidates.append({"entity_type": "ip", "entity_value": direct_ip})
+        subject = context.get("user") or context.get("subject")
+        if subject and ("@" in str(subject) or context.get("user")):
+            candidates.append({"entity_type": "user", "entity_value": subject})
+        for asset in context.get("assets", []) if isinstance(context.get("assets"), list) else []:
+            value = (asset.get("name") or asset.get("hostname") or asset.get("asset")) if isinstance(asset, dict) else asset
+            if value:
+                candidates.append({"entity_type": "hostname", "entity_value": value})
+        cve = context.get("cve")
+        if cve or re.fullmatch(r"CVE-\d{4}-\d{4,}", str(context.get("indicator") or ""), re.I):
+            candidates.append({"entity_type": "cve", "entity_value": cve or context.get("indicator")})
+        indicator = str(context.get("indicator") or "")
+        if indicator:
+            indicator_ip = entity_resolver.canonicalize("ip", indicator)
+            if indicator_ip:
+                candidates.append({"entity_type": "ip", "entity_value": indicator_ip})
+            elif re.fullmatch(r"[a-fA-F0-9]{32}|[a-fA-F0-9]{40}|[a-fA-F0-9]{64}", indicator):
+                candidates.append({"entity_type": "hash", "entity_value": indicator})
+            elif indicator.lower().startswith(("http://", "https://")):
+                candidates.append({"entity_type": "url", "entity_value": indicator})
+            elif "." in indicator and " " not in indicator:
+                candidates.append({"entity_type": "domain", "entity_value": indicator})
+        entities, seen = [], set()
+        for item in candidates:
+            kind = item["entity_type"]
+            canonical = entity_resolver.canonicalize(kind, item["entity_value"])
+            if canonical and (kind, canonical) not in seen:
+                entities.append({"entity_type": kind, "entity_value": canonical})
+                seen.add((kind, canonical))
+            if len(entities) >= 20:
+                break
+        if not entities:
+            return {"status": "no_supported_entities", "source": "local durable entity graph",
+                    "events": [], "query_entities": [],
+                    "interpretation": "No supported canonical entity was present in the selected finding."}
+        now_ts = time.time()
+        try:
+            if context.get("start") and context.get("end"):
+                start = entity_resolver._epoch(context["start"])
+                end = entity_resolver._epoch(context["end"])
+            else:
+                seconds = {"1h": 3600, "6h": 21600, "12h": 43200, "24h": 86400,
+                           "3d": 259200, "7d": 604800, "30d": 2592000,
+                           "90d": 7776000, "180d": 15552000}.get(str(context.get("range") or "24h"), 86400)
+                end, start = now_ts, now_ts - seconds
+            if start >= end or end - start > 186 * 86400:
+                raise ValueError("Invalid or overlong evidence window")
+            timeline = self.entity_timeline(entities, start, end, limit=10)
+        except Exception as exc:
+            return {"status": "unavailable", "source": "local durable entity graph",
+                    "query_entities": entities, "events": [], "reason": self.clean_error(exc),
+                    "interpretation": "Related local evidence could not be read; no full-log search was implied."}
+        events = []
+        for event in timeline.get("events", []) if isinstance(timeline, dict) else []:
+            if not isinstance(event, dict) or not event.get("evidence_id"):
+                continue
+            compact = {key: (str(event.get(key))[:240] if isinstance(event.get(key), str) else event.get(key))
+                       for key in ("evidence_id", "timestamp", "last_seen", "source", "source_record_id", "title",
+                                   "severity", "confidence", "occurrence_count", "rule_id", "decoder",
+                                   "attack_mapping_status") if event.get(key) is not None}
+            compact["attack_techniques"] = [{key: str(value)[:160] for key, value in technique.items()
+                                             if key in {"id", "name", "mapping_source"} and value is not None}
+                                            for technique in (event.get("attack_techniques") or [])[:3]
+                                            if isinstance(technique, dict)]
+            compact["matched_entities"] = [{key: str(value)[:200] for key, value in entity.items()
+                                            if key in {"type", "value"} and value is not None}
+                                           for entity in (event.get("matched_entities") or [])[:3]
+                                           if isinstance(entity, dict)]
+            compact["entities"] = [{key: (str(value)[:200] if key == "value" else str(value)[:120])
+                                    for key, value in entity.items()
+                                    if key in {"type", "value", "role", "field_path", "confidence"} and value is not None}
+                                   for entity in (event.get("entities") or [])[:4]
+                                   if isinstance(entity, dict)]
+            events.append(compact)
+        return {"status": timeline.get("status", "unavailable"),
+                "source": timeline.get("source", "local durable entity graph"),
+                "query_entities": entities, "events": events, "returned": len(events),
+                "truncated": bool(timeline.get("truncated")),
+                "range_label": str(context.get("range") or "24h")[:32],
+                "interpretation": timeline.get("interpretation") or
+                    "Chronological related evidence only; shared entity does not establish causality."}
 
     def _finding_memory(self, context):
         finding_id = str(context.get("id") or context.get("title") or "")[:300]
@@ -2468,6 +2953,7 @@ class Automation:
                     "analyst_feedback": (memory.get("analyst_feedback") or [])[:3],
                     "instruction": memory.get("instruction"),
                 }
+            context = _finding_provenance_context(context)
             try:
                 result = analyze_finding_with_model(self.config(), context)
                 if result.get("status") in {"disabled", "not_configured"} and self.config().get("AI_FALLBACK_ENABLED") == "true":
@@ -2479,16 +2965,33 @@ class Automation:
                     result = local_finding_ai_fallback(context, self.clean_error(exc))
             if result.get("status") == "completed":
                 result["analysis_profile"] = context.get("analysis_profile")
+                result["related_evidence"] = context.get("related_evidence")
                 result["memory"] = {"status": "used", "previous_assessments": len((context.get("analyst_memory") or {}).get("previous_assessments") or []),
                     "indicator_history": len(((context.get("analyst_memory") or {}).get("indicator_history") or {}).get("findings") or []),
                     "analyst_feedback": len((context.get("analyst_memory") or {}).get("analyst_feedback") or [])}
+                if not isinstance(result.get("audit"), dict):
+                    result["audit"] = _finding_audit_metadata(context, result, self.config())
+                audit = result["audit"]
+                result_without_audit = {key: value for key, value in result.items() if key != "audit"}
+                audit["result_sha256"] = _sha256_text(json.dumps(
+                    result_without_audit, sort_keys=True, separators=(",", ":"), ensure_ascii=True, default=str))
                 ttl = int_config(self.config(), "AI_FINDING_CACHE_SECONDS", 86400)
                 created = time.time()
                 with self.db() as db:
+                    db.execute('''INSERT INTO finding_ai_runs
+                        (run_id,finding_id,created,model,skill_version,contract_version,prompt_sha256,input_sha256,
+                         result_sha256,evidence_ids,provider_sources,audit) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)''',
+                        (audit["run_id"], str(context.get("id") or context.get("title"))[:300], created,
+                         str(audit.get("model") or "unknown")[:200], str(audit.get("skill_version") or "unknown")[:100],
+                         str(audit.get("contract_version") or "unknown")[:100], str(audit.get("prompt_sha256") or ""),
+                         str(audit.get("input_sha256") or ""), audit["result_sha256"],
+                         json.dumps(audit.get("evidence_ids") or []), json.dumps(audit.get("provider_sources") or []),
+                         json.dumps(audit, separators=(",", ":"))))
                     db.execute("INSERT OR REPLACE INTO finding_ai(cache_key,finding_id,created,expires,data) VALUES (?,?,?,?,?)",
                         (cache_key, str(context.get("id") or context.get("title"))[:300], created, created + ttl, json.dumps(result)))
                     retention = int_config(self.config(), "SOC_REPORT_RETENTION_DAYS", 180) * 86400
                     db.execute("DELETE FROM finding_ai WHERE created<?", (created - retention,))
+                    db.execute("DELETE FROM finding_ai_runs WHERE created<?", (created - retention,))
                 result["cache"] = {"status": "miss", "age_seconds": 0, "ttl_seconds": ttl}
             return result
         finally:
@@ -2520,6 +3023,53 @@ class Automation:
             position = db.execute("SELECT COUNT(*) FROM finding_ai_jobs WHERE status='queued' AND created<=?", (created,)).fetchone()[0]
         return {"status": "queued", "job_id": job_id, "queued_at": created, "position": position,
             "profile": context.get("analysis_profile")}
+
+    def finding_analysis_history(self, finding_id, limit=10):
+        finding_id = str(finding_id or "").strip()[:300]
+        try:
+            limit = min(max(int(limit or 10), 1), 50)
+        except (TypeError, ValueError):
+            limit = 10
+        if not finding_id:
+            return {"finding_id": finding_id, "items": []}
+        with self.db() as db:
+            rows = db.execute('''SELECT run_id,created,model,skill_version,contract_version,
+                prompt_sha256,input_sha256,result_sha256,evidence_ids,provider_sources,audit
+                FROM finding_ai_runs WHERE finding_id=? ORDER BY created DESC LIMIT ?''',
+                (finding_id, limit)).fetchall()
+        items = []
+        for row in rows:
+            try:
+                audit = json.loads(row[10])
+                evidence_ids = json.loads(row[8])
+                provider_sources = json.loads(row[9])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            items.append({"run_id": row[0], "created": row[1], "model": row[2],
+                "skill_version": row[3], "contract_version": row[4], "prompt_sha256": row[5],
+                "input_sha256": row[6], "result_sha256": row[7], "evidence_ids": evidence_ids,
+                "provider_sources": provider_sources, "audit": audit})
+        return {"finding_id": finding_id, "items": items}
+
+    def finding_ai_advisory(self, finding_id, run_id):
+        """Return a server-persisted AI result only when its exact run ID is supplied."""
+        finding_id = str(finding_id or "").strip()[:300]
+        run_id = str(run_id or "").strip()[:100]
+        if not finding_id or not run_id:
+            return None
+        with self.db() as db:
+            rows = db.execute("""SELECT data FROM finding_ai
+                WHERE finding_id=? AND expires>? ORDER BY created DESC LIMIT 20""",
+                (finding_id, time.time())).fetchall()
+        for (raw,) in rows:
+            try:
+                stored = json.loads(raw)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            audit = stored.get("audit") if isinstance(stored, dict) else None
+            if isinstance(audit, dict) and audit.get("run_id") == run_id and isinstance(stored.get("result"), dict):
+                return {"result": stored["result"], "audit": audit, "model": stored.get("model")}
+        return None
 
     def finding_analysis_job(self, job_id):
         with self.db() as db:
@@ -2958,9 +3508,22 @@ class Automation:
         return {"status": "ready" if rows_out else "empty", "findings": rows_out}
 
     def store_ai(self, report, result):
+        if result.get("status") == "completed" and not isinstance(result.get("audit"), dict):
+            try:
+                result["audit"] = _window_audit_metadata(report, result, self.config())
+            except Exception:
+                result["audit"] = {"audit_version": AI_AUDIT_VERSION, "run_id": uuid.uuid4().hex,
+                    "scope": "window", "skill_version": WINDOW_AI_SKILL_VERSION,
+                    "contract_version": CONTRACT_VERSION, "model": result.get("model") or "unknown",
+                    "evidence_ids": [], "evidence_ref_count": 0, "fallback_used": bool(result.get("fallback_used")),
+                    "audit_error": "Evidence manifest could not be prepared", "created_at": now()}
+        if isinstance(result.get("audit"), dict) and "result_sha256" not in result["audit"]:
+            result_without_audit = {key: value for key, value in result.items() if key != "audit"}
+            result["audit"]["result_sha256"] = _sha256_text(json.dumps(
+                result_without_audit, sort_keys=True, separators=(",", ":"), ensure_ascii=True, default=str))
         created = None
         with self.db() as db:
-            db.execute('INSERT INTO ai_runs(report_id,created,data) VALUES (?,?,?)', (report['id'],time.time(),json.dumps({'previous':report.get('ai'),'result':result})))
+            db.execute('INSERT INTO ai_runs(report_id,created,data) VALUES (?,?,?)', (report['id'],time.time(),json.dumps({'previous':report.get('ai'),'result':result,'audit':result.get('audit')})))
             report['ai'] = result
             db.execute('UPDATE reports SET data=? WHERE id=?', (json.dumps(report),report['id']))
             row = db.execute('SELECT created FROM reports WHERE id=?', (report['id'],)).fetchone()
@@ -3148,13 +3711,14 @@ class Automation:
         finally:
             self.external_collector_lock.release()
 
-    def external_intelligence_status(self) -> dict[str, Any]:
+    def external_intelligence_status(self, start: str | None = None,
+                                     end: str | None = None) -> dict[str, Any]:
         """Expose only local ledger/checkpoint status; this never calls a provider."""
         cfg = self.config()
         now_utc = datetime.now(timezone.utc)
         with self.db() as db:
             research = cyfirma_research.history(db, limit=5)
-            defender = defender_xdr.status(db)
+            defender = defender_xdr.status(db, start, end)
             try:
                 observation_rows = db.execute('''SELECT scope,COUNT(*),MAX(observed_at),MIN(valid_until),MAX(valid_until)
                     FROM cyfirma_observations GROUP BY scope''').fetchall()
@@ -3261,7 +3825,9 @@ class Automation:
                                           "configured": bool(cfg.get("SOC_CYFIRMA_ORG_VULN_API_KEY")),
                                           "cursor": org_cursor, "freshness": freshness(org_observations), **org_observations,
                                           "detail": {key: org_vulnerability_runtime.get(key) for key in ("loaded", "reported", "pages", "more", "pagination_complete", "reason") if key in org_vulnerability_runtime}},
-            "defender_xdr": {"enabled": cfg.get("DEFENDER_XDR_ENABLED") == "true", **defender,
+            "defender_xdr": {"enabled": cfg.get("DEFENDER_XDR_ENABLED") == "true",
+                             "mode": cfg.get("DEFENDER_XDR_COLLECTION_MODE", "both"),
+                             "provider": cfg.get("DEFENDER_XDR_API_PROVIDER", "defender"), **defender,
                              "configured": bool(cfg.get("DEFENDER_XDR_TENANT_ID") and cfg.get("DEFENDER_XDR_CLIENT_ID") and cfg.get("DEFENDER_XDR_CLIENT_SECRET"))},
         }
 
@@ -3610,6 +4176,12 @@ class Automation:
     def loop(self):
         while not self.stop.wait(10):
             current = time.time()
+            if current >= self.next_entity_group_refresh:
+                try:
+                    self.refresh_correlation_candidates()
+                except Exception as exc:
+                    self.entity_group_error = self.clean_error(exc)
+                self.next_entity_group_refresh = current + 300
             if current >= self.next_external_refresh:
                 # The method's non-blocking lock plus per-collector cache,
                 # interval and error backoff keep this independent loop cheap.

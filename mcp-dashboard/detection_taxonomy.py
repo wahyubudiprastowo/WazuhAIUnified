@@ -5,6 +5,7 @@ It does not turn keyword matches into a claim that an exploit succeeded.
 """
 from __future__ import annotations
 
+import re
 from typing import Any
 
 
@@ -87,13 +88,21 @@ def _haystack(event: dict[str, Any]) -> str:
     return " ".join(str(value) for value in values if value).lower()
 
 
+def _contains_signal(haystack: str, term: str) -> bool:
+    # Short attack acronyms (for example RCE) must be tokens: substring
+    # matching makes "force" look like an RCE signal.
+    if term.isalnum() and len(term) <= 4:
+        return re.search(rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])", haystack, re.I) is not None
+    return term in haystack
+
+
 def classify(event: dict[str, Any] | None, provider_only: bool = False) -> dict[str, Any]:
     """Classify a decoded record without asserting compromise or attribution."""
     event = event or {}
     haystack = _haystack(event)
     family, mitre = "other", ()
     for candidate, terms, techniques in FAMILIES:
-        if any(term in haystack for term in terms):
+        if any(_contains_signal(haystack, term) for term in terms):
             family, mitre = candidate, techniques
             break
     fields = event_fields(event)
@@ -163,6 +172,8 @@ def telemetry_source(event: dict[str, Any] | None) -> str:
         return "fortiweb"
     if "fortigate" in decoder:
         return "fortigate"
+    if "sangfor" in decoder:
+        return "sangfor_firewall"
     if any(term in decoder for term in ("modsecurity", "waf", "nginx", "apache", "iis")):
         return "waf_web"
     if any(term in decoder for term in ("suricata", "snort", "zeek")):
