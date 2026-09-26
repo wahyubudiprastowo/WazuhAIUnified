@@ -102,7 +102,7 @@ class FrontendLifecycleTests(unittest.TestCase):
         self.assertIn('"l1": {"status": l1_detail_status, "message": l1_detail_message}', server)
         self.assertIn('correlation_groups', (ROOT / "static" / "app.js").read_text(encoding="utf-8"))
         self.assertIn("Candidates are not confirmed incidents or attack paths", (ROOT / "static" / "app.js").read_text(encoding="utf-8"))
-        self.assertIn('DASHBOARD_BUILD_ID = "2026-09-26-patch25"', server)
+        self.assertIn('DASHBOARD_BUILD_ID = "2026-09-26-patch26"', server)
 
     def test_workflow_runner_is_centralized_in_tool_console(self):
         source = (ROOT / "static" / "workflows.js").read_text(encoding="utf-8")
@@ -209,7 +209,7 @@ class FrontendLifecycleTests(unittest.TestCase):
         server = (ROOT / "server.py").read_text(encoding="utf-8")
         deploy_check = (ROOT.parent / "tools" / "check_dashboard_deploy.sh").read_text(encoding="utf-8")
         self.assertIn('build ${overview.build_id || "unknown"}', source)
-        self.assertIn('DASHBOARD_BUILD_ID = "2026-09-26-patch25"', server)
+        self.assertIn('DASHBOARD_BUILD_ID = "2026-09-26-patch26"', server)
         self.assertIn("Shared dashboard/materializer code parity", deploy_check)
         self.assertIn("mcp-dashboard mcp-materializer", deploy_check)
 

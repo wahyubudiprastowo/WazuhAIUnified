@@ -557,9 +557,37 @@ detector, mengubah decoder, schema, credential, case store, atau quota provider.
 - [x] Regression test memastikan refresh historis tidak ditolak hanya karena
   refresh live sedang aktif, dan refresh historis kedua tetap tidak dijalankan
   bersamaan.
-- [ ] Patch25 belum terdeploy. Setelah deploy, validasi `30d` harus menjadi
-  `cache=hit` dengan `materialization.status=rollup` dan trace historis tetap
-  `not_observed`/bounded sesuai kontrak, bukan dipaksa menjadi detail raw.
+- [x] Patch25 terdeploy dan runtime merespons build `2026-09-26-patch25`.
+  Probe terautentikasi berurutan membuktikan `24h`, `7d`, dan `30d` HTTP 200;
+  setelah refresh selesai, `7d` dan `30d` menjadi `cache=hit`,
+  `materialization.status=rollup`, `exact=true`, coverage bucket `100%`, dan
+  `errors={}`. `30d` sempat mengembalikan snapshot last-good dengan status
+  stale selama worker berjalan, lalu berubah menjadi hit; ini adalah transisi
+  refresh yang terukur, bukan bukti data hilang.
+- [x] Kontrak detail tetap jujur: `24h` memiliki L1/L2 `available`, sedangkan
+  `7d/30d` memiliki L1/L2 `unavailable` karena rollup tidak menyimpan raw
+  historical detail. Tidak ada klaim bahwa rollup adalah replay raw event.
+- [ ] Patch25 tidak menutup gap G01 lain: raw syslog/archive ingress,
+  parser-version, received-vs-indexed denominator, late-event counter,
+  resource/lock baseline, dan telemetry sumber tambahan masih pending.
+
+#### Follow-up G01: refresh queue provenance, patch26, 2026-09-26 UTC
+
+- [x] Patch additive menambahkan `cache.refresh_state` dan status
+  `stale-waiting`/`stale-schema-waiting` ketika 7d/30d/custom menunggu refresh
+  historis lain. Snapshot last-good tetap dikembalikan; tidak ada query
+  Indexer baru, worker kedua, perubahan schema, reset cache/checkpoint, atau
+  perubahan semantik angka.
+- [x] State refresh menyimpan waktu mulai in-memory selama worker aktif dan
+  membersihkannya pada `finally`; informasi yang keluar hanya status aman,
+  alasan antrean, dan timestamp, bukan detail thread atau credential.
+- [x] Regression test menutup antrean historis, race live-vs-historical, cache
+  schema lama, error refresh, dan kompatibilitas snapshot. Full discovery:
+  **265 tests, OK (10 skipped)**; `py_compile` dan `git diff --check` lulus.
+- [ ] Patch26 belum terdeploy ke runtime pada audit ini; runtime terakhir yang
+  terbukti masih patch25. Setelah deploy, verifikasi build dashboard dan
+  materializer sama-sama patch26 serta ulangi probe 24h/7d/30d tanpa reset
+  database atau checkpoint.
 
 Status G00 saat ini: **runtime_validated untuk Findings/dashboard, bounded
 status, ledger read path, dan worker startup**, belum `accepted` penuh karena
@@ -1067,8 +1095,8 @@ Catatan validasi terakhir dari direktori `mcp-dashboard`:
 python3 -m unittest test_detection_improvements test_entity_resolver test_soc_pipeline test_cve_exposure test_frontend_lifecycle
 ```
 
-Hasil baseline: **96 tests, OK**. Setelah patch25, full discovery menghasilkan
-**264 tests, OK (10 skipped)**. Browser smoke runtime patch20 terakhir lulus pada
+Hasil baseline: **96 tests, OK**. Setelah patch26, full discovery menghasilkan
+**265 tests, OK (10 skipped)**. Browser smoke runtime patch20 terakhir lulus pada
 empat rentang. Tes ini memakai fixture/mock/temp DB dan static checks;
 runtime smoke terautentikasi patch23 mencakup API 24h dan deploy check. Semua hasil tersebut
 tidak membuktikan API provider live, seluruh tool, load 3M/hari atau seluruh

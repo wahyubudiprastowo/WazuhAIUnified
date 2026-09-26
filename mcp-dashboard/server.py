@@ -38,7 +38,7 @@ from telemetry_contract import summary as telemetry_contract_summary
 
 ROOT = Path(__file__).resolve().parent
 STATIC = ROOT / "static"
-DASHBOARD_BUILD_ID = "2026-09-26-patch25"
+DASHBOARD_BUILD_ID = "2026-09-26-patch26"
 CONFIG_FILE = Path(os.environ.get("DASHBOARD_CONFIG_FILE", ROOT / "dashboard.env"))
 HOST = os.environ.get("DASHBOARD_HOST", "0.0.0.0")
 PORT = int(os.environ.get("DASHBOARD_PORT", "8088"))
@@ -84,6 +84,7 @@ _overview_db_init_lock = threading.Lock()
 _overview_db_initialized = False
 _overview_refreshing: set[str] = set()
 _overview_historical_refreshing = False
+_overview_refresh_started_at: dict[str, float] = {}
 # Keep a short, non-sensitive operational state for stale snapshots. Previously
 # a failed asynchronous refresh was invisible and looked like unchanged data.
 _overview_refresh_errors: dict[str, str] = {}
@@ -2789,6 +2790,7 @@ def _overview_cache_write(cache_key: str, window: dict[str, Any], data: dict[str
 
 
 def _overview_refresh_worker(cache_key: str, window: dict[str, Any], payload: Any, ttl: int) -> None:
+    global _overview_historical_refreshing
     historical = window.get("requested") in {"7d", "30d", "custom"}
     try:
         try:
@@ -2811,20 +2813,37 @@ def _overview_refresh_worker(cache_key: str, window: dict[str, Any], payload: An
     finally:
         with _overview_cache_lock:
             _overview_refreshing.discard(cache_key)
+            _overview_refresh_started_at.pop(cache_key, None)
             if historical:
-                global _overview_historical_refreshing
                 _overview_historical_refreshing = False
 
 
-def _overview_refresh_async(cache_key: str, window: dict[str, Any], payload: Any, ttl: int) -> None:
+def _overview_refresh_state(cache_key: str, historical: bool) -> dict[str, Any]:
+    """Describe refresh ownership without exposing thread internals."""
+    with _overview_cache_lock:
+        started = _overview_refresh_started_at.get(cache_key)
+        if cache_key in _overview_refreshing:
+            return {"status": "refreshing", "started_at": started}
+        if historical and _overview_historical_refreshing:
+            active = [value for value in _overview_refresh_started_at.values() if value]
+            return {
+                "status": "waiting",
+                "reason": "another_historical_refresh",
+                "started_at": min(active) if active else None,
+            }
+    return {"status": "idle"}
+
+
+def _overview_refresh_async(cache_key: str, window: dict[str, Any], payload: Any, ttl: int) -> bool:
     global _overview_historical_refreshing
     with _overview_cache_lock:
         historical = window.get("requested") in {"7d", "30d", "custom"}
         # A live 24h refresh can be slow and must not starve the local-rollup
         # refresh for 7d/30d/custom. Historical refreshes remain serialized.
         if cache_key in _overview_refreshing or (historical and _overview_historical_refreshing):
-            return
+            return False
         _overview_refreshing.add(cache_key)
+        _overview_refresh_started_at[cache_key] = time.time()
         if historical:
             _overview_historical_refreshing = True
     thread = threading.Thread(
@@ -2833,6 +2852,7 @@ def _overview_refresh_async(cache_key: str, window: dict[str, Any], payload: Any
         daemon=True,
     )
     thread.start()
+    return True
 
 
 def _attack_activity_summary(rollup: dict[str, Any] | None) -> dict[str, Any]:
@@ -3168,16 +3188,22 @@ def _overview_cached(payload: Any = "24h") -> dict[str, Any]:
     if cached and not force_refresh:
         data = dict(cached["data"])
         _ensure_historical_detail(data, window)
+        historical = window.get("requested") in {"7d", "30d", "custom"}
+        _overview_refresh_async(cache_key, window, payload, ttl)
+        refresh_state = _overview_refresh_state(cache_key, historical)
+        refresh_status = "stale-schema-refreshing" if cache_schema_stale else (
+            "stale-error" if refresh_error else "stale-refreshing")
+        if historical and refresh_state.get("status") == "waiting" and not refresh_error:
+            refresh_status = "stale-schema-waiting" if cache_schema_stale else "stale-waiting"
         data["cache"] = {
             **(data.get("cache") or {}),
-            "status": ("stale-schema-refreshing" if cache_schema_stale else
-                        "stale-error" if refresh_error else "stale-refreshing"),
+            "status": refresh_status,
             "age_seconds": int(now - cached["created_at"]),
             "ttl_seconds": ttl,
             **({"refresh_error": refresh_error} if refresh_error else {}),
             **({"schema_refresh": "inventory_evidence"} if cache_schema_stale else {}),
+            "refresh_state": refresh_state,
         }
-        _overview_refresh_async(cache_key, window, payload, ttl)
         return _stamp_overview_service_identity(data)
     if window.get("requested") in {"7d", "30d", "custom"} and (not cached or force_refresh):
         if force_refresh:
@@ -3186,9 +3212,11 @@ def _overview_cached(payload: Any = "24h") -> dict[str, Any]:
             _overview_refresh_async(cache_key, window, payload, ttl)
             if cached:
                 data = dict(cached["data"])
+                refresh_state = _overview_refresh_state(cache_key, True)
                 data["cache"] = {
                     **(data.get("cache") or {}), "status": "stale-refreshing",
                     "age_seconds": int(now - cached["created_at"]), "ttl_seconds": ttl,
+                    "refresh_state": refresh_state,
                 }
                 return _stamp_overview_service_identity(data)
         result: dict[str, Any] = {}
@@ -3208,6 +3236,7 @@ def _overview_cached(payload: Any = "24h") -> dict[str, Any]:
         detail_status = "materializing" if not refresh_error else "unavailable"
         detail_message = ("Bounded historical detail query is running or queued in the background."
                           if not refresh_error else refresh_error)
+        refresh_state = _overview_refresh_state(cache_key, True)
         data["detail_materialization"] = {
             "status": "building" if not refresh_error else "error",
             "message": detail_message,
@@ -3219,7 +3248,8 @@ def _overview_cached(payload: Any = "24h") -> dict[str, Any]:
             "l2": {"status": detail_status, "message": detail_message},
         }
         data["cache"] = {"status": "building" if not refresh_error else "rollup-error",
-                          "age_seconds": 0, "ttl_seconds": ttl}
+                          "age_seconds": 0, "ttl_seconds": ttl,
+                          "refresh_state": refresh_state}
         return _stamp_overview_service_identity(data)
     data = _overview(payload)
     try:

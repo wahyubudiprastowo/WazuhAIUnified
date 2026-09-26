@@ -101,6 +101,39 @@ class FindingTests(unittest.TestCase):
         self.assertEqual(result["cache"]["status"], "stale-schema-refreshing")
         refresh.assert_called_once()
 
+    def test_historical_cache_exposes_waiting_refresh_without_discarding_snapshot(self):
+        cached = {
+            "data": {
+                "build_id": "2026-09-26-patch25",
+                "telemetry_contract": {"summary": {"ready_sources": 1}},
+                "alerts": {"total_alerts": 12},
+            },
+            "created_at": time.time() - 10,
+            "expires_at": time.time() - 1,
+        }
+        original_keys = set(server._overview_refreshing)
+        original_historical = server._overview_historical_refreshing
+        original_started = dict(server._overview_refresh_started_at)
+        try:
+            server._overview_refreshing.clear()
+            server._overview_refresh_started_at.clear()
+            server._overview_refreshing.add("historical-7d")
+            server._overview_historical_refreshing = True
+            with patch.object(server, "_overview_cache_read", return_value=cached), \
+                 patch.object(server, "_overview_refresh_async") as refresh:
+                result = server._overview_cached({"range": "30d"})
+            self.assertEqual(result["alerts"]["total_alerts"], 12)
+            self.assertEqual(result["cache"]["status"], "stale-schema-waiting")
+            self.assertEqual(result["cache"]["refresh_state"]["status"], "waiting")
+            self.assertEqual(result["cache"]["refresh_state"]["reason"], "another_historical_refresh")
+            refresh.assert_called_once()
+        finally:
+            server._overview_refreshing.clear()
+            server._overview_refreshing.update(original_keys)
+            server._overview_refresh_started_at.clear()
+            server._overview_refresh_started_at.update(original_started)
+            server._overview_historical_refreshing = original_historical
+
     def test_private_ip_skipped(self):
         with patch.object(server, "_safe_call") as call:
             self.assertFalse(server._finding_intel("crowdsec", "10.0.0.1")["ok"])
