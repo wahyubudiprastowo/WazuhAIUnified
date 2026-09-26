@@ -139,6 +139,17 @@ class AutomationTests(unittest.TestCase):
         self.assertFalse(external["detail_available"])
         self.assertEqual(external["cyfirma_research"]["items"], 0)
 
+    def test_lightweight_status_surfaces_last_analysis_error_as_degraded(self):
+        previous = self.worker.error
+        try:
+            self.worker.error = "database is locked"
+            status = self.worker.status(lightweight=True)
+            self.assertEqual(status["status"], "degraded")
+            self.assertEqual(status["error_scope"], "last_analysis_cycle")
+            self.assertEqual(status["error"], "database is locked")
+        finally:
+            self.worker.error = previous
+
     def test_provider_policy_downranks_scanner_context_and_keeps_flow_direction(self):
         scanner = soc.provider_policy(
             {"indicator": "198.51.100.8", "level": 10},

@@ -584,10 +584,43 @@ detector, mengubah decoder, schema, credential, case store, atau quota provider.
 - [x] Regression test menutup antrean historis, race live-vs-historical, cache
   schema lama, error refresh, dan kompatibilitas snapshot. Full discovery:
   **265 tests, OK (10 skipped)**; `py_compile` dan `git diff --check` lulus.
-- [ ] Patch26 belum terdeploy ke runtime pada audit ini; runtime terakhir yang
-  terbukti masih patch25. Setelah deploy, verifikasi build dashboard dan
-  materializer sama-sama patch26 serta ulangi probe 24h/7d/30d tanpa reset
-  database atau checkpoint.
+- [x] Dashboard API kemudian terdeploy ke runtime build `2026-09-26-patch26`
+  dan probe 24h/7d/30d diulang tanpa reset database atau checkpoint.
+- [ ] Parity image dashboard/materializer belum dapat diklaim dari sesi ini
+  karena Docker socket tidak dapat dibaca.
+
+#### Re-audit runtime patch26 dan automation health, 2026-09-26 UTC
+
+- [x] Dashboard API terautentikasi merespons build `2026-09-26-patch26`.
+  `24h` dan `30d` menjadi `cache=hit`; `7d` terukur `stale-refreshing` dengan
+  `cache.refresh_state.status=refreshing`, lalu tetap menyajikan rollup exact
+  dengan coverage `100%`. Ini membuktikan state queue patch26 tampil, bukan
+  bahwa materializer service parity sudah terbukti dari Docker.
+- [x] Pipeline status bounded merespons `status=ok`, `scan_status=caught_up`,
+  lag sekitar `163s`, checkpoint events `104,662,629`, dan replay events
+  `12,280,636` pada probe ini. Angka tersebut scoped runtime snapshot, bukan
+  jumlah seluruh syslog atau bukti semua event sudah terdeteksi.
+- [ ] Docker socket tetap tidak dapat dibaca dari sesi audit ini; parity image
+  dashboard/materializer dan container start belum dapat diklaim.
+- [x] Ditemukan mismatch status: `/api/automation/status` mengembalikan
+  `status=ok` sambil membawa `error=database is locked` pada lima polling
+  berjarak dua detik. Ini adalah error terakhir siklus automation yang terbaca
+  setelah query status berhasil, bukan bukti query status selalu gagal.
+
+#### Follow-up G01: truthful automation health, patch27, 2026-09-26 UTC
+
+- [x] `Automation.status(lightweight=True)` sekarang mengembalikan
+  `status=degraded` bila siklus analisis terakhir memiliki error, serta
+  `error_scope=last_analysis_cycle`. Status `ok` tidak lagi menyembunyikan
+  error terakhir yang masih relevan.
+- [x] Patch tidak mengubah busy timeout, concurrency, query, schema, checkpoint,
+  worker count, atau data; hanya memperbaiki semantik health response.
+- [x] Regression test menutup status normal dan status dengan SQLite lock/error.
+  Full discovery setelah patch27: **266 tests, OK (10 skipped)**; `py_compile`
+  dan `git diff --check` lulus.
+- [ ] Patch27 belum dideploy; setelah deployment, ulangi polling automation
+  status dan pastikan status/error konsisten. Penyebab lock dan resource
+  baseline tetap pending sampai metrics writer/read lock dapat diambil.
 
 Status G00 saat ini: **runtime_validated untuk Findings/dashboard, bounded
 status, ledger read path, dan worker startup**, belum `accepted` penuh karena
@@ -1095,8 +1128,8 @@ Catatan validasi terakhir dari direktori `mcp-dashboard`:
 python3 -m unittest test_detection_improvements test_entity_resolver test_soc_pipeline test_cve_exposure test_frontend_lifecycle
 ```
 
-Hasil baseline: **96 tests, OK**. Setelah patch26, full discovery menghasilkan
-**265 tests, OK (10 skipped)**. Browser smoke runtime patch20 terakhir lulus pada
+Hasil baseline: **96 tests, OK**. Setelah patch27, full discovery menghasilkan
+**266 tests, OK (10 skipped)**. Browser smoke runtime patch20 terakhir lulus pada
 empat rentang. Tes ini memakai fixture/mock/temp DB dan static checks;
 runtime smoke terautentikasi patch23 mencakup API 24h dan deploy check. Semua hasil tersebut
 tidak membuktikan API provider live, seluruh tool, load 3M/hari atau seluruh

@@ -3255,18 +3255,23 @@ class Automation:
                         'SELECT COALESCE(MAX(id),0) FROM ai_runs WHERE report_id=?',
                         (row[0] if row else 0,)).fetchone()[0] or 0)
                 revision = f'{row[0] if row else 0}:{ai_version}'
+                last_error = self.clean_error(self.error) if self.error else None
                 return {"running": self.running, "phase": self.phase, "error": self.error,
                         "next_run": self.next_run, "revision": revision,
                         "unchanged": known_revision == revision,
                         "latest": None, "history": [], "deliveries": [],
-                        "status": "ok", "status_scope": "bounded_runtime_snapshot",
+                        "status": "degraded" if last_error else "ok",
+                        "status_scope": "bounded_runtime_snapshot",
+                        "error_scope": "last_analysis_cycle" if last_error else None,
                         "detail_available": False}
             except (sqlite3.Error, OSError) as exc:
+                error_scope = "last_analysis_cycle" if self.error else "status_read"
                 return {"running": self.running, "phase": self.phase, "error": self.error,
                         "next_run": self.next_run, "revision": None,
                         "unchanged": False, "latest": None, "history": [],
                         "deliveries": [], "status": "degraded",
                         "status_scope": "bounded_runtime_snapshot",
+                        "error_scope": error_scope,
                         "detail_available": False,
                         "reason": "local status read unavailable",
                         "error_detail": self.clean_error(exc)}
