@@ -16,7 +16,7 @@ import cyfirma_org_vulnerability
 import defender_xdr
 from detection_taxonomy import classify, consensus_confidence, telemetry_fields, telemetry_source
 from soc_pipeline import Pipeline, rollup_dimensions
-from telemetry_contract import summary
+from telemetry_contract import inventory_evidence, summary
 
 
 class DetectionImprovementTests(unittest.TestCase):
@@ -126,6 +126,36 @@ class DetectionImprovementTests(unittest.TestCase):
         self.assertIn("firewall_policy", by_key["fortigate"]["missing_fields"])
         self.assertEqual(by_key["defender_xdr"]["status"], "not_observed")
         self.assertEqual(by_key["sangfor_firewall"]["status"], "not_observed")
+
+    def test_inventory_evidence_keeps_unmeasured_ingest_metadata_explicit(self):
+        dimensions = {
+            "telemetry_source": [{"value": "fortigate", "count": 4,
+                                  "last_seen": "2026-09-26T08:00:00+00:00"}],
+            "telemetry_field": [{"value": "fortigate|source_ip", "count": 4}],
+            "forti_type": [{"value": "utm", "count": 4,
+                             "last_seen": "2026-09-26T08:00:00+00:00", "max_level": 5}],
+            "forti_subtype": [{"value": "ips", "count": 2,
+                                "last_seen": "2026-09-26T08:00:00+00:00", "max_level": 11}],
+        }
+        contract = summary(dimensions, materialization_complete=True,
+                           now=datetime(2026, 9, 26, 8, 1, tzinfo=timezone.utc).timestamp())
+        result = inventory_evidence(dimensions, contract, indexed_events=4,
+                                    bounded_samples={"network": 2, "identity": 0},
+                                    unmatched_decoder_events=1,
+                                    trace_records=[{"event_id": "event-1", "index": "wazuh-alerts-4.x-test",
+                                                    "timestamp": "2026-09-26T08:00:00Z", "rule_id": "81633",
+                                                    "decoder": "fortigate-firewall-v5", "agent": "wazuh.manager",
+                                                    "source_ip": "198.51.100.8", "destination_ip": "10.0.0.4"}])
+        self.assertEqual(result["status"], "measured")
+        self.assertEqual(result["subtype_dimensions"]["forti_subtype"][0]["value"], "ips")
+        self.assertEqual(result["bounded_samples"]["network"], 2)
+        self.assertEqual(result["parser_version"]["status"], "not_observed")
+        self.assertEqual(result["received_vs_indexed"]["status"], "unavailable")
+        self.assertEqual(result["late_events"]["status"], "unavailable")
+        self.assertEqual(result["unmatched_decoder"]["count"], 1)
+        self.assertEqual(result["index_to_ui_trace"]["status"], "measured")
+        self.assertEqual(result["index_to_ui_trace"]["records"][0]["event_id"], "event-1")
+        self.assertIn("upstream syslog/archive ingress", result["index_to_ui_trace"]["not_proven"])
 
     def test_fortiweb_contract_does_not_inflate_fortigate_coverage(self):
         result = summary({"decoder": [{"value": "fortiweb-json", "count": 9}], "telemetry_field": []})

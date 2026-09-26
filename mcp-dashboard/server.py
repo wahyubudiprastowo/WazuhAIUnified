@@ -32,12 +32,13 @@ import soc_automation
 import soc_pipeline
 import soc_workflows
 from detection_taxonomy import consensus_confidence
+from telemetry_contract import inventory_evidence as telemetry_inventory_evidence
 from telemetry_contract import summary as telemetry_contract_summary
 
 
 ROOT = Path(__file__).resolve().parent
 STATIC = ROOT / "static"
-DASHBOARD_BUILD_ID = "2026-09-25-patch10"
+DASHBOARD_BUILD_ID = "2026-09-26-patch25"
 CONFIG_FILE = Path(os.environ.get("DASHBOARD_CONFIG_FILE", ROOT / "dashboard.env"))
 HOST = os.environ.get("DASHBOARD_HOST", "0.0.0.0")
 PORT = int(os.environ.get("DASHBOARD_PORT", "8088"))
@@ -82,6 +83,7 @@ _overview_cache_lock = threading.Lock()
 _overview_db_init_lock = threading.Lock()
 _overview_db_initialized = False
 _overview_refreshing: set[str] = set()
+_overview_historical_refreshing = False
 # Keep a short, non-sensitive operational state for stale snapshots. Previously
 # a failed asynchronous refresh was invisible and looked like unchanged data.
 _overview_refresh_errors: dict[str, str] = {}
@@ -2787,9 +2789,16 @@ def _overview_cache_write(cache_key: str, window: dict[str, Any], data: dict[str
 
 
 def _overview_refresh_worker(cache_key: str, window: dict[str, Any], payload: Any, ttl: int) -> None:
+    historical = window.get("requested") in {"7d", "30d", "custom"}
     try:
         try:
-            data = _overview(payload)
+            # Long ranges are served from durable local rollups. Re-running the
+            # full live overview here would scan the Indexer again and can leave
+            # the last-good historical snapshot stale for a long time.
+            if window.get("requested") in {"7d", "30d", "custom"}:
+                data = _materialized_overview(window, payload)
+            else:
+                data = _overview(payload)
             _overview_cache_write(cache_key, window, data, ttl)
             with _overview_cache_lock:
                 _overview_refresh_errors.pop(cache_key, None)
@@ -2802,14 +2811,22 @@ def _overview_refresh_worker(cache_key: str, window: dict[str, Any], payload: An
     finally:
         with _overview_cache_lock:
             _overview_refreshing.discard(cache_key)
+            if historical:
+                global _overview_historical_refreshing
+                _overview_historical_refreshing = False
 
 
 def _overview_refresh_async(cache_key: str, window: dict[str, Any], payload: Any, ttl: int) -> None:
+    global _overview_historical_refreshing
     with _overview_cache_lock:
         historical = window.get("requested") in {"7d", "30d", "custom"}
-        if cache_key in _overview_refreshing or (historical and _overview_refreshing):
+        # A live 24h refresh can be slow and must not starve the local-rollup
+        # refresh for 7d/30d/custom. Historical refreshes remain serialized.
+        if cache_key in _overview_refreshing or (historical and _overview_historical_refreshing):
             return
         _overview_refreshing.add(cache_key)
+        if historical:
+            _overview_historical_refreshing = True
     thread = threading.Thread(
         target=_overview_refresh_worker,
         args=(cache_key, window, payload, ttl),
@@ -2926,6 +2943,14 @@ def _materialized_overview(window: dict[str, Any], payload: Any) -> dict[str, An
         external_intelligence.get("defender_xdr") if isinstance(external_intelligence, dict) else {},
         materialization_complete=rollup_complete,
         now=telemetry_as_of,
+    )
+    telemetry_contract["inventory_evidence"] = telemetry_inventory_evidence(
+        dimensions,
+        telemetry_contract,
+        indexed_events=indexed,
+        bounded_samples={"network": 0, "identity": 0, "decoder_buckets": len(decoder_rows)},
+        unmatched_decoder_events=None,
+        trace_records=[],
     )
     return {
         "build_id": DASHBOARD_BUILD_ID,
@@ -3099,6 +3124,26 @@ def _ensure_historical_detail(data: dict[str, Any], window: dict[str, Any]) -> d
     return data
 
 
+def _stamp_overview_service_identity(data: dict[str, Any]) -> dict[str, Any]:
+    """Separate the serving build from an older cached snapshot identity."""
+    if not isinstance(data, dict):
+        return data
+    snapshot_build = data.get("build_id")
+    if snapshot_build and snapshot_build != DASHBOARD_BUILD_ID:
+        data.setdefault("snapshot_build_id", snapshot_build)
+    data["build_id"] = DASHBOARD_BUILD_ID
+    data["service_build_id"] = DASHBOARD_BUILD_ID
+    return data
+
+
+def _overview_cache_schema_stale(data: dict[str, Any]) -> bool:
+    """Detect additive payload fields missing from pre-deploy snapshots."""
+    contract = (data or {}).get("telemetry_contract")
+    inventory = contract.get("inventory_evidence") if isinstance(contract, dict) else None
+    return not isinstance(contract, dict) or not isinstance(inventory, dict) or \
+        "index_to_ui_trace" not in inventory
+
+
 def _overview_cached(payload: Any = "24h") -> dict[str, Any]:
     force_refresh = isinstance(payload, dict) and bool(payload.get("force"))
     window = _window_from_payload(payload)
@@ -3106,9 +3151,10 @@ def _overview_cached(payload: Any = "24h") -> dict[str, Any]:
     ttl = _overview_cache_ttl(window)
     cached = _overview_cache_read(cache_key)
     now = time.time()
+    cache_schema_stale = bool(cached and _overview_cache_schema_stale(cached["data"]))
     with _overview_cache_lock:
         refresh_error = _overview_refresh_errors.get(cache_key)
-    if cached and cached["expires_at"] > now and not force_refresh:
+    if cached and cached["expires_at"] > now and not force_refresh and not cache_schema_stale:
         data = dict(cached["data"])
         _ensure_historical_detail(data, window)
         data["cache"] = {
@@ -3118,19 +3164,21 @@ def _overview_cached(payload: Any = "24h") -> dict[str, Any]:
             "ttl_seconds": ttl,
             **({"refresh_error": refresh_error} if refresh_error else {}),
         }
-        return data
+        return _stamp_overview_service_identity(data)
     if cached and not force_refresh:
         data = dict(cached["data"])
         _ensure_historical_detail(data, window)
         data["cache"] = {
             **(data.get("cache") or {}),
-            "status": "stale-error" if refresh_error else "stale-refreshing",
+            "status": ("stale-schema-refreshing" if cache_schema_stale else
+                        "stale-error" if refresh_error else "stale-refreshing"),
             "age_seconds": int(now - cached["created_at"]),
             "ttl_seconds": ttl,
             **({"refresh_error": refresh_error} if refresh_error else {}),
+            **({"schema_refresh": "inventory_evidence"} if cache_schema_stale else {}),
         }
         _overview_refresh_async(cache_key, window, payload, ttl)
-        return data
+        return _stamp_overview_service_identity(data)
     if window.get("requested") in {"7d", "30d", "custom"} and (not cached or force_refresh):
         if force_refresh:
             with _overview_cache_lock:
@@ -3142,7 +3190,7 @@ def _overview_cached(payload: Any = "24h") -> dict[str, Any]:
                     **(data.get("cache") or {}), "status": "stale-refreshing",
                     "age_seconds": int(now - cached["created_at"]), "ttl_seconds": ttl,
                 }
-                return data
+                return _stamp_overview_service_identity(data)
         result: dict[str, Any] = {}
         completed = threading.Event()
         def materialize_fast() -> None:
@@ -3172,7 +3220,7 @@ def _overview_cached(payload: Any = "24h") -> dict[str, Any]:
         }
         data["cache"] = {"status": "building" if not refresh_error else "rollup-error",
                           "age_seconds": 0, "ttl_seconds": ttl}
-        return data
+        return _stamp_overview_service_identity(data)
     data = _overview(payload)
     try:
         _overview_cache_write(cache_key, window, data, ttl)
@@ -3180,7 +3228,7 @@ def _overview_cached(payload: Any = "24h") -> dict[str, Any]:
         data["cache"] = {"status": "bypass", "error": str(exc), "ttl_seconds": ttl}
         return data
     stored = _overview_cache_read(cache_key)
-    return stored["data"] if stored else data
+    return _stamp_overview_service_identity(stored["data"] if stored else data)
 
 
 def _overview_prewarm_loop() -> None:
@@ -3809,6 +3857,26 @@ def _normalize_range(value: Any) -> str:
     return value if value in {"24h", "7d", "30d"} else "24h"
 
 
+def _overview_statistics(local_alerts: dict[str, Any], historical_window: bool) -> dict[str, Any]:
+    """Select the hourly activity source without hiding a failed fallback.
+
+    The local alert aggregation is already exact for the selected live window and
+    is also the frontend fallback for the hourly chart.  Manager statistics are
+    optional enrichment; only call it when the local source is unavailable.
+    """
+    if historical_window:
+        return {"ok": True, "data": {}, "source": "historical_rollup", "skipped": True}
+    if local_alerts.get("ok"):
+        return {
+            "ok": True,
+            "data": {},
+            "source": "local_alert_timeline",
+            "skipped": True,
+            "reason": "Local alert aggregation supplies the selected hourly activity.",
+        }
+    return _safe_call("gensecai", "get_wazuh_statistics", {})
+
+
 def _overview(payload: Any = "24h") -> dict[str, Any]:
     window = _window_from_payload(payload)
     time_range = window["tool_range"]
@@ -3845,7 +3913,7 @@ def _overview(payload: Any = "24h") -> dict[str, Any]:
                 }))
     vuln_summary = _safe_call("gensecai", "get_wazuh_vulnerability_summary", {})
     critical_vulns = _safe_call("gensecai", "get_wazuh_critical_vulnerabilities", {"limit": 10})
-    statistics = ({"ok": True, "data": {}} if historical_window else _safe_call("gensecai", "get_wazuh_statistics", {}))
+    statistics = _overview_statistics(local_alerts, historical_window)
     geo_heatmap = ({"ok": True, "data": {"historical_skip": True}} if historical_window else
                    _safe_call("infokom", "blueteam_wazuh_geo_heatmap", {
                        "since": time_range, "top_n": 30, "response_format": "json",
@@ -3990,6 +4058,18 @@ def _overview(payload: Any = "24h") -> dict[str, Any]:
         external_intelligence.get("defender_xdr") if isinstance(external_intelligence, dict) else {},
         materialization_complete=bool((telemetry_rollup.get("coverage") or {}).get("complete")),
         now=telemetry_as_of,
+    )
+    telemetry_contract["inventory_evidence"] = telemetry_inventory_evidence(
+        telemetry_dimensions,
+        telemetry_contract,
+        indexed_events=indexed_events,
+        bounded_samples={
+            "network": int((operational_evidence.get("network") or {}).get("observed") or 0),
+            "identity": int((operational_evidence.get("identity") or {}).get("observed") or 0),
+            "decoder_buckets": int((operational_evidence.get("decoders") or {}).get("observed") or 0),
+        },
+        unmatched_decoder_events=(operational_evidence.get("decoders") or {}).get("unmatched_events"),
+        trace_records=local_alerts.get("l1_queue") or [],
     )
     telemetry_contract["materialization"] = {
         "source": "local detection rollups",
@@ -4654,8 +4734,20 @@ class Handler(SimpleHTTPRequestHandler):
                 cache_payload = {**window, 'limit': limit}
                 cached = _api_cache_read('cyfirma_updates', cache_payload, 60)
                 if cached is None:
-                    cached = _api_cache_write('cyfirma_updates', cache_payload,
-                        automation.cyfirma_updates(start, end, limit), 60)
+                    try:
+                        result = automation.cyfirma_updates(start, end, limit)
+                    except (sqlite3.Error, OSError, TimeoutError) as exc:
+                        # Provider/ledger read failures are not an empty feed.
+                        # Keep the dashboard usable and expose the exact state.
+                        result = {
+                            'ok': False, 'status': 'unavailable',
+                            'source': 'local_cyfirma_ledger',
+                            'provider_calls': 0,
+                            'reason': 'CYFIRMA history could not be read from the local ledger',
+                            'error': soc_automation.clean_error(exc),
+                            'items': [], 'cve_items': [], 'timeline': [],
+                        }
+                    cached = _api_cache_write('cyfirma_updates', cache_payload, result, 60)
                 _json_response(self, 200, cached)
                 return
             if self.path == '/api/intelligence/cyfirma-research':
@@ -4710,10 +4802,10 @@ class Handler(SimpleHTTPRequestHandler):
                 _json_response(self, 200, {'report': automation.report(payload.get('id'))})
                 return
             if self.path == '/api/pipeline/status':
-                _json_response(self, 200, pipeline.status())
+                _json_response(self, 200, pipeline.status(lightweight=True))
                 return
             if self.path == "/api/automation/status":
-                _json_response(self, 200, automation.status(payload.get('known_revision')))
+                _json_response(self, 200, automation.status(payload.get('known_revision'), lightweight=True))
                 return
             if self.path == "/api/automation/run":
                 _json_response(self, 202, automation.trigger(payload))

@@ -19,8 +19,8 @@
 .findingsWorkspace { display: grid; grid-template-columns: minmax(270px,34%) minmax(0,1fr); background: #fff; min-height: 650px; }
 .findingsWorkspace > * { min-width: 0; }
 .findingsList { border-right: 1px solid var(--finding-border); background: #f8fafb; }
-.findingsListHead { display: flex; justify-content: space-between; gap: 10px; font-size: 12px; padding: 16px; border-bottom: 1px solid var(--finding-border); color: var(--finding-muted); }
-.findingsListHead > span { flex-shrink: 0; }
+.findingsListHead { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 10px; font-size: 12px; padding: 16px; border-bottom: 1px solid var(--finding-border); color: var(--finding-muted); }
+.findingsListHead > span { flex: 1 1 160px; min-width: 0; overflow-wrap: anywhere; }
 #findingsCount { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-weight: 600; }
 #findingsView #findingsCount button { min-height: 32px; font-size: 11px; padding: 0 6px; }
 #findingsView .findingRow { width: 100%; display: flex; flex-direction: column; gap: 8px; padding: 16px; text-align: left; border: 0; border-bottom: 1px solid var(--finding-border); border-left: 3px solid transparent; border-radius: 0; }

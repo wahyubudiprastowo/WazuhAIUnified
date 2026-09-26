@@ -30,6 +30,9 @@ const state = {
   crowdSecLoading: false,
   crowdSecRequestId: 0,
   overviewRefreshTimer: null,
+  overviewRequestId: 0,
+  overviewWindow: "",
+  overviewLoad: {status: "idle", windowKey: "", error: ""},
   cveExposure: null,
   cveExposureLoading: false,
 };
@@ -3291,6 +3294,7 @@ function renderSettings() {
   `);
   const sourceRows = telemetry.sources || [];
   const readiness = telemetry.summary || {};
+  const inventory = telemetry.inventory_evidence || {};
   const defender = external.defender_xdr || {};
   const entityGraph = defender.entity_graph || defender.correlations?.graph || {};
   const research = external.cyfirma_research || {};
@@ -3331,6 +3335,18 @@ function renderSettings() {
   setHtml("#telemetryReadiness", `
     <div class="telemetrySummary"><strong>${fmt.format(number(readiness.ready_sources))} / ${fmt.format(number(readiness.expected_sources))}</strong><span>sources ready for field-level detection</span><small>${fmt.format(number(readiness.observed_sources))} observed · ${fmt.format(number(readiness.observed_incomplete_sources))} incomplete · ${fmt.format(number(readiness.degraded_sources))} degraded · ${fmt.format(number(readiness.stale_sources))} stale. ${esc(telemetry.note || "Load a dashboard snapshot to inspect local telemetry readiness.")}</small></div>
     <div class="telemetrySourceGrid">${sourceRows.map(renderTelemetrySource).join("") || '<div class="emptyState">Telemetry contract loads with the selected dashboard window.</div>'}</div>
+    <details class="telemetryInventory"><summary>Measured source and subtype inventory</summary>
+      <p class="evidenceNote">${esc(inventory.scope || "Inventory evidence is unavailable.")} Counts are scoped to the selected window; unavailable fields are intentionally not shown as zero.</p>
+      <div class="evidenceMetrics evidenceMetricsCompact">
+        <div class="evidenceMetric"><span>Indexed events</span><strong>${inventory.indexed_events == null ? "-" : fmt.format(number(inventory.indexed_events))}</strong><small>exact window count</small></div>
+        <div class="evidenceMetric"><span>Network samples</span><strong>${fmt.format(number(inventory.bounded_samples?.network))}</strong><small>bounded live sample</small></div>
+        <div class="evidenceMetric"><span>Identity samples</span><strong>${fmt.format(number(inventory.bounded_samples?.identity))}</strong><small>bounded live sample</small></div>
+        <div class="evidenceMetric"><span>Index-to-UI trace</span><strong>${fmt.format(number(inventory.index_to_ui_trace?.records?.length))}</strong><small>${esc(inventory.index_to_ui_trace?.status || "unavailable")}</small></div>
+        <div class="evidenceMetric"><span>Parser version</span><strong>${esc(inventory.parser_version?.status || "unavailable")}</strong><small>${esc(inventory.parser_version?.reason || "Not measured")}</small></div>
+      </div>
+      <div class="evidenceTableWrap"><table class="evidenceTable"><thead><tr><th>Subtype dimension</th><th>Observed values</th><th>Top rollup evidence</th></tr></thead><tbody>${Object.entries(inventory.subtype_dimensions || {}).map(([name, values]) => `<tr><td>${esc(name)}</td><td>${fmt.format(number(values.length))}</td><td>${esc((values || []).slice(0, 5).map(row => `${row.value} (${fmt.format(number(row.count))})`).join(" · ") || "not observed")}</td></tr>`).join("") || '<tr><td colspan="3">Subtype inventory unavailable for this snapshot.</td></tr>'}</tbody></table></div>
+      <p class="evidenceNote"><b>Trace scope:</b> ${esc(inventory.index_to_ui_trace?.scope || "not measured")}. <b>Not proven:</b> ${esc((inventory.index_to_ui_trace?.not_proven || []).join(" · ") || "none")}. <b>Not measured:</b> ${esc([inventory.received_vs_indexed?.status === "unavailable" ? "upstream received-vs-indexed count" : "", inventory.late_events?.status === "unavailable" ? "late-event count" : ""].filter(Boolean).join(" · ") || "none")}. ${esc((inventory.limitations || []).join(" "))}</p>
+    </details>
     <div class="telemetryExternal"><article><strong>CYFIRMA research</strong><span>${research.enabled ? esc(research.status || "not started") : "disabled"}</span><b>${fmt.format(number(research.items))}</b><small>Stored separately from STIX IOC feeds</small></article><article><strong>CYFIRMA TAXII</strong><span>${esc(collectorProgress(taxii))}</span><b>${taxii.configured ? "checkpointed collection" : "configuration required"}</b><small>${esc(taxii.collection || "Collection URL not configured")} · valid until ${esc(taxii.freshness?.earliest_valid_until || "not reported")}</small></article><article><strong>CYFIRMA Org CVE</strong><span>${esc(collectorProgress(orgVulnerability))}</span><b>${orgVulnerability.configured ? "checkpointed collection" : "configuration required"}</b><small>Bounded Vulnerability V2 pagination · valid until ${esc(orgVulnerability.freshness?.earliest_valid_until || "not reported")}</small></article><article><strong>Microsoft Defender XDR</strong><span>${defender.enabled ? esc(defender.status || "not started") : "disabled"}</span><b>${fmt.format(number(defender.counts?.incidents))} incidents · ${fmt.format(number(defender.counts?.alerts))} alerts</b><small>${defender.configured ? `collection ${esc(defender.mode || "unknown")} · ${fmt.format(number(entityGraph.entities))} canonical entities · ${fmt.format(number(entityGraph.clusters))} correlated clusters · graph ${fmt.format(number(entityGraph.latest_batch?.stored))} stored / ${fmt.format(number(entityGraph.latest_batch?.queued))} queued · ${fmt.format(number(entityGraph.queue?.pending))} pending${number(entityGraph.latest_batch?.dropped) ? ` · ${fmt.format(number(entityGraph.latest_batch.dropped))} dropped in last batch` : ""}${number(entityGraph.batch_history?.dropped) ? ` · ${fmt.format(number(entityGraph.batch_history.dropped))} historical candidates unrepresented` : ""}` : "requires Entra app credentials"}</small></article></div>
   `);
 }
@@ -3973,20 +3989,31 @@ function renderOverview(data) {
   renderView(state.view, data);
 }
 
+async function readJsonResponse(resp) {
+  let data;
+  try {
+    data = await resp.json();
+  } catch (_) {
+    if (resp.ok) throw new Error("Server returned an invalid JSON response");
+    data = {};
+  }
+  if (!resp.ok) {
+    const error = new Error(resp.status === 401 ? "Authentication required (HTTP 401); sign in and refresh."
+      : data?.detail || data?.error || (Array.isArray(data?.errors) ? data.errors.join(", ") : "") || `${resp.status} ${resp.statusText}`);
+    error.payload = data;
+    error.status = resp.status;
+    throw error;
+  }
+  return data;
+}
+
 async function postJson(path, body = {}) {
   const resp = await fetch(path, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-  const data = await resp.json();
-  if (!resp.ok) {
-    const error = new Error(data.detail || data.error || (data.errors || []).join(", ") || `${resp.status} ${resp.statusText}`);
-    error.payload = data;
-    error.status = resp.status;
-    throw error;
-  }
-  return data;
+  return readJsonResponse(resp);
 }
 
 async function postJsonWithTimeout(path, body = {}, timeoutMs = 30000) {
@@ -3999,9 +4026,7 @@ async function postJsonWithTimeout(path, body = {}, timeoutMs = 30000) {
       body: JSON.stringify(body),
       signal: controller.signal,
     });
-    const data = await resp.json();
-    if (!resp.ok) throw new Error(data.error || (data.errors || []).join(", ") || `${resp.status} ${resp.statusText}`);
-    return data;
+    return await readJsonResponse(resp);
   } catch (err) {
     if (err.name === "AbortError") throw new Error(`Request timed out after ${Math.round(timeoutMs / 1000)}s`);
     throw err;
@@ -4010,7 +4035,18 @@ async function postJsonWithTimeout(path, body = {}, timeoutMs = 30000) {
   }
 }
 
+function setOverviewLoad(status, windowKey, error = "") {
+  state.overviewLoad = {status, windowKey, error};
+  document.dispatchEvent(new CustomEvent("soc:overview-status", {detail: state.overviewLoad}));
+}
+
 async function loadDashboard(force = false) {
+  const requestId = ++state.overviewRequestId;
+  const windowKey = routeWindowKey();
+  const isCurrent = () => requestId === state.overviewRequestId && windowKey === routeWindowKey();
+  clearTimeout(state.overviewRefreshTimer);
+  state.overviewRefreshTimer = null;
+  setOverviewLoad("loading", windowKey);
   els.status.textContent = force ? "Refreshing live SOC telemetry..." : "Loading SOC telemetry...";
   els.dot.className = "";
   els.connectionText.textContent = "Loading";
@@ -4022,12 +4058,13 @@ async function loadDashboard(force = false) {
     const clientSnapshot = force ? null : readClientOverview(cachePayload);
     if (clientSnapshot) {
       state.overview = clientSnapshot;
+      state.overviewWindow = windowKey;
       renderOverview(clientSnapshot);
       els.status.textContent = `Showing local snapshot | ${currentRangeLabel(clientSnapshot)} | refreshing telemetry...`;
     }
     if (force) windowPayload.force = true;
-    const settingsPromise = state.settings ? Promise.resolve() : postJson("/api/settings").then(settings => { state.settings = settings; renderSettings(); });
-    const toolsPromise = state.tools.length ? Promise.resolve() : postJson("/api/tools").then(toolsData => {
+    const settingsPromise = state.settings ? Promise.resolve() : postJsonWithTimeout("/api/settings").then(settings => { state.settings = settings; renderSettings(); });
+    const toolsPromise = state.tools.length ? Promise.resolve() : postJsonWithTimeout("/api/tools").then(toolsData => {
         state.tools = toolsData.tools || [];
         state.toolSummary = toolsData.summary || {};
         state.categories = toolsData.categories || {};
@@ -4035,8 +4072,16 @@ async function loadDashboard(force = false) {
         document.dispatchEvent(new CustomEvent("soc:tools"));
         if (!state.selected && state.tools.length) selectTool(state.tools[0]);
     });
-    const overview = await postJson("/api/overview", windowPayload);
+    // Attach rejection handlers before awaiting the independent overview request.
+    const dependencies = Promise.allSettled([settingsPromise, toolsPromise]);
+    const overview = await postJsonWithTimeout("/api/overview", windowPayload);
+    if (!isCurrent()) return;
+    if (!overview || typeof overview !== "object" || Array.isArray(overview)) {
+      throw new Error("Server returned an invalid overview payload");
+    }
     state.overview = overview;
+    state.overviewWindow = windowKey;
+    setOverviewLoad("ready", windowKey);
     writeClientOverview(cachePayload, overview);
     state.crowdSecRequestId += 1;
     state.crowdSecLoading = false;
@@ -4072,9 +4117,22 @@ async function loadDashboard(force = false) {
       els.providerIntelGrid.innerHTML = '<div class="emptyState">Provider connection tests are on demand. Stored intelligence and scheduled enrichment remain available without spending API quota.</div>';
     }
     if (state.view === "l3") loadCrowdSecIntel(true).catch(() => {});
-    await Promise.allSettled([settingsPromise, toolsPromise]);
+    const settled = await dependencies;
+    if (isCurrent()) {
+      const failed = settled.flatMap((result, index) => result.status === "rejected" ? [index === 0 ? "settings" : "tools"] : []);
+      if (failed.length) {
+        els.status.textContent += ` | unavailable: ${failed.join(", ")}`;
+        els.dot.className = "bad";
+        els.connectionText.textContent = "Degraded";
+      }
+    }
+  } catch (err) {
+    if (isCurrent()) {
+      setOverviewLoad("error", windowKey, String(err.message || err));
+      showLoadError(err);
+    }
   } finally {
-    els.refresh.disabled = false;
+    if (requestId === state.overviewRequestId) els.refresh.disabled = false;
   }
 }
 

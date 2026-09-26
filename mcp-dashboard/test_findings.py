@@ -29,6 +29,29 @@ class FindingTests(unittest.TestCase):
                 server._finding_intel("wazuh_restart", "host")
             call.assert_not_called()
 
+    def test_overview_statistics_uses_local_alert_timeline_when_available(self):
+        local = {"ok": True, "timeline": {"total_alerts": 12}}
+        with patch.object(server, "_safe_call") as call:
+            result = server._overview_statistics(local, False)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["source"], "local_alert_timeline")
+        self.assertTrue(result["skipped"])
+        call.assert_not_called()
+
+    def test_overview_statistics_preserves_manager_fallback_when_local_fails(self):
+        fallback = {"ok": False, "error": "manager unavailable"}
+        with patch.object(server, "_safe_call", return_value=fallback) as call:
+            result = server._overview_statistics({"ok": False}, False)
+        self.assertEqual(result, fallback)
+        call.assert_called_once_with("gensecai", "get_wazuh_statistics", {})
+
+    def test_overview_statistics_does_not_fetch_live_manager_stats_for_history(self):
+        with patch.object(server, "_safe_call") as call:
+            result = server._overview_statistics({"ok": False}, True)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["source"], "historical_rollup")
+        call.assert_not_called()
+
     def test_overview_cache_schema_bump_does_not_reuse_legacy_snapshot_key(self):
         window = {"requested": "24h", "bounds": {"gte": "now-24h", "lt": "now"}, "tool_range": "24h"}
         legacy_payload = json.dumps({
@@ -39,6 +62,44 @@ class FindingTests(unittest.TestCase):
         }, sort_keys=True, separators=(",", ":"))
         legacy_key = hashlib.sha256(legacy_payload.encode("utf-8")).hexdigest()
         self.assertNotEqual(server._overview_cache_key(window), legacy_key)
+
+    def test_overview_cache_refreshes_older_snapshot_without_deleting_last_good_data(self):
+        cached = {
+            "data": {
+                "build_id": "2026-09-26-patch20",
+                "telemetry_contract": {"summary": {"ready_sources": 1}},
+                "alerts": {"total_alerts": 12},
+            },
+            "created_at": time.time() - 10,
+            "expires_at": time.time() + 300,
+        }
+        with patch.object(server, "_overview_cache_read", return_value=cached), \
+             patch.object(server, "_overview_refresh_async") as refresh:
+            result = server._overview_cached({"range": "24h"})
+        self.assertEqual(result["alerts"]["total_alerts"], 12)
+        self.assertEqual(result["cache"]["status"], "stale-schema-refreshing")
+        self.assertEqual(result["cache"]["schema_refresh"], "inventory_evidence")
+        refresh.assert_called_once()
+
+    def test_overview_cache_refreshes_inventory_snapshot_missing_index_trace(self):
+        cached = {
+            "data": {
+                "build_id": "2026-09-26-patch21",
+                "telemetry_contract": {
+                    "summary": {"ready_sources": 1},
+                    "inventory_evidence": {"status": "measured"},
+                },
+                "alerts": {"total_alerts": 12},
+            },
+            "created_at": time.time() - 10,
+            "expires_at": time.time() + 300,
+        }
+        with patch.object(server, "_overview_cache_read", return_value=cached), \
+             patch.object(server, "_overview_refresh_async") as refresh:
+            result = server._overview_cached({"range": "24h"})
+        self.assertEqual(result["alerts"]["total_alerts"], 12)
+        self.assertEqual(result["cache"]["status"], "stale-schema-refreshing")
+        refresh.assert_called_once()
 
     def test_private_ip_skipped(self):
         with patch.object(server, "_safe_call") as call:
@@ -654,6 +715,36 @@ class FindingTests(unittest.TestCase):
                              "Background refresh failed; retaining the last valid snapshot.")
         finally:
             server._overview_refresh_errors.pop(key, None)
+
+    def test_historical_background_refresh_uses_rollup_without_live_overview(self):
+        key = "test-historical-rollup-refresh"
+        window = {"requested": "30d", "label": "30 days", "bounds": {"gte": "start", "lt": "end"}}
+        materialized = {"build_id": server.DASHBOARD_BUILD_ID, "materialization": {"status": "rollup"}}
+        with patch.object(server, "_materialized_overview", return_value=materialized) as rollup, \
+             patch.object(server, "_overview", side_effect=AssertionError("live overview must not run")), \
+             patch.object(server, "_overview_cache_write") as write:
+            server._overview_refresh_worker(key, window, {"range": "30d"}, 300)
+        rollup.assert_called_once_with(window, {"range": "30d"})
+        write.assert_called_once_with(key, window, materialized, 300)
+
+    def test_historical_refresh_is_not_starved_by_live_refresh(self):
+        original_keys = set(server._overview_refreshing)
+        original_historical = server._overview_historical_refreshing
+        try:
+            server._overview_refreshing.clear()
+            server._overview_refreshing.add("live-24h")
+            server._overview_historical_refreshing = False
+            window = {"requested": "30d"}
+            with patch("server.threading.Thread") as thread:
+                server._overview_refresh_async("historical-30d", window, {"range": "30d"}, 300)
+            thread.assert_called_once()
+            thread.return_value.start.assert_called_once()
+            self.assertIn("historical-30d", server._overview_refreshing)
+            self.assertTrue(server._overview_historical_refreshing)
+        finally:
+            server._overview_refreshing.clear()
+            server._overview_refreshing.update(original_keys)
+            server._overview_historical_refreshing = original_historical
 
     def test_complete_rollup_serves_fast_and_starts_bounded_detail_refresh(self):
         placeholder = {"generated_at": "now", "materialization": {"status": "rollup", "exact": True}}

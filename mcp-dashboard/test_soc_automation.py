@@ -125,6 +125,20 @@ class AutomationTests(unittest.TestCase):
         self.assertEqual(status["items"], 1)
         self.assertEqual(status["status"], "stored")
 
+    def test_lightweight_status_is_bounded_and_does_not_expand_detail_reads(self):
+        with self.worker.db():
+            pass
+        status = self.worker.status(lightweight=True)
+        self.assertEqual(status["status"], "ok")
+        self.assertEqual(status["status_scope"], "bounded_runtime_snapshot")
+        self.assertFalse(status["detail_available"])
+        self.assertEqual(status["history"], [])
+        external = self.worker.external_intelligence_status(lightweight=True)
+        self.assertEqual(external["status"], "ok")
+        self.assertEqual(external["status_scope"], "bounded_runtime_snapshot")
+        self.assertFalse(external["detail_available"])
+        self.assertEqual(external["cyfirma_research"]["items"], 0)
+
     def test_provider_policy_downranks_scanner_context_and_keeps_flow_direction(self):
         scanner = soc.provider_policy(
             {"indicator": "198.51.100.8", "level": 10},
@@ -704,6 +718,72 @@ class AutomationTests(unittest.TestCase):
         self.assertEqual(self.worker.finding_analysis_job(healthy['job_id'])['status'], 'queued')
         retried = self.worker.retry_finding_analysis_job(stale['job_id'])
         self.assertEqual(retried['status'], 'queued')
+
+    def test_finding_ai_watchdog_survives_database_lock_and_recovers(self):
+        calls = []
+
+        def locked_once():
+            calls.append(True)
+            if len(calls) == 1:
+                raise sqlite3.OperationalError("database is locked")
+            return 0
+
+        with patch.object(self.worker, "expire_stale_finding_jobs", side_effect=locked_once):
+            self.assertIsNone(self.worker._finding_ai_watchdog_cycle())
+            self.assertEqual(self.worker.finding_ai_watchdog_state["status"], "degraded")
+            self.assertEqual(self.worker.finding_ai_watchdog_state["lock_events"], 1)
+            self.assertEqual(self.worker._finding_ai_watchdog_cycle(), 0)
+        self.assertEqual(self.worker.finding_ai_watchdog_state["status"], "ok")
+        self.assertIsNone(self.worker.finding_ai_watchdog_state["last_error"])
+        self.assertEqual(self.worker.finding_analysis_jobs()["watchdog"]["status"], "ok")
+
+    def test_external_collector_lock_is_degraded_and_recovers(self):
+        self.config.update({
+            "SOC_CYFIRMA_RESEARCH_ENABLED": "false",
+            "SOC_CYFIRMA_TAXII_ENABLED": "false",
+            "SOC_CYFIRMA_ORG_VULN_ENABLED": "false",
+            "DEFENDER_XDR_ENABLED": "true",
+        })
+        locked = sqlite3.OperationalError("database is locked")
+        with patch.object(soc.defender_xdr, "collect", side_effect=locked):
+            self.worker._refresh_external_collectors()
+        failed = self.worker.external_collectors["defender_xdr"]
+        self.assertEqual(failed["status"], "degraded")
+        self.assertTrue(failed["retryable"])
+        self.assertIn("database is locked", failed["reason"])
+
+        with patch.object(soc.defender_xdr, "collect", return_value={"status": "ok", "observations": 4}):
+            self.worker._refresh_external_collectors_safely()
+        self.assertEqual(self.worker.external_collectors["defender_xdr"]["status"], "ok")
+
+    def test_external_collector_unexpected_error_does_not_escape_scheduler_boundary(self):
+        self.config.update({
+            "SOC_CYFIRMA_RESEARCH_ENABLED": "false",
+            "SOC_CYFIRMA_TAXII_ENABLED": "false",
+            "SOC_CYFIRMA_ORG_VULN_ENABLED": "false",
+        })
+        with patch.object(self.worker, "_refresh_external_collectors", side_effect=RuntimeError("collector failure")):
+            self.worker._refresh_external_collectors_safely()
+        failed = self.worker.external_collectors["defender_xdr"]
+        self.assertEqual(failed["status"], "error")
+        self.assertFalse(failed["retryable"])
+        self.assertIn("collector failure", failed["reason"])
+
+    def test_schema_initialization_retries_transient_database_lock(self):
+        calls = []
+        original = self.worker._initialize_schema
+
+        def flaky(connection):
+            if not calls:
+                calls.append(True)
+                raise sqlite3.OperationalError("database is locked")
+            return original(connection)
+
+        with patch.object(self.worker, "_initialize_schema", side_effect=flaky):
+            with self.worker.db() as db:
+                self.assertEqual(db.execute("SELECT 1").fetchone()[0], 1)
+        self.assertTrue(self.worker.db_initialized)
+        self.assertEqual(len(calls), 1)
 
     def test_existing_finding_job_table_is_migrated_in_place(self):
         db_path = Path(self.temp.name) / 'legacy.db'

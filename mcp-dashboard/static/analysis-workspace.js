@@ -98,8 +98,8 @@
     }
     activeAreas().forEach(el => el.innerHTML = `<div class="analysisBody">${t("Menghitung cakupan alert terindeks...", "Calculating indexed alert coverage...")}</div>`);
     try {
-      const data = await postJson("/api/analysis/coverage", payload);
-      if (generation !== a.generation) return;
+      const data = await postJsonWithTimeout("/api/analysis/coverage", payload);
+      if (generation !== a.generation || windowKey !== coverageKey(coveragePayload())) return;
       if (!data.ok) throw new Error(t("Indexer mengembalikan hasil parsial atau timeout. Cakupan belum dapat dinyatakan lengkap.", "Indexer returned partial results or timed out. Coverage cannot be declared complete."));
       a.coverage = data;
       a.coverageWindow = windowKey;
@@ -109,7 +109,7 @@
       if (state.view === "l1") renderThreatTable("#l1Queue", data.rules.slice(0, 25));
       if (!eligible().some(row => row.indicator === a.selected)) a.selected = eligible()[0]?.indicator || "";
       render();
-    } catch (e) { if (generation === a.generation) {
+    } catch (e) { if (generation === a.generation && windowKey === coverageKey(coveragePayload())) {
       window.SocFindings?.setCoverageStatus("error", e.message);
       activeAreas().forEach(el => el.innerHTML = `<div class="analysisBody">${t("Cakupan belum tersedia", "Coverage unavailable")}: ${esc(e.message)}</div>`);
     } }

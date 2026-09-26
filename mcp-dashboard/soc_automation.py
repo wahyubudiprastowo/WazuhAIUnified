@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import html
 import base64
+import fcntl
 import hashlib
 import json
 import os
@@ -2176,6 +2177,10 @@ class Automation:
         self.phase = "idle"
         self.error = None
         self.entity_group_error = None
+        self.finding_ai_watchdog_state = {
+            "status": "starting", "last_run": None, "last_success": None,
+            "last_error": None, "lock_events": 0,
+        }
         self.next_run = time.time() + 30
         # External collectors have their own cache/backoff and must not wait
         # for an Indexer-backed Wazuh report to succeed.
@@ -2184,79 +2189,156 @@ class Automation:
         self.stop = threading.Event()
         self.requested_window = {"range": "24h"}
 
+    def _initialize_schema(self, conn):
+        with conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("CREATE TABLE IF NOT EXISTS reports (id INTEGER PRIMARY KEY, created REAL, data TEXT)")
+            conn.execute("CREATE TABLE IF NOT EXISTS report_summaries (report_id INTEGER PRIMARY KEY, created REAL, bucket_day TEXT, data TEXT)")
+            conn.execute("CREATE INDEX IF NOT EXISTS report_summaries_time ON report_summaries(created)")
+            conn.execute("CREATE INDEX IF NOT EXISTS report_summaries_day ON report_summaries(bucket_day,created)")
+            conn.execute('''CREATE TABLE IF NOT EXISTS cve_observations (
+                observation_key TEXT PRIMARY KEY, observed_at REAL NOT NULL,
+                bucket_day TEXT NOT NULL, cve TEXT NOT NULL, agent_id TEXT,
+                agent TEXT, package TEXT, version TEXT, severity TEXT,
+                published_at TEXT, detected_at TEXT, data TEXT NOT NULL)''')
+            conn.execute("CREATE INDEX IF NOT EXISTS cve_observations_time ON cve_observations(observed_at)")
+            conn.execute("CREATE INDEX IF NOT EXISTS cve_observations_day ON cve_observations(bucket_day,cve)")
+            conn.execute("CREATE INDEX IF NOT EXISTS cve_observations_asset ON cve_observations(agent_id,cve)")
+            conn.execute("CREATE TABLE IF NOT EXISTS cve_observation_reports (report_id INTEGER PRIMARY KEY, materialized_at REAL NOT NULL)")
+            conn.execute('''CREATE TABLE IF NOT EXISTS cyfirma_observations (
+                observation_key TEXT PRIMARY KEY, observed_at REAL NOT NULL,
+                bucket_day TEXT NOT NULL, item_key TEXT NOT NULL, scope TEXT NOT NULL,
+                source_created TEXT, source_modified TEXT, valid_from TEXT, valid_until TEXT,
+                name TEXT, description TEXT, confidence INTEGER, ioc_count INTEGER NOT NULL DEFAULT 0,
+                cves TEXT NOT NULL, labels TEXT NOT NULL, data TEXT NOT NULL)''')
+            conn.execute("CREATE INDEX IF NOT EXISTS cyfirma_observations_time ON cyfirma_observations(observed_at)")
+            conn.execute("CREATE INDEX IF NOT EXISTS cyfirma_observations_item ON cyfirma_observations(item_key,observed_at DESC)")
+            conn.execute("CREATE INDEX IF NOT EXISTS cyfirma_observations_cve ON cyfirma_observations(bucket_day,scope)")
+            conn.execute('''CREATE TABLE IF NOT EXISTS cyfirma_feed_runs (
+                run_key TEXT PRIMARY KEY, collected_at REAL NOT NULL, scope TEXT NOT NULL,
+                status TEXT NOT NULL, loaded INTEGER NOT NULL DEFAULT 0,
+                reported INTEGER NOT NULL DEFAULT 0, cached INTEGER NOT NULL DEFAULT 0,
+                detail TEXT NOT NULL)''')
+            conn.execute("CREATE INDEX IF NOT EXISTS cyfirma_feed_runs_time ON cyfirma_feed_runs(collected_at DESC)")
+            # A feed can be much larger than the per-cycle API budget. Keep a
+            # durable, per-scope cursor so each run advances rather than
+            # repeatedly downloading page zero.
+            conn.execute('''CREATE TABLE IF NOT EXISTS cyfirma_feed_cursor (
+                scope TEXT PRIMARY KEY, next_offset INTEGER NOT NULL DEFAULT 0,
+                updated_at REAL NOT NULL, status TEXT NOT NULL, detail TEXT NOT NULL)''')
+            conn.execute('''CREATE TABLE IF NOT EXISTS cyfirma_connector_cursor (
+                scope TEXT PRIMARY KEY, next_value TEXT NOT NULL,
+                updated_at REAL NOT NULL, status TEXT NOT NULL, detail TEXT NOT NULL)''')
+            cyfirma_research.ensure_schema(conn)
+            defender_xdr.ensure_schema(conn)
+            conn.execute("CREATE TABLE IF NOT EXISTS cache (key TEXT PRIMARY KEY, expires REAL, data TEXT)")
+            conn.execute("CREATE TABLE IF NOT EXISTS deliveries (channel TEXT, report_id INTEGER, sent REAL, status TEXT, PRIMARY KEY(channel,report_id))")
+            conn.execute('CREATE TABLE IF NOT EXISTS ai_runs (id INTEGER PRIMARY KEY, report_id INTEGER, created REAL, data TEXT)')
+            conn.execute('CREATE TABLE IF NOT EXISTS finding_ai (cache_key TEXT PRIMARY KEY, finding_id TEXT, created REAL, expires REAL, data TEXT)')
+            conn.execute('CREATE INDEX IF NOT EXISTS finding_ai_created ON finding_ai(created)')
+            conn.execute('''CREATE TABLE IF NOT EXISTS finding_ai_runs (
+                run_id TEXT PRIMARY KEY, finding_id TEXT NOT NULL, created REAL NOT NULL,
+                model TEXT NOT NULL, skill_version TEXT NOT NULL, contract_version TEXT NOT NULL,
+                prompt_sha256 TEXT NOT NULL, input_sha256 TEXT NOT NULL,
+                result_sha256 TEXT NOT NULL, evidence_ids TEXT NOT NULL,
+                provider_sources TEXT NOT NULL, audit TEXT NOT NULL)''')
+            conn.execute('CREATE INDEX IF NOT EXISTS finding_ai_runs_lookup ON finding_ai_runs(finding_id,created DESC)')
+            conn.execute('CREATE TABLE IF NOT EXISTS finding_ai_jobs (id TEXT PRIMARY KEY, cache_key TEXT, finding_id TEXT, created REAL, updated REAL, status TEXT, request TEXT, force INTEGER, result TEXT, error TEXT)')
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(finding_ai_jobs)")}
+            if "attempts" not in columns:
+                conn.execute("ALTER TABLE finding_ai_jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
+            conn.execute('CREATE INDEX IF NOT EXISTS finding_ai_jobs_status ON finding_ai_jobs(status,created)')
+            conn.execute('CREATE TABLE IF NOT EXISTS finding_feedback (id INTEGER PRIMARY KEY, finding_id TEXT, created REAL, disposition TEXT, note TEXT, data TEXT)')
+            conn.execute('CREATE INDEX IF NOT EXISTS finding_feedback_lookup ON finding_feedback(finding_id,created DESC)')
+
+    @staticmethod
+    def _schema_is_ready(conn):
+        required_tables = {
+            "reports", "report_summaries", "cve_observations", "cve_observation_reports",
+            "cyfirma_observations", "cyfirma_feed_runs", "cyfirma_feed_cursor",
+            "cyfirma_connector_cursor", "cyfirma_research", "defender_xdr_checkpoint",
+            "defender_xdr_observations", "defender_xdr_correlations", "entity_nodes",
+            "entity_evidence", "entity_observations", "entity_relations", "entity_clusters",
+            "entity_cluster_members", "entity_graph_batches", "entity_graph_queue",
+            "correlation_candidates", "correlation_candidate_state", "correlation_candidate_evidence",
+            "cache", "deliveries", "ai_runs", "finding_ai", "finding_ai_runs",
+            "finding_ai_jobs", "finding_feedback",
+        }
+        tables = {row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )}
+        if not required_tables <= tables:
+            return False
+        required_columns = {
+            "cyfirma_research": {"published_epoch"},
+            "defender_xdr_observations": {"record_type"},
+            "entity_graph_batches": {"queued_count", "coalesced_count"},
+            "finding_ai_jobs": {"attempts"},
+        }
+        for table, columns in required_columns.items():
+            present = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+            if not columns <= present:
+                return False
+        return True
+
+    @contextmanager
+    def _schema_process_lock(self):
+        """Serialize the rare cross-process schema/migration path."""
+        lock_path = Path(str(self.db_path) + ".schema.lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a+", encoding="utf-8") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
     @contextmanager
     def db(self):
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(self.db_path, timeout=15)
+        conn = sqlite3.connect(self.db_path, timeout=10)
         try:
-            conn.execute("PRAGMA busy_timeout=15000")
+            conn.execute("PRAGMA busy_timeout=10000")
             if not self.db_initialized:
                 with self.db_init_lock:
                     if not self.db_initialized:
-                        with conn:
-                            conn.execute("PRAGMA journal_mode=WAL")
-                            conn.execute("PRAGMA synchronous=NORMAL")
-                            conn.execute("CREATE TABLE IF NOT EXISTS reports (id INTEGER PRIMARY KEY, created REAL, data TEXT)")
-                            conn.execute("CREATE TABLE IF NOT EXISTS report_summaries (report_id INTEGER PRIMARY KEY, created REAL, bucket_day TEXT, data TEXT)")
-                            conn.execute("CREATE INDEX IF NOT EXISTS report_summaries_time ON report_summaries(created)")
-                            conn.execute("CREATE INDEX IF NOT EXISTS report_summaries_day ON report_summaries(bucket_day,created)")
-                            conn.execute('''CREATE TABLE IF NOT EXISTS cve_observations (
-                                observation_key TEXT PRIMARY KEY, observed_at REAL NOT NULL,
-                                bucket_day TEXT NOT NULL, cve TEXT NOT NULL, agent_id TEXT,
-                                agent TEXT, package TEXT, version TEXT, severity TEXT,
-                                published_at TEXT, detected_at TEXT, data TEXT NOT NULL)''')
-                            conn.execute("CREATE INDEX IF NOT EXISTS cve_observations_time ON cve_observations(observed_at)")
-                            conn.execute("CREATE INDEX IF NOT EXISTS cve_observations_day ON cve_observations(bucket_day,cve)")
-                            conn.execute("CREATE INDEX IF NOT EXISTS cve_observations_asset ON cve_observations(agent_id,cve)")
-                            conn.execute("CREATE TABLE IF NOT EXISTS cve_observation_reports (report_id INTEGER PRIMARY KEY, materialized_at REAL NOT NULL)")
-                            conn.execute('''CREATE TABLE IF NOT EXISTS cyfirma_observations (
-                                observation_key TEXT PRIMARY KEY, observed_at REAL NOT NULL,
-                                bucket_day TEXT NOT NULL, item_key TEXT NOT NULL, scope TEXT NOT NULL,
-                                source_created TEXT, source_modified TEXT, valid_from TEXT, valid_until TEXT,
-                                name TEXT, description TEXT, confidence INTEGER, ioc_count INTEGER NOT NULL DEFAULT 0,
-                                cves TEXT NOT NULL, labels TEXT NOT NULL, data TEXT NOT NULL)''')
-                            conn.execute("CREATE INDEX IF NOT EXISTS cyfirma_observations_time ON cyfirma_observations(observed_at)")
-                            conn.execute("CREATE INDEX IF NOT EXISTS cyfirma_observations_item ON cyfirma_observations(item_key,observed_at DESC)")
-                            conn.execute("CREATE INDEX IF NOT EXISTS cyfirma_observations_cve ON cyfirma_observations(bucket_day,scope)")
-                            conn.execute('''CREATE TABLE IF NOT EXISTS cyfirma_feed_runs (
-                                run_key TEXT PRIMARY KEY, collected_at REAL NOT NULL, scope TEXT NOT NULL,
-                                status TEXT NOT NULL, loaded INTEGER NOT NULL DEFAULT 0,
-                                reported INTEGER NOT NULL DEFAULT 0, cached INTEGER NOT NULL DEFAULT 0,
-                                detail TEXT NOT NULL)''')
-                            conn.execute("CREATE INDEX IF NOT EXISTS cyfirma_feed_runs_time ON cyfirma_feed_runs(collected_at DESC)")
-                            # A feed can be much larger than the per-cycle API budget.
-                            # Keep a durable, per-scope cursor so each run advances rather
-                            # than repeatedly downloading page zero.
-                            conn.execute('''CREATE TABLE IF NOT EXISTS cyfirma_feed_cursor (
-                                scope TEXT PRIMARY KEY, next_offset INTEGER NOT NULL DEFAULT 0,
-                                updated_at REAL NOT NULL, status TEXT NOT NULL, detail TEXT NOT NULL)''')
-                            conn.execute('''CREATE TABLE IF NOT EXISTS cyfirma_connector_cursor (
-                                scope TEXT PRIMARY KEY, next_value TEXT NOT NULL,
-                                updated_at REAL NOT NULL, status TEXT NOT NULL, detail TEXT NOT NULL)''')
-                            cyfirma_research.ensure_schema(conn)
-                            defender_xdr.ensure_schema(conn)
-                            conn.execute("CREATE TABLE IF NOT EXISTS cache (key TEXT PRIMARY KEY, expires REAL, data TEXT)")
-                            conn.execute("CREATE TABLE IF NOT EXISTS deliveries (channel TEXT, report_id INTEGER, sent REAL, status TEXT, PRIMARY KEY(channel,report_id))")
-                            conn.execute('CREATE TABLE IF NOT EXISTS ai_runs (id INTEGER PRIMARY KEY, report_id INTEGER, created REAL, data TEXT)')
-                            conn.execute('CREATE TABLE IF NOT EXISTS finding_ai (cache_key TEXT PRIMARY KEY, finding_id TEXT, created REAL, expires REAL, data TEXT)')
-                            conn.execute('CREATE INDEX IF NOT EXISTS finding_ai_created ON finding_ai(created)')
-                            conn.execute('''CREATE TABLE IF NOT EXISTS finding_ai_runs (
-                                run_id TEXT PRIMARY KEY, finding_id TEXT NOT NULL, created REAL NOT NULL,
-                                model TEXT NOT NULL, skill_version TEXT NOT NULL, contract_version TEXT NOT NULL,
-                                prompt_sha256 TEXT NOT NULL, input_sha256 TEXT NOT NULL,
-                                result_sha256 TEXT NOT NULL, evidence_ids TEXT NOT NULL,
-                                provider_sources TEXT NOT NULL, audit TEXT NOT NULL)''')
-                            conn.execute('CREATE INDEX IF NOT EXISTS finding_ai_runs_lookup ON finding_ai_runs(finding_id,created DESC)')
-                            conn.execute('CREATE TABLE IF NOT EXISTS finding_ai_jobs (id TEXT PRIMARY KEY, cache_key TEXT, finding_id TEXT, created REAL, updated REAL, status TEXT, request TEXT, force INTEGER, result TEXT, error TEXT)')
-                            columns = {row[1] for row in conn.execute("PRAGMA table_info(finding_ai_jobs)")}
-                            if "attempts" not in columns:
-                                conn.execute("ALTER TABLE finding_ai_jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
-                            conn.execute('CREATE INDEX IF NOT EXISTS finding_ai_jobs_status ON finding_ai_jobs(status,created)')
-                            conn.execute('CREATE TABLE IF NOT EXISTS finding_feedback (id INTEGER PRIMARY KEY, finding_id TEXT, created REAL, disposition TEXT, note TEXT, data TEXT)')
-                            conn.execute('CREATE INDEX IF NOT EXISTS finding_feedback_lookup ON finding_feedback(finding_id,created DESC)')
-                        self.db_initialized = True
+                        if self._schema_is_ready(conn):
+                            self.db_initialized = True
+                        else:
+                            with self._schema_process_lock():
+                                if self._schema_is_ready(conn):
+                                    self.db_initialized = True
+                                else:
+                                    for attempt in range(5):
+                                        try:
+                                            self._initialize_schema(conn)
+                                            self.db_initialized = True
+                                            break
+                                        except sqlite3.OperationalError as exc:
+                                            if not self._sqlite_lock_error(exc) or attempt == 4:
+                                                raise
+                                            time.sleep(0.25 * (2 ** attempt))
             with conn:
                 yield conn
+        finally:
+            conn.close()
+
+    @contextmanager
+    def read_db(self, timeout=0.5):
+        """Open a bounded, read-only SQLite view for health and history reads.
+
+        Runtime status must not wait behind a materializer write transaction.
+        This connection never initializes schema and never writes; callers must
+        surface a degraded result when the bounded read cannot proceed.
+        """
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        bounded = max(0.05, min(float(timeout), 2.0))
+        conn = sqlite3.connect(self.db_path, timeout=bounded)
+        try:
+            conn.execute(f"PRAGMA busy_timeout={int(bounded * 1000)}")
+            conn.execute("PRAGMA query_only=ON")
+            yield conn
         finally:
             conn.close()
 
@@ -3107,7 +3189,8 @@ class Automation:
             "queue_limit": int_config(self.config(), "AI_FINDING_QUEUE_MAX", 100),
             "workers": int_config(self.config(), "AI_FINDING_WORKERS", 2),
             "active": int(counts.get("processing", 0)),
-            "lease_seconds": int_config(self.config(), "AI_FINDING_LEASE_SECONDS", 300), "recent": recent}
+            "lease_seconds": int_config(self.config(), "AI_FINDING_LEASE_SECONDS", 300),
+            "watchdog": dict(self.finding_ai_watchdog_state), "recent": recent}
 
     def expire_stale_finding_jobs(self):
         lease = int_config(self.config(), "AI_FINDING_LEASE_SECONDS", 300)
@@ -3117,6 +3200,37 @@ class Automation:
                 "UPDATE finding_ai_jobs SET status='failed',updated=?,error=? WHERE status='processing' AND updated<?",
                 (time.time(), f"AI processing lease expired after {lease} seconds; retry is available", cutoff),
             ).rowcount
+        return changed
+
+    @staticmethod
+    def _sqlite_lock_error(error):
+        return isinstance(error, sqlite3.OperationalError) and "locked" in str(error).lower()
+
+    def _set_finding_ai_watchdog_state(self, status, error=None, changed=None):
+        now = time.time()
+        state = self.finding_ai_watchdog_state
+        state["status"] = status
+        state["last_run"] = now
+        if changed is not None:
+            state["last_success"] = now
+            state["last_changed"] = int(changed)
+            state["last_error"] = None
+        elif error:
+            state["last_error"] = self.clean_error(error)
+            if self._sqlite_lock_error(error):
+                state["lock_events"] = int(state.get("lock_events") or 0) + 1
+
+    def _finding_ai_watchdog_cycle(self):
+        """Run one watchdog pass without allowing a transient DB lock to kill it."""
+        try:
+            changed = self.expire_stale_finding_jobs()
+        except sqlite3.OperationalError as exc:
+            if not self._sqlite_lock_error(exc):
+                self._set_finding_ai_watchdog_state("error", exc)
+                raise
+            self._set_finding_ai_watchdog_state("degraded", exc)
+            return None
+        self._set_finding_ai_watchdog_state("ok", changed=changed)
         return changed
 
     def retry_finding_analysis_job(self, job_id):
@@ -3132,7 +3246,30 @@ class Automation:
             return {"status": "error", "error": "Stored AI job request is invalid"}
         return self.queue_finding_analysis(request, True)
 
-    def status(self, known_revision=None):
+    def status(self, known_revision=None, lightweight=False):
+        if lightweight:
+            try:
+                with self.read_db() as db:
+                    row = db.execute("SELECT id,created FROM reports ORDER BY id DESC LIMIT 1").fetchone()
+                    ai_version = int(db.execute(
+                        'SELECT COALESCE(MAX(id),0) FROM ai_runs WHERE report_id=?',
+                        (row[0] if row else 0,)).fetchone()[0] or 0)
+                revision = f'{row[0] if row else 0}:{ai_version}'
+                return {"running": self.running, "phase": self.phase, "error": self.error,
+                        "next_run": self.next_run, "revision": revision,
+                        "unchanged": known_revision == revision,
+                        "latest": None, "history": [], "deliveries": [],
+                        "status": "ok", "status_scope": "bounded_runtime_snapshot",
+                        "detail_available": False}
+            except (sqlite3.Error, OSError) as exc:
+                return {"running": self.running, "phase": self.phase, "error": self.error,
+                        "next_run": self.next_run, "revision": None,
+                        "unchanged": False, "latest": None, "history": [],
+                        "deliveries": [], "status": "degraded",
+                        "status_scope": "bounded_runtime_snapshot",
+                        "detail_available": False,
+                        "reason": "local status read unavailable",
+                        "error_detail": self.clean_error(exc)}
         with self.db() as db:
             row = db.execute("SELECT id,data FROM reports ORDER BY id DESC LIMIT 1").fetchone()
             ai_version = db.execute('SELECT COALESCE(MAX(id),0) FROM ai_runs WHERE report_id=?', (row[0] if row else 0,)).fetchone()[0]
@@ -3583,7 +3720,7 @@ class Automation:
             self._store_cve_observations(report, created, report["id"])
             # A successful report may opportunistically refresh external
             # sources. The scheduler also runs this independently of Wazuh.
-            self._refresh_external_collectors()
+            self._refresh_external_collectors_safely()
             self.next_external_refresh = time.time() + 60
             self.error = None
             if self.pipeline:
@@ -3704,16 +3841,146 @@ class Automation:
                         org_vulnerability = {"enabled": True, "status": "error", "reason": self.clean_error(exc)}
                         self.put("cyfirma_org_vulnerability:refresh", org_vulnerability,
                                  int_config(cfg, "SOC_PROVIDER_ERROR_BACKOFF_SECONDS", 14400))
-            with self.db() as db:
-                defender = defender_xdr.collect(db, cfg)
+            try:
+                with self.db() as db:
+                    defender = defender_xdr.collect(db, cfg)
+            except Exception as exc:
+                # A transient SQLite lock must not terminate the automation
+                # scheduler or be represented as zero observations.
+                defender = self._external_collector_error(cfg, exc)
             self.external_collectors = {"cyfirma_research": research, "cyfirma_taxii": taxii,
                                         "cyfirma_org_vulnerability": org_vulnerability, "defender_xdr": defender}
         finally:
             self.external_collector_lock.release()
 
+    def _external_collector_error(self, cfg, error):
+        locked = self._sqlite_lock_error(error)
+        return {
+            "enabled": cfg.get("DEFENDER_XDR_ENABLED") == "true",
+            "status": "degraded" if locked else "error",
+            "provider": cfg.get("DEFENDER_XDR_API_PROVIDER", "defender"),
+            "mode": cfg.get("DEFENDER_XDR_COLLECTION_MODE", "both"),
+            "reason": self.clean_error(error),
+            "retryable": locked,
+            "runtime_checked_at": now(),
+        }
+
+    def _refresh_external_collectors_safely(self):
+        """Keep one collector failure from terminating the scheduler thread."""
+        try:
+            self._refresh_external_collectors()
+        except Exception as exc:
+            self.external_collectors["defender_xdr"] = self._external_collector_error(self.config(), exc)
+
+    def _external_intelligence_status_lightweight(self) -> dict[str, Any]:
+        """Return a bounded durable snapshot for probes and status panels.
+
+        The full status method also builds research/Defender detail views. A
+        health check must not compete with the materializer for that work.
+        """
+        cfg = self.config()
+        try:
+            with self.read_db() as db:
+                observations = db.execute('''SELECT scope,COUNT(*),MAX(observed_at),
+                    MIN(valid_until),MAX(valid_until) FROM cyfirma_observations
+                    GROUP BY scope''').fetchall()
+                cursors = db.execute('''SELECT scope,next_offset,updated_at,status,detail
+                    FROM cyfirma_feed_cursor ORDER BY scope''').fetchall()
+                connectors = db.execute('''SELECT scope,next_value,updated_at,status,detail
+                    FROM cyfirma_connector_cursor ORDER BY scope''').fetchall()
+                research_count = int(db.execute(
+                    'SELECT COUNT(*) FROM cyfirma_research').fetchone()[0] or 0)
+                defender_count = int(db.execute(
+                    'SELECT COUNT(*) FROM defender_xdr_observations').fetchone()[0] or 0)
+        except (sqlite3.Error, OSError) as exc:
+            return {
+                'status': 'degraded', 'status_scope': 'bounded_runtime_snapshot',
+                'detail_available': False, 'reason': 'local intelligence status read unavailable',
+                'error_detail': self.clean_error(exc),
+                'cyfirma_feed': {'enabled': True, 'status': 'unavailable'},
+                'cyfirma_research': {'enabled': cfg.get('SOC_CYFIRMA_RESEARCH_ENABLED') == 'true',
+                                     'items': None, 'status': 'unavailable'},
+                'cyfirma_taxii': {'enabled': cfg.get('SOC_CYFIRMA_TAXII_ENABLED') == 'true',
+                                  'configured': bool(cfg.get('SOC_CYFIRMA_TAXII_COLLECTION_URL') and
+                                                     cfg.get('SOC_CYFIRMA_TAXII_BEARER_TOKEN')),
+                                  'status': 'unavailable'},
+                'cyfirma_org_vulnerability': {'enabled': cfg.get('SOC_CYFIRMA_ORG_VULN_ENABLED') == 'true',
+                                              'configured': bool(cfg.get('SOC_CYFIRMA_ORG_VULN_API_KEY')),
+                                              'status': 'unavailable'},
+                'defender_xdr': {'enabled': cfg.get('DEFENDER_XDR_ENABLED') == 'true',
+                                 'configured': bool(cfg.get('DEFENDER_XDR_TENANT_ID') and
+                                                    cfg.get('DEFENDER_XDR_CLIENT_ID') and
+                                                    cfg.get('DEFENDER_XDR_CLIENT_SECRET')),
+                                 'observations': None, 'status': 'unavailable'},
+            }
+
+        def parse_detail(raw):
+            try:
+                value = json.loads(raw or '{}')
+                return value if isinstance(value, dict) else {}
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return {}
+
+        def cursor_row(row):
+            scope, next_value, updated_at, status, detail = row
+            return {'scope': scope, 'next': str(next_value or ''), 'status': status,
+                    'updated_at': datetime.fromtimestamp(float(updated_at), timezone.utc).isoformat()
+                    if updated_at else None, 'detail': parse_detail(detail)}
+
+        observation_counts = {}
+        for scope, count, observed_at, earliest, latest in observations:
+            observation_counts[str(scope)] = {
+                'observations': int(count or 0),
+                'last_observed_at': datetime.fromtimestamp(float(observed_at), timezone.utc).isoformat()
+                if observed_at else None,
+                'earliest_valid_until': earliest, 'latest_valid_until': latest,
+            }
+        feed_cursors = []
+        for scope, next_offset, updated_at, status, detail in cursors:
+            feed_cursors.append({'scope': scope, 'next_offset': int(next_offset or 0),
+                                 'status': status, 'updated_at': datetime.fromtimestamp(float(updated_at), timezone.utc).isoformat()
+                                 if updated_at else None, 'detail': parse_detail(detail)})
+        connector_cursors = {str(row[0]): cursor_row(row) for row in connectors}
+
+        def state(cursor=None, count=0):
+            if cursor and cursor.get('status'):
+                return cursor['status']
+            return 'stored' if count else 'not_started'
+
+        taxii = observation_counts.get('taxii', {})
+        org = observation_counts.get('org_vulnerability', {})
+        taxii_cursor = connector_cursors.get('taxii')
+        org_cursor = connector_cursors.get('org_vulnerability')
+        return {
+            'status': 'ok', 'status_scope': 'bounded_runtime_snapshot',
+            'detail_available': False,
+            'cyfirma_feed': {'enabled': True, 'cursors': feed_cursors,
+                             'source': 'durable rotating STIX feed cursor'},
+            'cyfirma_research': {'enabled': cfg.get('SOC_CYFIRMA_RESEARCH_ENABLED') == 'true',
+                                 'items': research_count, 'status': 'stored' if research_count else 'not_started'},
+            'cyfirma_taxii': {'enabled': cfg.get('SOC_CYFIRMA_TAXII_ENABLED') == 'true',
+                              'configured': bool(cfg.get('SOC_CYFIRMA_TAXII_COLLECTION_URL') and
+                                                 cfg.get('SOC_CYFIRMA_TAXII_BEARER_TOKEN')),
+                              'status': state(taxii_cursor, taxii.get('observations', 0)),
+                              'cursor': taxii_cursor, **taxii},
+                'cyfirma_org_vulnerability': {'enabled': cfg.get('SOC_CYFIRMA_ORG_VULN_ENABLED') == 'true',
+                                              'configured': bool(cfg.get('SOC_CYFIRMA_ORG_VULN_API_KEY')),
+                                          'status': state(org_cursor, org.get('observations', 0)),
+                                          'cursor': org_cursor, **org},
+            'defender_xdr': {'enabled': cfg.get('DEFENDER_XDR_ENABLED') == 'true',
+                             'configured': bool(cfg.get('DEFENDER_XDR_TENANT_ID') and
+                                                cfg.get('DEFENDER_XDR_CLIENT_ID') and
+                                                cfg.get('DEFENDER_XDR_CLIENT_SECRET')),
+                             'observations': defender_count,
+                             'status': 'stored' if defender_count else 'not_started'},
+        }
+
     def external_intelligence_status(self, start: str | None = None,
-                                     end: str | None = None) -> dict[str, Any]:
+                                     end: str | None = None,
+                                     lightweight=False) -> dict[str, Any]:
         """Expose only local ledger/checkpoint status; this never calls a provider."""
+        if lightweight:
+            return self._external_intelligence_status_lightweight()
         cfg = self.config()
         now_utc = datetime.now(timezone.utc)
         with self.db() as db:
@@ -3795,6 +4062,7 @@ class Automation:
         taxii_runtime = self.external_collectors.get("cyfirma_taxii") or self.cached("cyfirma_taxii:refresh") or {}
         org_vulnerability_runtime = (self.external_collectors.get("cyfirma_org_vulnerability")
                                      or self.cached("cyfirma_org_vulnerability:refresh") or {})
+        defender_runtime = self.external_collectors.get("defender_xdr") or {}
 
         def status(runtime, cursor=None, observations=0):
             value = runtime.get("status") if isinstance(runtime, dict) else None
@@ -3808,6 +4076,16 @@ class Automation:
         org_cursor = connector_cursors.get("org_vulnerability")
         taxii_observations = observation_counts.get("taxii", {})
         org_observations = observation_counts.get("org_vulnerability", {})
+        if defender_runtime.get("status") in {"degraded", "error"}:
+            # Durable Defender observations remain readable, while the latest
+            # scheduler write failure stays visible instead of being hidden by
+            # the previous checkpoint status.
+            defender["runtime_status"] = defender_runtime.get("status")
+            defender["runtime_reason"] = defender_runtime.get("reason")
+            defender["runtime_checked_at"] = defender_runtime.get("runtime_checked_at")
+            defender["status"] = defender_runtime.get("status")
+            defender["reason"] = defender_runtime.get("reason")
+            defender["retryable"] = bool(defender_runtime.get("retryable"))
         return {
             "cyfirma_feed": {"enabled": True, "cursors": feed_cursors,
                               "source": "durable rotating STIX feed cursor"},
@@ -4164,7 +4442,14 @@ class Automation:
 
     def finding_ai_watchdog_loop(self):
         while not self.stop.wait(15):
-            self.expire_stale_finding_jobs()
+            try:
+                self._finding_ai_watchdog_cycle()
+            except sqlite3.OperationalError:
+                # Non-lock SQLite errors are recorded above and should not
+                # silently terminate this background health monitor either.
+                continue
+            except Exception as exc:
+                self._set_finding_ai_watchdog_state("error", exc)
 
     def delivery_loop(self):
         while not self.stop.wait(30):
@@ -4185,7 +4470,7 @@ class Automation:
             if current >= self.next_external_refresh:
                 # The method's non-blocking lock plus per-collector cache,
                 # interval and error backoff keep this independent loop cheap.
-                self._refresh_external_collectors()
+                self._refresh_external_collectors_safely()
                 self.next_external_refresh = current + 60
             if self.config().get("SOC_AUTO_ENRICH") == "true" and current >= self.next_run:
                 self.trigger()

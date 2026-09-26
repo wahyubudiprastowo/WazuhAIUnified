@@ -159,12 +159,24 @@
   }
 
   function renderList() {
+    if (!f.data) {
+      const failed = Boolean(f.overviewError);
+      const message = failed ? t(`Overview tidak tersedia: ${f.overviewError}. Tekan Refresh untuk mencoba lagi.`, `Overview unavailable: ${f.overviewError}. Press Refresh to retry.`)
+        : t("Memuat temuan untuk rentang terpilih...", "Loading findings for the selected range...");
+      q("#findingsCount").textContent = failed ? t("Temuan tidak tersedia", "Findings unavailable") : t("Memuat temuan", "Loading findings");
+      q("#findingsScope").textContent = message;
+      q("#findingsSummary").innerHTML = "";
+      q("#findingsCategories").innerHTML = "";
+      q("#findingsPagination").innerHTML = "";
+      for (const id of ["findingsRows", "findingDetail"]) q(`#${id}`).innerHTML = `<div class="findingEmpty" role="${failed ? "alert" : "status"}">${esc(message)}</div>`;
+      return;
+    }
     const rows = filtered(), pageSize = 12;
     f.page = Math.min(f.page, Math.max(0, Math.ceil(rows.length / pageSize) - 1));
     const d = f.data || {};
     const alertCount = f.coverage?.total_events ?? (d.alerts?.status === "available" ? d.alerts?.total_alerts : null);
     const ruleCount = f.coverage?.rules?.length || d.threats?.length || 0;
-    const scope = f.coverageStatus === "ready"
+    const coverageScope = f.coverageStatus === "ready"
       ? (f.coverage?.coverage_warning || (f.coverage?.rules?.length
           ? t(`${f.coverage.rules.length} rule unik dimuat; kandidat agregasi dibatasi`, `${f.coverage.rules.length} unique rules loaded; aggregation candidates are bounded`)
           : t(`Agregasi tidak mengembalikan rule; memakai ${ruleCount} rule overview terbatas`, `Aggregation returned no rules; using ${ruleCount} bounded overview rules`)))
@@ -179,7 +191,11 @@
             : d.alerts?.status === "unavailable"
               ? t("Sumber alert tidak tersedia; periksa status koneksi dan errors", "Alert source unavailable; check connection status and errors")
               : t(`${ruleCount} rule pada overview terbatas; bukan seluruh alert`, `${ruleCount} rules in bounded overview; not the full alert set`);
+    const scope = f.overviewError
+      ? t(`Refresh gagal: ${f.overviewError}. Menampilkan snapshot terakhir untuk rentang ini.`, `Refresh failed: ${f.overviewError}. Showing the last available snapshot for this range.`)
+      : coverageScope;
     q("#findingsScope").textContent = scope;
+    q("#findingsScope").setAttribute("role", f.overviewError ? "alert" : "status");
     q("#findingsSummary").innerHTML = [
       [t("Alert pada window terpilih", "Alerts in selected window"), alertCount == null ? "-" : fmt.format(alertCount), f.coverage ? t(`${ruleCount} rule dimuat dari agregasi indeks`, `${ruleCount} rules loaded from index aggregation`) : scope],
       [t("Record prioritas tinggi", "High-priority records"), f.rows.filter(r => r.evidence !== "intel" && ["high", "critical"].includes(r.severity)).length, t("Dari temuan yang dimuat", "From the loaded findings")],
@@ -711,8 +727,22 @@
   for (const id of ["findingSearch", "findingEvidence", "findingSeverity"]) q(`#${id}`).addEventListener(id === "findingSearch" ? "input" : "change", () => { f.page = 0; renderList(); });
   q("#findingAiOperationsRefresh")?.addEventListener("click", loadAiOperations);
   const findingsActive = () => q("#findingsView")?.classList.contains("active");
+  function receiveOverviewStatus(detail) {
+    if (!detail || detail.windowKey !== routeWindowKey()) return;
+    if (f.windowKey !== detail.windowKey) {
+      f.windowKey = detail.windowKey;
+      f.data = null; f.rows = []; f.selected = null; f.coverage = null;
+      f.sequence++;
+      f.pivots.clear(); f.cache.clear();
+    }
+    f.overviewError = detail.status === "error" ? detail.error : "";
+    renderList();
+  }
   function receiveOverview(data) {
     if (!data) return;
+    if (state.overviewWindow !== routeWindowKey()) return;
+    f.windowKey = state.overviewWindow;
+    f.overviewError = state.overviewLoad?.status === "error" ? state.overviewLoad.error : "";
     f.data = data;
     f.coverage = null;
     f.coverageStatus = state.view === "findings" ? "loading" : "idle";
@@ -727,6 +757,7 @@
     }
   }
   document.addEventListener("soc:overview", e => receiveOverview(e.detail));
+  document.addEventListener("soc:overview-status", e => receiveOverviewStatus(e.detail));
   document.addEventListener("soc:view", event => {
     if (event.detail.view !== "findings") return;
     f.coverageStatus = f.coverage ? "ready" : "loading";
@@ -778,5 +809,6 @@
   });
   // The initial overview request may finish before this script registers listeners.
   if (state.overview) receiveOverview(state.overview);
+  receiveOverviewStatus(state.overviewLoad);
   window.SocFindings.ready = true;
 })();

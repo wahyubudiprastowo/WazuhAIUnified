@@ -146,3 +146,118 @@ def summary(dimensions: dict[str, Any] | None, cloud_total: int = 0,
         "sources": rows,
         "note": "Ready requires decoded telemetry, every contract field, current freshness and healthy materialization. Event volume alone never means ready.",
     }
+
+
+def inventory_evidence(
+    dimensions: dict[str, Any] | None,
+    contract: dict[str, Any] | None,
+    *,
+    indexed_events: int | None = None,
+    bounded_samples: dict[str, int] | None = None,
+    unmatched_decoder_events: int | None = None,
+    trace_records: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Expose the measured G01 inventory without inventing unavailable fields.
+
+    Rollups retain counts and ``last_seen`` values, not raw event provenance or
+    parser versions.  The response therefore labels those dimensions as
+    unavailable instead of treating a missing value as complete coverage.
+    """
+    dimensions = dimensions or {}
+    contract = contract or {}
+
+    def rows(name: str) -> list[dict[str, Any]]:
+        value = dimensions.get(name)
+        return [row for row in value if isinstance(row, dict)] if isinstance(value, list) else []
+
+    source_matrix = []
+    for source in contract.get("sources") or []:
+        source_matrix.append({
+            "source": source.get("key"),
+            "label": source.get("label"),
+            "status": source.get("status"),
+            "observed_events": source.get("observed_events"),
+            "last_seen": source.get("last_seen"),
+            "age_seconds": source.get("age_seconds"),
+            "available_fields": source.get("available_fields") or [],
+            "missing_fields": source.get("missing_fields") or [],
+            "undercovered_fields": source.get("undercovered_fields") or [],
+            "field_coverage": source.get("field_coverage") or {},
+            "status_reason": source.get("status_reason"),
+        })
+
+    subtype_dimensions = {}
+    for name in ("forti_type", "forti_subtype", "forti_profile", "detection_family"):
+        subtype_dimensions[name] = [
+            {
+                "value": row.get("value"),
+                "count": int(row.get("count") or 0),
+                "last_seen": row.get("last_seen"),
+                "max_level": int(row.get("max_level") or 0),
+            }
+            for row in rows(name)
+            if row.get("value") not in (None, "")
+        ]
+
+    index_to_ui_trace = []
+    for record in trace_records or []:
+        if not isinstance(record, dict) or not record.get("event_id"):
+            continue
+        index_to_ui_trace.append({
+            "event_id": str(record.get("event_id"))[:160],
+            "index": str(record.get("index") or "")[:160] or None,
+            "event_time": record.get("timestamp"),
+            "rule_id": record.get("rule_id"),
+            "decoder": record.get("decoder"),
+            "agent": record.get("agent"),
+            "source_ip": record.get("source_ip"),
+            "destination_ip": record.get("destination_ip"),
+            "trace_scope": "Wazuh Indexer bounded sample -> dashboard payload",
+        })
+
+    return {
+        "status": "measured",
+        "scope": "selected alert window and durable rollup dimensions",
+        "indexed_events": indexed_events,
+        "source_matrix": source_matrix,
+        "subtype_dimensions": subtype_dimensions,
+        "bounded_samples": dict(bounded_samples or {}),
+        "index_to_ui_trace": {
+            "status": "measured" if index_to_ui_trace else "not_observed",
+            "records": index_to_ui_trace[:20],
+            "sample_limit": 20,
+            "scope": "L1 records with rule.level >= 7 from the selected window",
+            "not_proven": ["upstream syslog/archive ingress", "decoder processing before Indexer"],
+        },
+        "timestamp": {
+            "status": "rollup_last_seen_only",
+            "event_time_available": False,
+            "reason": "The current rollup stores last_seen per dimension; an individual event timestamp is available only in bounded live samples.",
+        },
+        "parser_version": {
+            "status": "not_observed",
+            "value": None,
+            "reason": "Parser/decoder version is not persisted in the current Wazuh alert projection or detection rollup.",
+        },
+        "received_vs_indexed": {
+            "status": "unavailable",
+            "received": None,
+            "indexed": indexed_events,
+            "reason": "The current contract has no durable upstream received counter for this window.",
+        },
+        "late_events": {
+            "status": "unavailable",
+            "count": None,
+            "reason": "Event ingest time and late-arrival classification are not persisted in the current projection.",
+        },
+        "unmatched_decoder": {
+            "status": "measured" if unmatched_decoder_events is not None else "unavailable",
+            "count": unmatched_decoder_events,
+            "basis": "decoder.name absent in the bounded alert aggregation" if unmatched_decoder_events is not None else None,
+        },
+        "limitations": [
+            "Source status is window-scoped and does not prove historical absence.",
+            "Subtype counts are rollup dimensions, not a raw-event trace or attack confirmation.",
+            "Parser version, upstream received count, and late-event count require an additive ingestion contract.",
+        ],
+    }

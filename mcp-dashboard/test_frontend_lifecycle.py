@@ -72,8 +72,8 @@ class FrontendLifecycleTests(unittest.TestCase):
         html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
         self.assertIn("if (state.overview) receiveOverview(state.overview);", findings)
         self.assertIn("if (state.overview && coverageEnabled(state.view)) setTimeout(loadCoverage, 0);", workspace)
-        self.assertIn("findings.js?v=20260925-3", html)
-        self.assertIn("analysis-workspace.js?v=20260925-2", html)
+        self.assertIn("findings.js?v=20260925-4", html)
+        self.assertIn("analysis-workspace.js?v=20260925-3", html)
 
     def test_findings_renderer_surfaces_bad_payload_instead_of_sticking_on_loading(self):
         findings = (ROOT / "static" / "findings.js").read_text(encoding="utf-8")
@@ -84,8 +84,8 @@ class FrontendLifecycleTests(unittest.TestCase):
         self.assertIn("Security Findings module failed", app)
         self.assertIn("Unable to load ${scriptUrl}", app)
         self.assertIn('findings: "Security Findings"', app)
-        self.assertIn("app.js?v=20260925-7", html)
-        self.assertIn("findings.js?v=20260925-3", html)
+        self.assertIn("app.js?v=20260926-25", html)
+        self.assertIn("findings.js?v=20260925-4", html)
 
     def test_findings_fall_back_to_available_overview_and_show_coverage_state(self):
         findings = (ROOT / "static" / "findings.js").read_text(encoding="utf-8")
@@ -102,7 +102,7 @@ class FrontendLifecycleTests(unittest.TestCase):
         self.assertIn('"l1": {"status": l1_detail_status, "message": l1_detail_message}', server)
         self.assertIn('correlation_groups', (ROOT / "static" / "app.js").read_text(encoding="utf-8"))
         self.assertIn("Candidates are not confirmed incidents or attack paths", (ROOT / "static" / "app.js").read_text(encoding="utf-8"))
-        self.assertIn('DASHBOARD_BUILD_ID = "2026-09-25-patch10"', server)
+        self.assertIn('DASHBOARD_BUILD_ID = "2026-09-26-patch25"', server)
 
     def test_workflow_runner_is_centralized_in_tool_console(self):
         source = (ROOT / "static" / "workflows.js").read_text(encoding="utf-8")
@@ -209,9 +209,20 @@ class FrontendLifecycleTests(unittest.TestCase):
         server = (ROOT / "server.py").read_text(encoding="utf-8")
         deploy_check = (ROOT.parent / "tools" / "check_dashboard_deploy.sh").read_text(encoding="utf-8")
         self.assertIn('build ${overview.build_id || "unknown"}', source)
-        self.assertIn('DASHBOARD_BUILD_ID = "2026-09-25-patch10"', server)
+        self.assertIn('DASHBOARD_BUILD_ID = "2026-09-26-patch25"', server)
         self.assertIn("Shared dashboard/materializer code parity", deploy_check)
         self.assertIn("mcp-dashboard mcp-materializer", deploy_check)
+
+    def test_cached_overview_keeps_snapshot_provenance_and_stamps_service_build(self):
+        server = (ROOT / "server.py").read_text(encoding="utf-8")
+        self.assertIn("def _stamp_overview_service_identity", server)
+        self.assertIn('data.setdefault("snapshot_build_id", snapshot_build)', server)
+        self.assertIn('data["service_build_id"] = DASHBOARD_BUILD_ID', server)
+
+    def test_runtime_smoke_waits_for_the_requested_range_after_hash_navigation(self):
+        source = (ROOT / "check_findings_ui.py").read_text(encoding="utf-8")
+        self.assertIn("state.overview?.window?.range === expected", source)
+        self.assertIn("state.overviewLoad?.windowKey === JSON.stringify(currentWindowPayload())", source)
 
 
 if __name__ == "__main__":

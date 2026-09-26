@@ -6,3 +6,4 @@ dashboard.env
 __pycache__
 *.pyc
 .pytest_cache
+artifacts/

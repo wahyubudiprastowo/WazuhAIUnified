@@ -1,5 +1,6 @@
 """Restartable alert-window discovery and persistent, deduplicated IOC backlog."""
 import ipaddress
+import sqlite3
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -283,14 +284,6 @@ class Pipeline:
                 event_count INTEGER NOT NULL DEFAULT 0, completed_at REAL NOT NULL,
                 batch_key TEXT NOT NULL)''')
             db.execute('CREATE INDEX IF NOT EXISTS rollup_windows_time ON rollup_windows(bucket_epoch)')
-            # Existing installations already have useful rollups. Seed their completion
-            # ledger once so an upgrade does not report every historical bucket as a gap.
-            db.execute('''INSERT OR IGNORE INTO rollup_windows
-                (bucket_epoch,bucket,source,event_count,completed_at,batch_key)
-                SELECT CAST(strftime('%s',bucket) AS INTEGER),bucket,'legacy',count,?,
-                       'legacy:' || bucket
-                FROM detection_rollups
-                WHERE dimension='total' AND strftime('%s',bucket) IS NOT NULL''', (time.time(),))
             db.execute('''CREATE TABLE IF NOT EXISTS rollup_backfill_state (
                 id INTEGER PRIMARY KEY, cursor TEXT, target TEXT, completed INTEGER DEFAULT 0,
                 chunks INTEGER DEFAULT 0, events INTEGER DEFAULT 0, last_run REAL,
@@ -315,7 +308,100 @@ class Pipeline:
                 last_duration_ms INTEGER DEFAULT 0, last_query_took_ms INTEGER DEFAULT 0,
                 error TEXT, next_run REAL DEFAULT 0)''')
 
-    def status(self):
+        # Existing installations already have useful rollups. This idempotent
+        # ledger seed is deliberately isolated from schema setup so a dashboard
+        # probe can retry it while the materializer holds a rollup write lock.
+        self._seed_rollup_windows_with_retry()
+
+    def _seed_rollup_windows_with_retry(self):
+        statement = '''INSERT OR IGNORE INTO rollup_windows
+            (bucket_epoch,bucket,source,event_count,completed_at,batch_key)
+            SELECT CAST(strftime('%s',bucket) AS INTEGER),bucket,'legacy',count,?,
+                   'legacy:' || bucket
+            FROM detection_rollups
+            WHERE dimension='total' AND strftime('%s',bucket) IS NOT NULL'''
+        for attempt in range(5):
+            try:
+                with self.automation.db() as db:
+                    if db.execute('SELECT 1 FROM rollup_windows LIMIT 1').fetchone():
+                        return
+                    if not db.execute("SELECT 1 FROM detection_rollups WHERE dimension='total' LIMIT 1").fetchone():
+                        return
+                    db.execute(statement, (time.time(),))
+                return
+            except sqlite3.OperationalError as exc:
+                if 'locked' not in str(exc).lower() or attempt == 4:
+                    raise
+                time.sleep(0.25 * (2 ** attempt))
+
+    def status(self, lightweight=False):
+        if lightweight:
+            try:
+                with self.automation.read_db() as db:
+                    row = db.execute('''SELECT start,checkpoint,scanned,live_checkpoint,
+                        checkpoint_scanned,replay_scanned FROM stream_state WHERE id=1''').fetchone()
+                    total, pending = db.execute(
+                        'SELECT COUNT(*),COALESCE(SUM(next_attempt<=?),0) FROM ioc_queue',
+                        (time.time(),)).fetchone()
+                    rollup = db.execute("""SELECT MIN(bucket),MAX(bucket),COUNT(*),
+                        COALESCE(SUM(count),0) FROM detection_rollups
+                        WHERE dimension='total'""").fetchone()
+                    backfill = db.execute('''SELECT cursor,target,completed,chunks,events,
+                        error,next_run FROM rollup_backfill_state WHERE id=1''').fetchone()
+                checkpoint = row[1] if row else None
+                lag_seconds = None
+                if checkpoint:
+                    try:
+                        lag_seconds = max(0, int(time.time() -
+                            datetime.fromisoformat(checkpoint).timestamp()))
+                    except (TypeError, ValueError):
+                        pass
+                caught_up = lag_seconds is not None and lag_seconds <= 15 * 60
+                return {
+                    'enabled': self.automation.config().get('SOC_STREAM_ENABLED') == 'true',
+                    'active': self.active, 'error': self.error,
+                    'started_at': row[0] if row else None, 'checkpoint': checkpoint,
+                    'checkpoint_events_scanned': row[4] if row else 0,
+                    'live_replay_events_scanned': row[5] if row else 0,
+                    'live_through': row[3] if row else None,
+                    'lag_seconds': lag_seconds, 'caught_up': caught_up,
+                    'scan_status': 'caught_up' if caught_up else ('scanning' if self.active else 'behind'),
+                    'unique_scan_counter': 'checkpoint_events_scanned',
+                    'replay_counter_note': 'Replay overlaps the checkpoint stream and must not be added to unique event totals.',
+                    'historical_scope_complete': bool(backfill[2]) if backfill else False,
+                    'raw_archives_scanned': False,
+                    'rollup': {
+                        'enabled': self.automation.config().get('SOC_ROLLUP_ENABLED', 'true') == 'true',
+                        'first_bucket': rollup[0] if rollup else None,
+                        'last_bucket': rollup[1] if rollup else None,
+                        'buckets': int(rollup[2] or 0) if rollup else 0,
+                        'events': int(rollup[3] or 0) if rollup else 0,
+                        'backfill': {
+                            'cursor': backfill[0] if backfill else None,
+                            'target': backfill[1] if backfill else None,
+                            'complete': bool(backfill[2]) if backfill else False,
+                            'chunks': int(backfill[3] or 0) if backfill else 0,
+                            'events': int(backfill[4] or 0) if backfill else 0,
+                            'error': backfill[5] if backfill else None,
+                            'next_run': backfill[6] if backfill else None,
+                        },
+                    },
+                    'entity_graph': {'status': 'not_checked',
+                                     'detail': 'Detailed entity graph status omitted from bounded health read.'},
+                    'queued_indicators': int(total or 0), 'due_indicators': int(pending or 0),
+                    'scope': 'wazuh-alerts-* only; bounded health snapshot',
+                    'status': 'ok', 'status_scope': 'bounded_runtime_snapshot',
+                    'detail_available': False,
+                }
+            except (sqlite3.Error, OSError) as exc:
+                return {
+                    'enabled': self.automation.config().get('SOC_STREAM_ENABLED') == 'true',
+                    'active': self.active, 'error': self.error,
+                    'scan_status': 'unavailable', 'status': 'degraded',
+                    'status_scope': 'bounded_runtime_snapshot', 'detail_available': False,
+                    'reason': 'local pipeline status read unavailable',
+                    'error_detail': str(exc)[:240],
+                }
         with self.automation.db() as db:
             row = db.execute('SELECT start,checkpoint,scanned,live_checkpoint,checkpoint_scanned,replay_scanned FROM stream_state WHERE id=1').fetchone()
             total, pending = db.execute('SELECT COUNT(*),COALESCE(SUM(next_attempt<=?),0) FROM ioc_queue', (time.time(),)).fetchone()

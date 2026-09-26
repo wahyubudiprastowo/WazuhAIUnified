@@ -1,8 +1,10 @@
 import tempfile
 import time
 import unittest
+import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 from datetime import datetime, timezone, timedelta
 import soc_automation as soc
 from soc_pipeline import Pipeline, bounds, history, observables
@@ -18,6 +20,25 @@ class PipelineTests(unittest.TestCase):
         self.request=Mock()
         self.pipeline=Pipeline(self.worker,self.request)
         self.event={'@timestamp':datetime.now(timezone.utc).isoformat(),'rule':{'level':12},'data':{'srcip':'1.1.1.1','url':'/'}}
+
+    def test_rollup_seed_retries_transient_database_lock(self):
+        connection = Mock()
+        connection.execute.side_effect = [sqlite3.OperationalError('database is locked'), Mock()]
+
+        @contextmanager
+        def locked_db():
+            yield connection
+
+        with patch.object(self.worker, 'db', side_effect=[locked_db(), locked_db()]):
+            self.pipeline._seed_rollup_windows_with_retry()
+        self.assertEqual(connection.execute.call_count, 2)
+
+    def test_lightweight_status_is_explicitly_bounded(self):
+        status = self.pipeline.status(lightweight=True)
+        self.assertEqual(status["status"], "ok")
+        self.assertEqual(status["status_scope"], "bounded_runtime_snapshot")
+        self.assertFalse(status["detail_available"])
+        self.assertEqual(status["entity_graph"]["status"], "not_checked")
 
     def test_failed_window_replays_without_duplicate_indicators(self):
         first={'_scroll_id':'cursor','hits':{'hits':[{'_source':self.event}]}}

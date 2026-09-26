@@ -126,8 +126,8 @@ echo '== Retained collector and rollup state =='
 import json
 import server
 
-external = server.automation.external_intelligence_status()
-pipeline = server.pipeline.status()
+external = server.automation.external_intelligence_status(lightweight=True)
+pipeline = server.pipeline.status(lightweight=True)
 def collector_state(payload):
     if not isinstance(payload, dict):
         return {}
