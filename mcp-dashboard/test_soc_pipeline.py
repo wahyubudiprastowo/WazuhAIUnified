@@ -39,6 +39,23 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(status["status_scope"], "bounded_runtime_snapshot")
         self.assertFalse(status["detail_available"])
         self.assertEqual(status["entity_graph"]["status"], "not_checked")
+        self.assertEqual(status["last_scan"]["status"], "not_observed")
+
+    def test_lightweight_status_surfaces_last_scan_metrics_and_error(self):
+        self.request.side_effect = [{'took': 7, '_scroll_id': 'cursor',
+                                     'hits': {'hits': [{'_source': self.event}]}},
+                                    {'_scroll_id': 'cursor', 'hits': {'hits': []}}, {}]
+        self.assertTrue(self.pipeline.scan_window())
+        status = self.pipeline.status(lightweight=True)
+        self.assertEqual(status['status'], 'ok')
+        self.assertEqual(status['last_scan']['status'], 'measured')
+        self.assertEqual(status['last_scan']['query_took_ms'], 7)
+        self.assertEqual(status['last_scan']['events'], 1)
+        self.assertEqual(status['last_scan']['committed_events'], 1)
+        self.pipeline.error = 'bounded test error'
+        degraded = self.pipeline.status(lightweight=True)
+        self.assertEqual(degraded['status'], 'degraded')
+        self.assertEqual(degraded['error_scope'], 'last_scan_cycle')
 
     def test_failed_window_replays_without_duplicate_indicators(self):
         first={'_scroll_id':'cursor','hits':{'hits':[{'_source':self.event}]}}

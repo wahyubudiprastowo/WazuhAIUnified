@@ -633,6 +633,36 @@ Next allowed task: selesaikan gap G01 atau siapkan kontrak G02 hanya setelah
 gap tersebut memiliki keputusan berbukti, bukan menambah panel atau detector
 tanpa source evidence. Runtime ini stabil.
 
+#### Follow-up G01: bounded pipeline window metrics, patch28, 2026-09-26 UTC
+
+- [x] Menambahkan migrasi additive pada `stream_state` untuk menyimpan waktu
+  commit window terakhir, durasi scan, `took` query Indexer pertama, jumlah
+  event yang dibaca, jumlah event yang dihitung untuk counter checkpoint/replay,
+  dan jenis stream (`checkpoint` atau `replay`). Database lama tetap kompatibel;
+  tidak ada reset checkpoint, penghapusan data, atau tabel worker kedua.
+- [x] Metrik ditulis di transaksi yang sama setelah update checkpoint berhasil.
+  Window stale, duplicate, atau transaksi rollback tidak dapat meninggalkan
+  metrik commit palsu. Status `last_scan` memakai `not_observed` sebelum window
+  berhasil dan `measured` sesudahnya.
+- [x] `Pipeline.status()` dan bounded health status sekarang menampilkan
+  `last_scan` serta mengembalikan `status=degraded` dan
+  `error_scope=last_scan_cycle` bila siklus pipeline terakhir menyimpan error.
+  Nilai ini tidak mengubah `scan_status`, counter historis, atau scope input.
+- [x] Scope tetap eksplisit: worker membaca `wazuh-alerts-*`; metrik bukan
+  denominator seluruh syslog, bukan bukti parser version, dan bukan bukti
+  received-vs-indexed atau late-event completeness.
+- [x] Regression test baru membuktikan metrik query/event/commit dan semantik
+  degraded. Test pipeline: **19 tests, OK**. Full discovery:
+  **267 tests, OK (10 skipped)**; `py_compile` dan `git diff --check` lulus.
+- [ ] Patch28 belum dideploy pada runtime produksi dari sesi ini. Setelah
+  deployment, polling `/api/pipeline/status` harus membuktikan `last_scan.status`
+  `measured`, stream, durasi, query time, serta status/error konsisten pada dua
+  pengamatan. Docker socket sesi ini sebelumnya ditolak, jadi parity image dan
+  live values belum boleh diklaim.
+- [ ] G01 tetap belum accepted: parser version, received-vs-indexed denominator,
+  late-event counter, disk/RSS/lock baseline, trace ingress-to-UI, dan raw
+  syslog/archive handoff masih pending.
+
 Rollback terarah (hanya bila regresi; belum dieksekusi):
 
 ```bash
@@ -1128,8 +1158,8 @@ Catatan validasi terakhir dari direktori `mcp-dashboard`:
 python3 -m unittest test_detection_improvements test_entity_resolver test_soc_pipeline test_cve_exposure test_frontend_lifecycle
 ```
 
-Hasil baseline: **96 tests, OK**. Setelah patch27, full discovery menghasilkan
-**266 tests, OK (10 skipped)**. Browser smoke runtime patch20 terakhir lulus pada
+Hasil baseline: **96 tests, OK**. Setelah patch28, full discovery menghasilkan
+**267 tests, OK (10 skipped)**. Browser smoke runtime patch20 terakhir lulus pada
 empat rentang. Tes ini memakai fixture/mock/temp DB dan static checks;
 runtime smoke terautentikasi patch23 mencakup API 24h dan deploy check. Semua hasil tersebut
 tidak membuktikan API provider live, seluruh tool, load 3M/hari atau seluruh

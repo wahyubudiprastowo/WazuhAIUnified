@@ -260,6 +260,17 @@ class Pipeline:
                 db.execute('ALTER TABLE stream_state ADD COLUMN checkpoint_scanned INTEGER DEFAULT 0')
             if 'replay_scanned' not in columns:
                 db.execute('ALTER TABLE stream_state ADD COLUMN replay_scanned INTEGER DEFAULT 0')
+            columns = {r[1] for r in db.execute('PRAGMA table_info(stream_state)')}
+            for name, definition in (
+                ('last_scan_at', 'REAL'),
+                ('last_scan_duration_ms', 'INTEGER DEFAULT 0'),
+                ('last_scan_query_took_ms', 'INTEGER DEFAULT 0'),
+                ('last_scan_events', 'INTEGER DEFAULT 0'),
+                ('last_scan_committed_events', 'INTEGER DEFAULT 0'),
+                ('last_scan_stream', 'TEXT'),
+            ):
+                if name not in columns:
+                    db.execute(f'ALTER TABLE stream_state ADD COLUMN {name} {definition}')
             db.execute('CREATE TABLE IF NOT EXISTS ioc_queue (kind TEXT, indicator TEXT, first_seen TEXT, last_seen TEXT, level INTEGER, next_attempt REAL DEFAULT 0, attempts INTEGER DEFAULT 0, PRIMARY KEY(kind,indicator))')
             if 'count' not in {r[1] for r in db.execute('PRAGMA table_info(ioc_queue)')}:
                 db.execute('ALTER TABLE ioc_queue ADD COLUMN count INTEGER DEFAULT 0')
@@ -339,7 +350,9 @@ class Pipeline:
             try:
                 with self.automation.read_db() as db:
                     row = db.execute('''SELECT start,checkpoint,scanned,live_checkpoint,
-                        checkpoint_scanned,replay_scanned FROM stream_state WHERE id=1''').fetchone()
+                        checkpoint_scanned,replay_scanned,last_scan_at,last_scan_duration_ms,
+                        last_scan_query_took_ms,last_scan_events,last_scan_committed_events,
+                        last_scan_stream FROM stream_state WHERE id=1''').fetchone()
                     total, pending = db.execute(
                         'SELECT COUNT(*),COALESCE(SUM(next_attempt<=?),0) FROM ioc_queue',
                         (time.time(),)).fetchone()
@@ -357,6 +370,7 @@ class Pipeline:
                     except (TypeError, ValueError):
                         pass
                 caught_up = lag_seconds is not None and lag_seconds <= 15 * 60
+                last_scan = self._scan_status(row)
                 return {
                     'enabled': self.automation.config().get('SOC_STREAM_ENABLED') == 'true',
                     'active': self.active, 'error': self.error,
@@ -368,6 +382,7 @@ class Pipeline:
                     'scan_status': 'caught_up' if caught_up else ('scanning' if self.active else 'behind'),
                     'unique_scan_counter': 'checkpoint_events_scanned',
                     'replay_counter_note': 'Replay overlaps the checkpoint stream and must not be added to unique event totals.',
+                    'last_scan': last_scan,
                     'historical_scope_complete': bool(backfill[2]) if backfill else False,
                     'raw_archives_scanned': False,
                     'rollup': {
@@ -390,7 +405,9 @@ class Pipeline:
                                      'detail': 'Detailed entity graph status omitted from bounded health read.'},
                     'queued_indicators': int(total or 0), 'due_indicators': int(pending or 0),
                     'scope': 'wazuh-alerts-* only; bounded health snapshot',
-                    'status': 'ok', 'status_scope': 'bounded_runtime_snapshot',
+                    'status': 'degraded' if self.error else 'ok',
+                    'error_scope': 'last_scan_cycle' if self.error else None,
+                    'status_scope': 'bounded_runtime_snapshot',
                     'detail_available': False,
                 }
             except (sqlite3.Error, OSError) as exc:
@@ -403,7 +420,10 @@ class Pipeline:
                     'error_detail': str(exc)[:240],
                 }
         with self.automation.db() as db:
-            row = db.execute('SELECT start,checkpoint,scanned,live_checkpoint,checkpoint_scanned,replay_scanned FROM stream_state WHERE id=1').fetchone()
+            row = db.execute('''SELECT start,checkpoint,scanned,live_checkpoint,checkpoint_scanned,
+                replay_scanned,last_scan_at,last_scan_duration_ms,last_scan_query_took_ms,
+                last_scan_events,last_scan_committed_events,last_scan_stream
+                FROM stream_state WHERE id=1''').fetchone()
             total, pending = db.execute('SELECT COUNT(*),COALESCE(SUM(next_attempt<=?),0) FROM ioc_queue', (time.time(),)).fetchone()
             rollup = db.execute("SELECT MIN(bucket),MAX(bucket),COUNT(*),COALESCE(SUM(count),0) FROM detection_rollups WHERE dimension='total'").fetchone()
             backfill = db.execute('''SELECT cursor,target,completed,chunks,events,last_run,
@@ -424,6 +444,7 @@ class Pipeline:
             except (TypeError, ValueError):
                 pass
         caught_up = lag_seconds is not None and lag_seconds <= 15 * 60
+        last_scan = self._scan_status(row)
         gaps = self.rollup_gaps()
         effective_chunk = int(backfill[9] or 0) if backfill else 0
         interval = int(self.automation.config().get('SOC_ROLLUP_BACKFILL_MIN_INTERVAL_SECONDS', 30))
@@ -470,6 +491,9 @@ class Pipeline:
                 'scan_status': 'caught_up' if caught_up else ('scanning' if self.active else 'behind'),
                 'unique_scan_counter': 'checkpoint_events_scanned',
                 'replay_counter_note': 'Replay overlaps the checkpoint stream and must not be added to unique event totals.',
+                'last_scan': last_scan,
+                'status': 'degraded' if self.error else 'ok',
+                'error_scope': 'last_scan_cycle' if self.error else None,
                 'historical_scope_complete': backfill_status['complete'],
                 'historical_scope_note': ('Configured historical rollup backfill is complete.' if backfill_status['complete']
                                           else 'Live discovery is current; throttled historical rollup backfill progresses only while caught up.'),
@@ -905,8 +929,20 @@ class Pipeline:
             db.execute('UPDATE ioc_queue SET next_attempt=?,attempts=attempts+1 WHERE kind=? AND indicator=?',
                 (time.time()+(3600 if retry else 21600), candidate['kind'], candidate['indicator']))
 
+    @staticmethod
+    def _scan_status(row):
+        """Expose measured window metrics without implying raw-log coverage."""
+        if not row or row[6] is None:
+            return {'status': 'not_observed', 'stream': None, 'at': None,
+                    'duration_ms': None, 'query_took_ms': None, 'events': None,
+                    'committed_events': None}
+        return {'status': 'measured', 'stream': row[11], 'at': row[6],
+                'duration_ms': int(row[7] or 0), 'query_took_ms': int(row[8] or 0),
+                'events': int(row[9] or 0), 'committed_events': int(row[10] or 0)}
+
     def _commit_scan_window(self, recent, checkpoint, end, batch, rollups, scanned, rollup_enabled,
-                            entity_records=None, entity_candidates=0, entity_queued=0):
+                            entity_records=None, entity_candidates=0, entity_queued=0,
+                            scan_metrics=None):
         """Atomically persist one completed discovery window exactly once."""
         stream = 'replay' if recent else 'checkpoint'
         window_start, window_end = stamp(checkpoint), stamp(end)
@@ -984,6 +1020,13 @@ class Pipeline:
                     WHERE id=1 AND {field}=?''', (window_end, int(scanned), window_start)).rowcount
             if not updated:
                 raise RuntimeError('Stale discovery window; transaction rolled back')
+            metrics = scan_metrics or {}
+            db.execute('''UPDATE stream_state SET last_scan_at=?,last_scan_duration_ms=?,
+                last_scan_query_took_ms=?,last_scan_events=?,last_scan_committed_events=?,
+                last_scan_stream=? WHERE id=1''',
+                (float(metrics.get('at') or time.time()), int(metrics.get('duration_ms') or 0),
+                 int(metrics.get('query_took_ms') or 0), int(metrics.get('events') or 0),
+                 int(metrics.get('committed_events') or 0), stream))
         return True
 
     def drain_entity_queue_once(self, config=None):
@@ -1028,10 +1071,16 @@ class Pipeline:
             entity_overflow.clear()
 
         rollup_enabled = not recent and self.automation.config().get('SOC_ROLLUP_ENABLED', 'true') == 'true'
+        scan_started = time.monotonic()
+        query_took_ms = 0
         try:
             data = self.request('/wazuh-alerts-*/_search?scroll=2m', {'size': page_size, 'sort': ['_doc'],
                 'timeout': '15s', 'query': {'range': {'@timestamp': {'gte': stamp(start), 'lt': stamp(end)}}},
                 '_source': sorted(set(ROLLUP_SOURCE_FIELDS + list(IOC_FIELDS.values())))})
+            try:
+                query_took_ms = max(0, int(data.get('took') or 0))
+            except (AttributeError, TypeError, ValueError):
+                query_took_ms = 0
             while True:
                 scroll_id = data.get('_scroll_id', scroll_id)
                 if data.get('timed_out') or data.get('_shards', {}).get('failed'):
@@ -1095,7 +1144,13 @@ class Pipeline:
             flush_entity_overflow()
             self._commit_scan_window(recent, checkpoint, end, batch, rollups,
                                      committed_scanned, rollup_enabled, list(entity_records.values()),
-                                     entity_candidates, entity_queued)
+                                     entity_candidates, entity_queued, {
+                                         'at': time.time(),
+                                         'duration_ms': int((time.monotonic() - scan_started) * 1000),
+                                         'query_took_ms': query_took_ms,
+                                         'events': scanned,
+                                         'committed_events': committed_scanned,
+                                     })
             return True
         finally:
             if scroll_id:
