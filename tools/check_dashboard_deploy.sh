@@ -151,6 +151,37 @@ result = {
 print(json.dumps(result, indent=2, sort_keys=True, default=str))
 PY
 
+echo '== Pipeline window measurement =='
+"${compose[@]}" exec -T mcp-dashboard python3 - <<'PY'
+import json
+import time
+import server
+
+observations = []
+deadline = time.time() + 60
+while len(observations) < 2:
+    pipeline = server.pipeline.status(lightweight=True)
+    last_scan = pipeline.get('last_scan') or {}
+    if pipeline.get('enabled') and last_scan.get('status') != 'measured':
+        if time.time() >= deadline:
+            raise SystemExit('pipeline enabled but no measured scan window within 60s')
+        time.sleep(5)
+        continue
+    observations.append({
+        'status': pipeline.get('status'),
+        'error_scope': pipeline.get('error_scope'),
+        'scan_status': pipeline.get('scan_status'),
+        'lag_seconds': pipeline.get('lag_seconds'),
+        'last_scan': last_scan,
+    })
+    if len(observations) < 2:
+        time.sleep(5)
+
+if any(item['status'] != 'ok' for item in observations):
+    raise SystemExit(json.dumps(observations, sort_keys=True, default=str))
+print(json.dumps({'polls': observations}, indent=2, sort_keys=True, default=str))
+PY
+
 echo '== Recent dashboard logs =='
 "${compose[@]}" logs --tail=80 mcp-dashboard
 

@@ -687,6 +687,23 @@ tanpa source evidence. Runtime ini stabil.
   late-event counter, raw syslog/archive handoff, trace ingress-to-UI, dan
   resource/lock baseline masih membutuhkan bukti telemetry tersendiri.
 
+#### Follow-up G01: deployment verification for measured scan, patch30, 2026-09-26 UTC
+
+- [x] `tools/check_dashboard_deploy.sh` sekarang melakukan pemeriksaan read-only
+  dua polling bounded setelah service hidup. Jika stream aktif, script menunggu
+  maksimal 60 detik sampai `last_scan.status=measured`; kemudian memeriksa
+  `pipeline.status=ok`, error scope, scan status, lag, stream, durasi, query
+  time, dan counter event.
+- [x] Script tidak memanggil Indexer, tidak mengubah checkpoint, tidak menghapus
+  cache/database, dan tidak menganggap `scan_status=caught_up` sebagai bukti
+  seluruh syslog sudah diproses. Jika worker belum menghasilkan window terukur,
+  verifikasi gagal secara eksplisit.
+- [x] Static shell syntax dan full Python test suite tetap wajib dijalankan
+  sebelum deployment; perubahan ini tidak mengubah runtime application code.
+- [ ] Patch30 belum dijalankan pada host produksi dari sesi ini. Output setelah
+  deploy harus membuktikan build ID patch29 di dua service, dua polling pipeline
+  berstatus `ok`, dan tidak ada restart/error startup baru.
+
 Rollback terarah (hanya bila regresi; belum dieksekusi):
 
 ```bash
