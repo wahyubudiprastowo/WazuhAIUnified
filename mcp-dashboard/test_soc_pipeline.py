@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 from datetime import datetime, timezone, timedelta
 import soc_automation as soc
-from soc_pipeline import Pipeline, bounds, history, observables
+from soc_pipeline import Pipeline, _ensure_column, bounds, history, observables
 import entity_resolver
 
 
@@ -31,6 +31,13 @@ class PipelineTests(unittest.TestCase):
 
         with patch.object(self.worker, 'db', side_effect=[locked_db(), locked_db()]):
             self.pipeline._seed_rollup_windows_with_retry()
+        self.assertEqual(connection.execute.call_count, 2)
+
+    def test_schema_migration_tolerates_concurrent_duplicate_column(self):
+        connection = Mock()
+        connection.execute.side_effect = [[], sqlite3.OperationalError(
+            'duplicate column name: last_scan_at')]
+        _ensure_column(connection, 'stream_state', 'last_scan_at', 'REAL')
         self.assertEqual(connection.execute.call_count, 2)
 
     def test_lightweight_status_is_explicitly_bounded(self):

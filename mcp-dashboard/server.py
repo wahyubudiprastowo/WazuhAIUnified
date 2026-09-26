@@ -38,7 +38,7 @@ from telemetry_contract import summary as telemetry_contract_summary
 
 ROOT = Path(__file__).resolve().parent
 STATIC = ROOT / "static"
-DASHBOARD_BUILD_ID = "2026-09-26-patch27"
+DASHBOARD_BUILD_ID = "2026-09-26-patch29"
 CONFIG_FILE = Path(os.environ.get("DASHBOARD_CONFIG_FILE", ROOT / "dashboard.env"))
 HOST = os.environ.get("DASHBOARD_HOST", "0.0.0.0")
 PORT = int(os.environ.get("DASHBOARD_PORT", "8088"))

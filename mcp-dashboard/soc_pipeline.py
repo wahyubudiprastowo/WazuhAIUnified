@@ -14,6 +14,24 @@ def stamp(value):
     return value.astimezone(timezone.utc).isoformat()
 
 
+def _ensure_column(db, table, name, definition):
+    """Add an internal schema column safely when dashboard workers start together."""
+    for attempt in range(5):
+        columns = {row[1] for row in db.execute(f'PRAGMA table_info({table})')}
+        if name in columns:
+            return
+        try:
+            db.execute(f'ALTER TABLE {table} ADD COLUMN {name} {definition}')
+            return
+        except sqlite3.OperationalError as exc:
+            message = str(exc).lower()
+            if 'duplicate column name' in message:
+                return
+            if 'locked' not in message or attempt == 4:
+                raise
+            time.sleep(0.05 * (2 ** attempt))
+
+
 def bounds(payload):
     try:
         start = datetime.fromisoformat(str(payload['start']).replace('Z', '+00:00'))
@@ -253,14 +271,9 @@ class Pipeline:
         with automation.db() as db:
             entity_resolver.ensure_schema(db)
             db.execute('CREATE TABLE IF NOT EXISTS stream_state (id INTEGER PRIMARY KEY, start TEXT, checkpoint TEXT, scanned INTEGER DEFAULT 0)')
-            if 'live_checkpoint' not in {r[1] for r in db.execute('PRAGMA table_info(stream_state)')}:
-                db.execute('ALTER TABLE stream_state ADD COLUMN live_checkpoint TEXT')
-            columns = {r[1] for r in db.execute('PRAGMA table_info(stream_state)')}
-            if 'checkpoint_scanned' not in columns:
-                db.execute('ALTER TABLE stream_state ADD COLUMN checkpoint_scanned INTEGER DEFAULT 0')
-            if 'replay_scanned' not in columns:
-                db.execute('ALTER TABLE stream_state ADD COLUMN replay_scanned INTEGER DEFAULT 0')
-            columns = {r[1] for r in db.execute('PRAGMA table_info(stream_state)')}
+            _ensure_column(db, 'stream_state', 'live_checkpoint', 'TEXT')
+            _ensure_column(db, 'stream_state', 'checkpoint_scanned', 'INTEGER DEFAULT 0')
+            _ensure_column(db, 'stream_state', 'replay_scanned', 'INTEGER DEFAULT 0')
             for name, definition in (
                 ('last_scan_at', 'REAL'),
                 ('last_scan_duration_ms', 'INTEGER DEFAULT 0'),
@@ -269,11 +282,9 @@ class Pipeline:
                 ('last_scan_committed_events', 'INTEGER DEFAULT 0'),
                 ('last_scan_stream', 'TEXT'),
             ):
-                if name not in columns:
-                    db.execute(f'ALTER TABLE stream_state ADD COLUMN {name} {definition}')
+                _ensure_column(db, 'stream_state', name, definition)
             db.execute('CREATE TABLE IF NOT EXISTS ioc_queue (kind TEXT, indicator TEXT, first_seen TEXT, last_seen TEXT, level INTEGER, next_attempt REAL DEFAULT 0, attempts INTEGER DEFAULT 0, PRIMARY KEY(kind,indicator))')
-            if 'count' not in {r[1] for r in db.execute('PRAGMA table_info(ioc_queue)')}:
-                db.execute('ALTER TABLE ioc_queue ADD COLUMN count INTEGER DEFAULT 0')
+            _ensure_column(db, 'ioc_queue', 'count', 'INTEGER DEFAULT 0')
             db.execute('CREATE INDEX IF NOT EXISTS ioc_queue_due ON ioc_queue(next_attempt,level)')
             db.execute('CREATE INDEX IF NOT EXISTS ioc_queue_priority ON ioc_queue(next_attempt,level,count,last_seen)')
             db.execute('''CREATE TABLE IF NOT EXISTS detection_rollups (
@@ -301,7 +312,6 @@ class Pipeline:
                 last_duration_ms INTEGER DEFAULT 0, last_query_took_ms INTEGER DEFAULT 0, error TEXT,
                 current_chunk_minutes INTEGER DEFAULT 0, success_streak INTEGER DEFAULT 0,
                 failures INTEGER DEFAULT 0, next_run REAL DEFAULT 0, mode TEXT DEFAULT 'linear')''')
-            backfill_columns = {row[1] for row in db.execute('PRAGMA table_info(rollup_backfill_state)')}
             for name, definition in {
                 'current_chunk_minutes': 'INTEGER DEFAULT 0',
                 'success_streak': 'INTEGER DEFAULT 0',
@@ -309,8 +319,7 @@ class Pipeline:
                 'next_run': 'REAL DEFAULT 0',
                 'mode': "TEXT DEFAULT 'linear'",
             }.items():
-                if name not in backfill_columns:
-                    db.execute(f'ALTER TABLE rollup_backfill_state ADD COLUMN {name} {definition}')
+                _ensure_column(db, 'rollup_backfill_state', name, definition)
             # Forti security metrics have their own cursor. This keeps a new
             # historical dimension from replaying the broad alert rollup.
             db.execute('''CREATE TABLE IF NOT EXISTS forti_security_backfill_state (

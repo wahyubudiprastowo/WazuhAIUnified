@@ -654,14 +654,38 @@ tanpa source evidence. Runtime ini stabil.
 - [x] Regression test baru membuktikan metrik query/event/commit dan semantik
   degraded. Test pipeline: **19 tests, OK**. Full discovery:
   **267 tests, OK (10 skipped)**; `py_compile` dan `git diff --check` lulus.
-- [ ] Patch28 belum dideploy pada runtime produksi dari sesi ini. Setelah
-  deployment, polling `/api/pipeline/status` harus membuktikan `last_scan.status`
-  `measured`, stream, durasi, query time, serta status/error konsisten pada dua
-  pengamatan. Docker socket sesi ini sebelumnya ditolak, jadi parity image dan
-  live values belum boleh diklaim.
+- [x] Output deploy 2026-09-26 membuktikan image dashboard/materializer
+  dibangun ulang, shared source parity `current`, CMDB authoritative 14 asset,
+  schema CVE current, dan rollup `caught_up` dengan lag 188 detik pada snapshot.
+  Ini adalah runtime evidence dari host pengguna, bukan hasil eksekusi sesi ini.
+- [ ] Patch28 belum accepted: pada startup bersamaan, materializer mencatat
+  `sqlite3.OperationalError: duplicate column name: last_scan_at`. Build ID
+  masih `patch27` karena patch28 belum mengubah `server.py`; akibatnya identitas
+  runtime belum dapat membedakan patch28 secara eksplisit.
 - [ ] G01 tetap belum accepted: parser version, received-vs-indexed denominator,
   late-event counter, disk/RSS/lock baseline, trace ingress-to-UI, dan raw
   syslog/archive handoff masih pending.
+
+#### Follow-up G01: race-safe schema migration and release identity, patch29, 2026-09-26 UTC
+
+- [x] Migrasi kolom internal `stream_state`, `ioc_queue`, dan
+  `rollup_backfill_state` sekarang membaca schema per percobaan, mengabaikan
+  hanya `duplicate column name` yang sah akibat startup bersamaan, dan retry
+  terbatas untuk lock SQLite. Error lain tetap dilempar; tidak ada error yang
+  disamarkan sebagai data sehat.
+- [x] Build ID dinaikkan ke `2026-09-26-patch29` agar source, image, kedua
+  service, dan payload API dapat dibandingkan secara eksplisit.
+- [x] Regression test mensimulasikan duplicate-column race. Test pipeline:
+  **20 tests, OK**. Full discovery: **268 tests, OK (10 skipped)**;
+  `py_compile` dan `git diff --check` lulus.
+- [ ] Patch29 belum dideploy dari sesi ini. Setelah deployment, deploy check
+  wajib menunjukkan `mcp-dashboard` dan `mcp-materializer` sama-sama
+  `2026-09-26-patch29`, materializer tidak restart-loop, dan log tidak memuat
+  duplicate-column error. Polling pipeline dua kali harus menunjukkan
+  `last_scan.status=measured` serta status/error yang konsisten.
+- [ ] G01 tetap belum accepted. Parser version, received-vs-indexed denominator,
+  late-event counter, raw syslog/archive handoff, trace ingress-to-UI, dan
+  resource/lock baseline masih membutuhkan bukti telemetry tersendiri.
 
 Rollback terarah (hanya bila regresi; belum dieksekusi):
 
